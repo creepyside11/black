@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+# Engine: SA-MP / Black Russia RakNet | Python 3 | Termux
+# Build: pip install -r requirements.txt (if any)
+# Run: python3 bot.py [сервер/номер] [никнейм] [пароль]
+
+import sys
+import os
+import time
+import threading
+from collections import deque
+
+import br_servers
+from core.network import Network
+from core import security
+from core import logger
+from core.protocol import RakNetProtocol
+from samp.api import BotAPI
+from samp.session import SampSession
+from samp.sync import PlayerSyncScheduler
+from logic.registration import RegistrationConfig
+from logic.json_ui import JsonUIConfig
+from logic.events import emitter
+
+MAX_NICKNAME_LEN = 20
+MAX_LOG_HISTORY = 100
+
+class BotInstance:
+    def __init__(self, bot_id: int, host: str, port: int, nickname: str, password: str = "", server_name: str = ""):
+        self.bot_id = bot_id
+        self.host = host
+        self.port = int(port)
+        self.nickname = nickname
+        self.password = password
+        self.server_name = server_name
+
+        self.logs = deque(maxlen=MAX_LOG_HISTORY)
+        self.status = "Инициализация"
+        self.connected_time = None
+        self.thread = None
+
+        self.network = Network(self.host, self.port)
+        self.protocol = RakNetProtocol(self.network, security)
+        self.sync_scheduler = PlayerSyncScheduler()
+
+        reg_config = None
+        if self.password:
+            reg_config = RegistrationConfig(
+                enabled=True,
+                auto_login=True,
+                password=self.password,
+                gender=0,
+                skin=78,
+                step_delay=0.6,
+                ack_timeout=15.0
+            )
+
+        json_ui = JsonUIConfig(
+            console_output=False,
+            auto_close_cinematic=True
+        )
+
+        self.session = SampSession(
+            self.protocol,
+            self.host,
+            self.port,
+            self.nickname,
+            sync_scheduler=self.sync_scheduler,
+            fps=60.0,
+            pings_ips_continuous=False,
+            server_password=None,
+            http_pre_ping=True,
+            http_pre_ping_port=80,
+            http_pre_ping_timeout=5.0,
+            http_pre_ping_host_suffix="blackrussia.online",
+            registration=reg_config,
+            json_ui=json_ui
+        )
+
+        self.api = BotAPI(self.session)
+        self.network.set_proxy_manager(self.session.proxy)
+
+    def add_log(self, text: str):
+        t_str = time.strftime("[%H:%M:%S]")
+        formatted = f"{t_str} [{self.nickname}] {text}"
+        self.logs.append(formatted)
+        return formatted
+
+    def start(self):
+        self.status = "Подключение..."
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            self.api.connect()
+        except Exception as e:
+            self.status = f"Ошибка: {e}"
+            self.add_log(f"Критическая ошибка сессии: {e}")
+
+    def send_chat(self, msg: str):
+        self.api.sendchat(msg)
+        self.add_log(f">> {msg}")
+
+    def stop(self):
+        self.status = "Отключен"
+        try:
+            self.api.disconnect()
+        except Exception:
+            pass
+
+class BotManager:
+    def __init__(self):
+        self.bots: dict[int, BotInstance] = {}
+        self._next_id = 1
+        self.active_bot_id: int | None = None
+        self._lock = threading.Lock()
+        self.stream_active_logs = True
+
+        # Устанавливаем перехватчик глобального логгера
+        logger.set_log_interceptor(self._handle_global_log)
+        self._setup_event_hooks()
+
+    def _handle_global_log(self, raw_message: str) -> bool:
+        # Привязываем лог к боту по контексту ника или активному боту
+        assigned = False
+        with self._lock:
+            for b in self.bots.values():
+                if b.nickname and b.nickname in raw_message:
+                    b.logs.append(raw_message)
+                    assigned = True
+                    break
+
+            if not assigned and self.active_bot_id is not None:
+                cur = self.bots.get(self.active_bot_id)
+                if cur:
+                    cur.logs.append(raw_message)
+
+            if not self.stream_active_logs:
+                return False
+
+            if self.active_bot_id is not None:
+                cur = self.bots.get(self.active_bot_id)
+                if cur and cur.nickname and cur.nickname in raw_message:
+                    return True
+                if not assigned:
+                    return True
+                return False
+            return True
+
+    def _find_bot_by_session_or_api(self, bot_obj):
+        with self._lock:
+            for b in self.bots.values():
+                if b.api == bot_obj or b.session == bot_obj:
+                    return b
+        return None
+
+    def _setup_event_hooks(self):
+        @emitter.on("onconnect")
+        def _on_connected(bot_obj, *args, **kwargs):
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if b:
+                b.status = "В игре (авторизован)"
+                b.connected_time = time.time()
+                b.add_log("Подключение установлено, мир загружен")
+
+        @emitter.on("onSpawn")
+        def _on_spawn(bot_obj, *args, **kwargs):
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if b:
+                b.status = "В игре (заспавнен)"
+                b.add_log("Персонаж заспавнен на карте")
+
+        @emitter.on("onShowChat")
+        def _on_chat(bot_obj, message, *args, **kwargs):
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if b:
+                b.add_log(f"[ЧАТ] {message}")
+
+        @emitter.on("onShowDialog")
+        def _on_dialog(bot_obj, d_id, style, title, info, b1, b2, *args, **kwargs):
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if b:
+                b.add_log(f"[ДИАЛОГ #{d_id}] {title} | Кнопки: '{b1}' / '{b2}'")
+
+        @emitter.on("disconnect")
+        def _on_disconnect(bot_obj, *args, **kwargs):
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if b:
+                b.status = "Отключен"
+                b.add_log("Соединение с сервером разорвано")
+
+        @emitter.on("onKick")
+        def _on_kick(bot_obj, reason_code, *args, **kwargs):
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if b:
+                b.status = f"Кикнут (код {reason_code})"
+                b.add_log(f"[КИК] Отключен сервером. Код причины: {reason_code}")
+
+    def add_bot(self, target_server: str, nickname: str, password: str = "") -> BotInstance | None:
+        try:
+            srv = br_servers.find_server(target_server)
+        except Exception as e:
+            print(f"[!] Ошибка загрузки списка серверов: {e}")
+            return None
+
+        if not srv:
+            print(f"[-] Сервер '{target_server}' не найден.")
+            return None
+
+        ip = srv["ip"]
+        port = int(srv["port"])
+        name = srv["name"]
+
+        with self._lock:
+            bot_id = self._next_id
+            self._next_id += 1
+            bot = BotInstance(bot_id, ip, port, nickname, password=password, server_name=name)
+            self.bots[bot_id] = bot
+            if self.active_bot_id is None:
+                self.active_bot_id = bot_id
+
+        bot.start()
+        print(f"[+] Бот #{bot_id} ({nickname}) запущен на сервере {name} ({ip}:{port})")
+        return bot
+
+    def list_bots(self):
+        print("\n" + "=" * 65)
+        print(f"{'ID':<4} {'Никнейм':<18} {'Сервер':<16} {'Статус':<20}")
+        print("-" * 65)
+        with self._lock:
+            if not self.bots:
+                print("   (нет запущенных ботов)")
+            for bid, b in self.bots.items():
+                cur_marker = "* " if bid == self.active_bot_id else "  "
+                online_str = b.status
+                if b.connected_time and "В игре" in b.status:
+                    uptime = int(time.time() - b.connected_time)
+                    m, s = divmod(uptime, 60)
+                    h, m = divmod(m, 60)
+                    online_str += f" ({h:02d}:{m:02d}:{s:02d})"
+                print(f"{cur_marker}{bid:<2} {b.nickname:<18} {b.server_name[:15]:<16} {online_str:<20}")
+        print("=" * 65)
+        if self.active_bot_id is not None:
+            active_bot = self.bots.get(self.active_bot_id)
+            if active_bot:
+                print(f"[*] Активный бот для команд: #{self.active_bot_id} [{active_bot.nickname}]\n")
+
+    def show_logs(self, bot_id: int):
+        with self._lock:
+            bot = self.bots.get(bot_id)
+        if not bot:
+            print(f"[-] Бот #{bot_id} не найден.")
+            return
+
+        print(f"\n--- Последние логи бота #{bot_id} [{bot.nickname}] ({len(bot.logs)} записей) ---")
+        if not bot.logs:
+            print("   (логов пока нет)")
+        else:
+            for line in list(bot.logs):
+                print(line)
+        print("--- Конец логов ---\n")
+
+    def switch_active(self, bot_id: int):
+        with self._lock:
+            if bot_id not in self.bots:
+                print(f"[-] Бот #{bot_id} не существует.")
+                return False
+            self.active_bot_id = bot_id
+            bot = self.bots[bot_id]
+        print(f"[+] Выбран бот #{bot_id} [{bot.nickname}] на сервере {bot.server_name}")
+        return True
+
+    def stop_bot(self, bot_id: int):
+        with self._lock:
+            bot = self.bots.get(bot_id)
+        if not bot:
+            print(f"[-] Бот #{bot_id} не найден.")
+            return
+        bot.stop()
+        print(f"[*] Бот #{bot_id} [{bot.nickname}] остановлен.")
+
+    def stop_all(self):
+        with self._lock:
+            for b in self.bots.values():
+                b.stop()
+        emitter.shutdown(wait=False)
+
+def print_help():
+    print("""
+====================== УПРАВЛЕНИЕ МУЛЬТИБОТОМ ======================
+  /menu             - Главное меню управления аккаунтами
+  /list             - Список всех запущенных ботов и их статусы
+  /add              - Добавить и запустить новый аккаунт
+  /switch <ID>      - Переключиться на бота по ID для управления
+  /logs [ID]        - Посмотреть последние логи бота (по умолчанию активного)
+  /stream           - Вкл/выкл живой вывод логов активного бота в консоль
+  /stop <ID>        - Остановить бота по ID
+  /q                - Выход и остановка всех ботов
+
+--- Команды для активного бота ---
+  /chat <текст>     - Отправить сообщение в чат
+  /<команда>        - Любая серверная команда (например /time, /stats, /mm)
+  /dialog <id> <кнопка> [список] [текст] - Ответить в диалог
+====================================================================
+""")
+
+def interactive_menu(manager: BotManager):
+    manager.stream_active_logs = False
+    try:
+        while True:
+            print("\n============ МЕНЮ АККАУНТОВ ============")
+            print("1. Показать список всех аккаунтов")
+            print("2. Добавить новый аккаунт")
+            print("3. Посмотреть логи аккаунта")
+            print("4. Переключить активный аккаунт")
+            print("5. Остановить аккаунт")
+            print("0. Вернуться в консоль")
+            print("========================================")
+            choice = input("Выберите пункт (0-5): ").strip()
+
+            if choice == "0":
+                break
+            elif choice == "1":
+                manager.list_bots()
+            elif choice == "2":
+                srv = input("Сервер (название или номер): ").strip()
+                if not srv:
+                    print("Отменено.")
+                    continue
+                nick = input("Никнейм (Name_Surname): ").strip()
+                if not nick:
+                    print("Ник не может быть пустым.")
+                    continue
+                pwd = input("Пароль (пусто, если не нужен): ").strip()
+                manager.add_bot(srv, nick, pwd)
+            elif choice == "3":
+                manager.list_bots()
+                b_str = input("Введите ID бота для просмотра логов: ").strip()
+                if b_str.isdigit():
+                    manager.show_logs(int(b_str))
+            elif choice == "4":
+                manager.list_bots()
+                b_str = input("Введите ID бота, на которого переключиться: ").strip()
+                if b_str.isdigit():
+                    manager.switch_active(int(b_str))
+            elif choice == "5":
+                manager.list_bots()
+                b_str = input("Введите ID бота для остановки: ").strip()
+                if b_str.isdigit():
+                    manager.stop_bot(int(b_str))
+    finally:
+        manager.stream_active_logs = True
+        print("[*] Вы вернулись в консоль управления. Введите /help для подсказки.")
+
+def main():
+    print("=" * 65)
+    print("   Black Russia Headless RakSAMP Bot Client [Multi-Account]   ")
+    print("=" * 65)
+
+    manager = BotManager()
+
+    # Если параметры переданы при запуске — сразу запускаем первого бота
+    if len(sys.argv) >= 3:
+        target_server = sys.argv[1]
+        nickname = sys.argv[2]
+        password = sys.argv[3] if len(sys.argv) > 3 else ""
+        manager.add_bot(target_server, nickname, password=password)
+    else:
+        print("\n[i] Первый запуск без параметров. Добавьте бота через меню.")
+        interactive_menu(manager)
+
+    print_help()
+
+    while True:
+        try:
+            line = input().strip()
+            if not line:
+                continue
+
+            if line in ("/q", "exit", "quit"):
+                break
+
+            elif line in ("/menu", "menu"):
+                interactive_menu(manager)
+
+            elif line in ("/list", "list"):
+                manager.list_bots()
+
+            elif line in ("/help", "help"):
+                print_help()
+
+            elif line.startswith("/add"):
+                parts = line.split(maxsplit=3)
+                if len(parts) >= 3:
+                    srv = parts[1]
+                    nick = parts[2]
+                    pwd = parts[3] if len(parts) > 3 else ""
+                    manager.add_bot(srv, nick, pwd)
+                else:
+                    interactive_menu(manager)
+
+            elif line.startswith("/switch"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    manager.switch_active(int(parts[1]))
+                else:
+                    print("Использование: /switch <ID бота>")
+
+            elif line.startswith("/logs"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    manager.show_logs(int(parts[1]))
+                elif manager.active_bot_id is not None:
+                    manager.show_logs(manager.active_bot_id)
+                else:
+                    print("Нет активного бота. Укажите ID: /logs <ID>")
+
+            elif line == "/stream":
+                manager.stream_active_logs = not manager.stream_active_logs
+                st = "ВКЛЮЧЕН" if manager.stream_active_logs else "ВЫКЛЮЧЕН"
+                print(f"[*] Живой стриминг логов в консоль: {st}")
+
+            elif line.startswith("/stop"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    manager.stop_bot(int(parts[1]))
+                else:
+                    print("Использование: /stop <ID бота>")
+
+            elif line.startswith("/dialog"):
+                # /dialog <id> <кнопка> [список] [текст]
+                with manager._lock:
+                    active = manager.bots.get(manager.active_bot_id) if manager.active_bot_id else None
+                if not active:
+                    print("[-] Нет активного бота для отправки диалога.")
+                    continue
+                parts = line.split(maxsplit=4)
+                if len(parts) >= 3:
+                    try:
+                        d_id = int(parts[1])
+                        btn = int(parts[2])
+                        list_item = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+                        txt = parts[4] if len(parts) > 4 else (parts[3] if len(parts) > 3 and not parts[3].isdigit() else "")
+                        from samp.packets import PacketBuilder
+                        active.session._sender.send(
+                            PacketBuilder.rpc_build("dialog_response", d_id, btn, list_item, txt),
+                            rpc_name="dialog_response"
+                        )
+                        active.add_log(f"Ответ в диалог #{d_id}: кнопка={btn}, элемент={list_item}, текст='{txt}'")
+                    except Exception as e:
+                        print(f"[-] Ошибка отправки диалога: {e}")
+                else:
+                    print("Использование: /dialog <dialog_id> <кнопка: 0/1> [номер_строки: 0] [текст]")
+
+            elif line.startswith("/chat "):
+                with manager._lock:
+                    active = manager.bots.get(manager.active_bot_id) if manager.active_bot_id else None
+                if active:
+                    active.send_chat(line[6:])
+                else:
+                    print("[-] Нет активного бота.")
+
+            else:
+                # Если строка начинается с / или это обычное сообщение
+                with manager._lock:
+                    active = manager.bots.get(manager.active_bot_id) if manager.active_bot_id else None
+                if active:
+                    active.send_chat(line)
+                else:
+                    print("[-] Нет активного бота. Выберите бота через /switch <ID> или введите /menu")
+
+        except (KeyboardInterrupt, EOFError):
+            break
+
+    print("\n[*] Завершение работы всех ботов...")
+    manager.stop_all()
+
+if __name__ == "__main__":
+    main()

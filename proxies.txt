@@ -1,0 +1,7 @@
+# proxies.txt - список прокси для Black Russia ботов
+# Поддерживаются форматы:
+# 1) ip:port:username:password
+# 2) socks5://username:password@ip:port
+# 3) Название|ip:port:username:password
+# Пример:
+# RussiaFast|185.120.30.40:1080:user:pass

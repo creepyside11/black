@@ -1,0 +1,1084 @@
+#!/usr/bin/env python3
+# Engine: SA-MP / Black Russia RakNet | Python 3 | Termux
+# Build: pip install -r requirements.txt (if any)
+# Run: python3 bot.py [сервер/номер] [никнейм] [пароль]
+
+import sys
+import os
+import time
+import random
+import threading
+import json
+from collections import deque
+
+import br_servers
+from core.network import Network
+from core import security
+from core import logger
+from core.protocol import RakNetProtocol
+from samp.api import BotAPI
+from samp.session import SampSession
+from samp.sync import PlayerSyncScheduler
+from logic.registration import RegistrationConfig
+from logic.json_ui import JsonUIConfig
+from logic.events import emitter
+from logic.bot_tasks import LevelGrinderTask, QuestMasterTask, MinerTask
+
+MAX_NICKNAME_LEN = 20
+MAX_LOG_HISTORY = 100
+ACCOUNTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts.json")
+
+
+class BotInstance:
+    def __init__(
+        self,
+        bot_id: int,
+        host: str,
+        port: int,
+        nickname: str,
+        password: str,
+        server_name: str = "",
+        auto_regen_nick: bool = False,
+        manager: any = None,
+        is_banned: bool = False,
+        default_task: str = "lvl",
+    ):
+        self.bot_id = bot_id
+        self.host = host
+        self.port = int(port)
+        self.nickname = nickname
+        self.password = password
+        self.server_name = server_name.upper()
+        self.auto_regen_nick = auto_regen_nick
+        self.manager = manager
+        self.stopping = False
+        self.is_banned = is_banned
+        self.default_task_name = default_task
+
+        self.logs = deque(maxlen=MAX_LOG_HISTORY)
+        self.status = "ЗАБАНЕН" if self.is_banned else "Остановлен"
+        self.connected_time = None
+        self.thread = None
+        self.active_task = None
+
+        self.reconnect_thread = None
+        self.reconnect_cancel_event = threading.Event()
+
+        self.session = None
+        self.api = None
+        self.network = None
+        self.protocol = None
+        self.sync_scheduler = None
+
+    def add_log(self, text: str):
+        t_str = time.strftime("[%H:%M:%S]")
+        formatted = f"{t_str} [{self.nickname}] {text}"
+        self.logs.append(formatted)
+        return formatted
+
+    def setup_session(self):
+        self.stopping = False
+        self.network = Network(self.host, self.port)
+        self.protocol = RakNetProtocol(self.network, security)
+        self.sync_scheduler = PlayerSyncScheduler()
+
+        reg_config = None
+        if self.password:
+            reg_config = RegistrationConfig(
+                enabled=True,
+                auto_login=True,
+                password=self.password,
+                gender=0,
+                skin=78,
+                step_delay=0.6,
+                ack_timeout=15.0,
+            )
+
+        json_ui = JsonUIConfig(
+            console_output=False,
+            auto_close_cinematic=True,
+        )
+
+        server_names_map = {}
+        if self.manager and hasattr(self.manager, "server_names_cache"):
+            server_names_map = self.manager.server_names_cache
+
+        self.session = SampSession(
+            self.protocol,
+            self.host,
+            self.port,
+            self.nickname,
+            sync_scheduler=self.sync_scheduler,
+            fps=60.0,
+            pings_ips_continuous=False,
+            server_password=None,
+            http_pre_ping=True,
+            http_pre_ping_port=80,
+            http_pre_ping_timeout=5.0,
+            http_pre_ping_host_suffix="blackrussia.online",
+            http_server_names=server_names_map,
+            registration=reg_config,
+            json_ui=json_ui,
+        )
+
+        self.api = BotAPI(self.session)
+        self.network.set_proxy_manager(self.session.proxy)
+
+    def start(self):
+        if self.is_banned:
+            self.add_log("Попытка запуска забаненного аккаунта отклонена.")
+            return False
+
+        self.cancel_reconnect()
+        self.stopping = False
+        self.status = "Подключение..."
+        self.setup_session()
+
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+        return True
+
+    def _run(self):
+        try:
+            self.api.connect()
+        except Exception as e:
+            if not self.stopping and not self.is_banned:
+                self.status = f"Ошибка: {e}"
+                self.add_log(f"Критическая ошибка сессии: {e}")
+                self.schedule_reconnect(delay=300.0)
+
+    def schedule_reconnect(self, delay: float = 300.0):
+        if self.stopping or self.is_banned:
+            return
+        if self.reconnect_thread and self.reconnect_thread.is_alive():
+            return
+
+        self.reconnect_cancel_event.clear()
+        target_time = time.time() + delay
+        self.add_log(f"Связь разорвана (рестарт/кик). Авто-вход через {int(delay)} сек (5 мин)...")
+
+        def _reconnect_waiter():
+            while time.time() < target_time:
+                if self.reconnect_cancel_event.is_set() or self.stopping or self.is_banned:
+                    return
+                rem = max(0, int(target_time - time.time()))
+                m, s = divmod(rem, 60)
+                self.status = f"Ожидание ({m:02d}:{s:02d})"
+                time.sleep(1.0)
+
+            if self.reconnect_cancel_event.is_set() or self.stopping or self.is_banned:
+                return
+
+            self.add_log("5 минут прошло. Автоматический перезапуск сессии...")
+            self.start()
+
+        self.reconnect_thread = threading.Thread(target=_reconnect_waiter, daemon=True)
+        self.reconnect_thread.start()
+
+    def cancel_reconnect(self):
+        self.reconnect_cancel_event.set()
+
+    def send_chat(self, msg: str):
+        if self.api:
+            self.api.sendchat(msg)
+            self.add_log(f">> {msg}")
+
+    def set_task(self, task_type: str):
+        if self.active_task:
+            self.active_task.stop()
+            self.active_task = None
+
+        self.default_task_name = task_type
+        if self.manager:
+            self.manager.save_accounts()
+
+        if task_type == "lvl":
+            self.active_task = LevelGrinderTask(self)
+            self.active_task.start()
+            return "Качка LVL запущена"
+        elif task_type == "quest":
+            self.active_task = QuestMasterTask(self)
+            self.active_task.start()
+            return "Квесты Дяди Славы запущены"
+        elif task_type in ("mine", "miner", "mining", "шахта"):
+            self.active_task = MinerTask(self)
+            self.active_task.start()
+            return "Бот шахтера запущен"
+        elif task_type in ("stop", "none", "off"):
+            return "Авто-задача остановлена"
+        else:
+            return "Неизвестный тип задачи. Доступно: 'lvl', 'quest', 'mine', 'stop'"
+
+    def stop(self, banned: bool = False):
+        self.stopping = True
+        self.cancel_reconnect()
+        if self.active_task:
+            try:
+                self.active_task.stop()
+            except Exception:
+                pass
+            self.active_task = None
+        self.status = "ЗАБАНЕН" if (banned or self.is_banned) else "Отключен"
+        if self.api:
+            try:
+                self.api.disconnect()
+            except Exception:
+                pass
+
+
+class BotManager:
+    def __init__(self):
+        self.bots: dict[int, BotInstance] = {}
+        self._next_id = 1
+        self.active_bot_id: int | None = None
+        self._lock = threading.Lock()
+        self.stream_active_logs = True
+
+        # Кэш соответствия IP серверов и их названий (для правильного HTTP pre-ping заголовка Host)
+        self.server_names_cache = {}
+        try:
+            all_s = br_servers.get_servers()
+            self.server_names_cache = {s["ip"]: s.get("firstname", "") for s in all_s}
+        except Exception:
+            self.server_names_cache = {}
+
+        logger.set_log_interceptor(self._handle_global_log)
+        self._setup_event_hooks()
+
+        # Загружаем сохраненные аккаунты из accounts.json
+        self.load_accounts()
+
+    def _handle_global_log(self, raw_message: str) -> bool:
+        assigned = False
+        with self._lock:
+            for b in self.bots.values():
+                if b.nickname and b.nickname in raw_message:
+                    b.logs.append(raw_message)
+                    assigned = True
+                    break
+
+            if not assigned and self.active_bot_id is not None:
+                cur = self.bots.get(self.active_bot_id)
+                if cur:
+                    cur.logs.append(raw_message)
+
+            if not self.stream_active_logs:
+                return False
+
+            if self.active_bot_id is not None:
+                cur = self.bots.get(self.active_bot_id)
+                if cur and cur.nickname and cur.nickname in raw_message:
+                    return True
+                if not assigned:
+                    return True
+                return False
+            return True
+
+    def _find_bot_by_session_or_api(self, bot_obj):
+        with self._lock:
+            for b in self.bots.values():
+                if b.api == bot_obj or b.session == bot_obj:
+                    return b
+        return None
+
+    def mark_bot_banned(self, bot: BotInstance, reason: str = ""):
+        bot.is_banned = True
+        bot.cancel_reconnect()
+        bot.status = "ЗАБАНЕН"
+        bot.add_log(f"[!] АККАУНТ ЗАБАНЕН СЕРВЕРОМ! Причина: {reason}")
+        print(f"\n[!] ВНИМАНИЕ: Бот #{bot.bot_id} [{bot.nickname}] получил БАН! ({reason})")
+        bot.stop(banned=True)
+        self.save_accounts()
+
+    def _setup_event_hooks(self):
+        @emitter.on("onconnect")
+        def _on_connected(bot_obj, *args, **kwargs):
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if b:
+                b.status = "В игре (авторизован)"
+                b.connected_time = time.time()
+                b.add_log("Подключение установлено, мир загружен")
+                if b.default_task_name and not b.active_task:
+                    b.set_task(b.default_task_name)
+
+        @emitter.on("onSpawn")
+        def _on_spawn(bot_obj, *args, **kwargs):
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if b:
+                b.status = "В игре (заспавнен)"
+                b.add_log("Персонаж заспавнен на карте")
+
+        @emitter.on("onShowChat")
+        def _on_chat(bot_obj, message, *args, **kwargs):
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if b:
+                b.add_log(f"[ЧАТ] {message}")
+                msg_lower = str(message).lower()
+                # Проверяем, не забанен ли бот по сообщению сервера в чат
+                if b.nickname.lower() in msg_lower:
+                    ban_words = ["заблокирован", "забанен", "получил бан", "выдан бан", "banned"]
+                    if any(k in msg_lower for k in ban_words) and "чат" not in msg_lower and "мут" not in msg_lower:
+                        self.mark_bot_banned(b, reason=f"Чат: {message}")
+
+        @emitter.on("onShowDialog")
+        def _on_dialog(bot_obj, d_id, style, title, info, b1, b2, *args, **kwargs):
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if b:
+                b.add_log(f"[ДИАЛОГ #{d_id}] {title} | Кнопки: '{b1}' / '{b2}'")
+                dialog_text = f"{title} {info}".lower()
+                ban_triggers = [
+                    "блокировк",
+                    "заблокирован",
+                    "забанен",
+                    "бан навсегда",
+                    "аккаунт заблокирован",
+                    "banned",
+                    "причина блокировки",
+                    "до разблокировки",
+                    "вы получили бан",
+                ]
+                if any(trigger in dialog_text for trigger in ban_triggers):
+                    self.mark_bot_banned(b, reason=f"Диалог #{d_id}: {title}")
+
+        @emitter.on("disconnect")
+        def _on_disconnect(bot_obj, *args, **kwargs):
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if b:
+                b.add_log("Соединение с сервером разорвано")
+                if b.is_banned:
+                    b.status = "ЗАБАНЕН"
+                    return
+                if b.stopping:
+                    b.status = "Отключен"
+                    return
+                # Плановый рестарт (5:00 МСК) или обычный кик — повторный вход через 5 минут
+                b.schedule_reconnect(delay=300.0)
+
+        @emitter.on("onKick")
+        def _on_kick(bot_obj, reason_code, *args, **kwargs):
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if b:
+                b.add_log(f"[КИК] Отключен сервером. Код причины: {reason_code}")
+                if reason_code == 999:
+                    self.mark_bot_banned(b, reason="Пакет CONNECTION_BANNED (0x19)")
+                    return
+                if reason_code == 2 and getattr(b, "auto_regen_nick", False):
+                    self.replace_bot_nickname(b)
+                    return
+                b.status = f"Кикнут (код {reason_code})"
+
+        @emitter.on("onRegistrationState")
+        def _on_reg_state(bot_obj, state, *args, **kwargs):
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if b:
+                b.add_log(f"[АВТОРИЗАЦИЯ] Статус: {state}")
+                if state == "logging_in" and getattr(b, "auto_regen_nick", False):
+                    self.replace_bot_nickname(b)
+
+        @emitter.on("onQuestTask")
+        def _on_quest_task(text, *args, **kwargs):
+            with self._lock:
+                for b in self.bots.values():
+                    if b.active_task and isinstance(b.active_task, QuestMasterTask):
+                        b.active_task.on_quest_task(text)
+
+        @emitter.on("onNpcDialog")
+        def _on_npc_dialog(name, text, model, buttons, *args, **kwargs):
+            with self._lock:
+                for b in self.bots.values():
+                    if b.active_task and hasattr(b.active_task, "on_npc_dialog"):
+                        b.active_task.on_npc_dialog(name, text, model, buttons)
+
+        @emitter.on("OnSetCheckpoint")
+        def _on_checkpoint(bot_obj, x, y, z, radius, *args, **kwargs):
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if b and b.active_task and isinstance(b.active_task, QuestMasterTask):
+                b.active_task.on_checkpoint(x, y, z, radius)
+
+        @emitter.on("onRewardList")
+        def _on_rewards(rewards, *args, **kwargs):
+            with self._lock:
+                for b in self.bots.values():
+                    if b.active_task and isinstance(b.active_task, QuestMasterTask):
+                        b.active_task.on_rewards(rewards)
+
+    def load_accounts(self):
+        if not os.path.exists(ACCOUNTS_FILE):
+            return
+
+        try:
+            with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, list):
+                return
+
+            loaded_count = 0
+            for item in data:
+                nick = item.get("nickname", "").strip()
+                pwd = item.get("password", "").strip()
+                srv_str = item.get("server", "").strip()
+                task = item.get("task", "lvl")
+                is_banned = bool(item.get("is_banned", False))
+
+                if not nick or not pwd or not srv_str:
+                    continue
+
+                try:
+                    srv = br_servers.find_server(srv_str)
+                except Exception:
+                    srv = None
+
+                if not srv:
+                    continue
+
+                clean_name = srv.get("firstname") or srv.get("name", "").replace("BLACK RUSSIA | ", "").strip()
+                clean_name = clean_name.upper()
+                ip = srv["ip"]
+                port = int(srv["port"])
+
+                with self._lock:
+                    bot_id = self._next_id
+                    self._next_id += 1
+                    b = BotInstance(
+                        bot_id=bot_id,
+                        host=ip,
+                        port=port,
+                        nickname=nick,
+                        password=pwd,
+                        server_name=clean_name,
+                        auto_regen_nick=False,
+                        manager=self,
+                        is_banned=is_banned,
+                        default_task=task,
+                    )
+                    self.bots[bot_id] = b
+                    if self.active_bot_id is None:
+                        self.active_bot_id = bot_id
+                loaded_count += 1
+
+            if loaded_count > 0:
+                print(f"[+] Загружено {loaded_count} сохраненных аккаунтов из {os.path.basename(ACCOUNTS_FILE)}")
+        except Exception as e:
+            print(f"[!] Ошибка загрузки {ACCOUNTS_FILE}: {e}")
+
+    def save_accounts(self):
+        with self._lock:
+            data = []
+            for b in self.bots.values():
+                data.append({
+                    "nickname": b.nickname,
+                    "password": b.password,
+                    "server": b.server_name,
+                    "task": b.default_task_name or (b.active_task.name if b.active_task else "lvl"),
+                    "is_banned": b.is_banned,
+                })
+
+        try:
+            tmp_file = ACCOUNTS_FILE + ".tmp"
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_file, ACCOUNTS_FILE)
+        except Exception as e:
+            print(f"[!] Ошибка сохранения {ACCOUNTS_FILE}: {e}")
+
+    def add_bot(
+        self,
+        target_server: str,
+        nickname: str,
+        password: str,
+        auto_regen_nick: bool = False,
+        default_task: str = "lvl",
+    ) -> BotInstance | None:
+        if not password or not password.strip():
+            print("[-] Ошибка: Пароль обязателен для каждого аккаунта!")
+            return None
+
+        password = password.strip()
+
+        try:
+            srv = br_servers.find_server(target_server)
+        except Exception as e:
+            print(f"[!] Ошибка загрузки списка серверов: {e}")
+            return None
+
+        if not srv:
+            print(f"[-] Сервер '{target_server}' не найден.")
+            return None
+
+        ip = srv["ip"]
+        port = int(srv["port"])
+        clean_name = srv.get("firstname") or srv.get("name", "").replace("BLACK RUSSIA | ", "").strip()
+        clean_name = clean_name.upper()
+
+        with self._lock:
+            bot_id = self._next_id
+            self._next_id += 1
+            bot = BotInstance(
+                bot_id=bot_id,
+                host=ip,
+                port=port,
+                nickname=nickname,
+                password=password,
+                server_name=clean_name,
+                auto_regen_nick=auto_regen_nick,
+                manager=self,
+                is_banned=False,
+                default_task=default_task,
+            )
+            self.bots[bot_id] = bot
+            if self.active_bot_id is None:
+                self.active_bot_id = bot_id
+
+        self.save_accounts()
+        bot.start()
+        if default_task:
+            bot.set_task(default_task)
+
+        print(f"[+] Бот #{bot_id} ({nickname}) запущен на сервере {clean_name} ({ip}:{port})")
+        return bot
+
+    def generate_random_nickname(self) -> str:
+        names_file = os.path.join(os.path.dirname(__file__), "names.txt")
+        surnames_file = os.path.join(os.path.dirname(__file__), "surnames.txt")
+
+        if not hasattr(self, "_cached_names") or not self._cached_names:
+            self._cached_names = []
+            if os.path.exists(names_file):
+                with open(names_file, "r", encoding="utf-8", errors="ignore") as f:
+                    self._cached_names = [line.strip() for line in f if line.strip()]
+            if not self._cached_names:
+                self._cached_names = ["Alex", "Dmitry", "Sergey", "Maxim", "Ivan", "Artem", "Nikita"]
+
+        if not hasattr(self, "_cached_surnames") or not self._cached_surnames:
+            self._cached_surnames = []
+            if os.path.exists(surnames_file):
+                with open(surnames_file, "r", encoding="utf-8", errors="ignore") as f:
+                    self._cached_surnames = [line.strip() for line in f if line.strip()]
+            if not self._cached_surnames:
+                self._cached_surnames = ["Smith", "Ivanov", "Smirnov", "Kuznetsov", "Popov", "Sokolov"]
+
+        if not hasattr(self, "_used_nicknames"):
+            self._used_nicknames = set()
+
+        with self._lock:
+            current_active_nicks = {b.nickname for b in self.bots.values() if b.nickname}
+            all_used = self._used_nicknames | current_active_nicks
+
+        for _ in range(500):
+            first_name = random.choice(self._cached_names)
+            last_name = random.choice(self._cached_surnames)
+            nick = f"{first_name}_{last_name}"
+            if len(nick) > MAX_NICKNAME_LEN:
+                nick = nick[:MAX_NICKNAME_LEN]
+            if nick not in all_used:
+                self._used_nicknames.add(nick)
+                return nick
+
+        suffix = random.randint(10, 99)
+        base = f"{random.choice(self._cached_names)}_{random.choice(self._cached_surnames)}"
+        nick = f"{base[:MAX_NICKNAME_LEN - 3]}_{suffix}"
+        self._used_nicknames.add(nick)
+        return nick
+
+    def replace_bot_nickname(self, bot: BotInstance):
+        if bot.stopping:
+            return
+
+        old_nick = bot.nickname
+        new_nick = self.generate_random_nickname()
+        bot.add_log(f"Ник {old_nick} занят/зарегистрирован! Новый ник: {new_nick}")
+        print(f"[!] Бот #{bot.bot_id} [{old_nick}] -> ник занят. Замена на: {new_nick}")
+
+        task_name = bot.default_task_name or (bot.active_task.name if bot.active_task else "lvl")
+        srv_name = bot.server_name
+        pwd = bot.password
+
+        bot.stop()
+
+        def _respawn():
+            time.sleep(2.0)
+            with self._lock:
+                if bot.bot_id in self.bots:
+                    del self.bots[bot.bot_id]
+
+            new_b = self.add_bot(srv_name, new_nick, password=pwd, auto_regen_nick=True, default_task=task_name)
+            self.save_accounts()
+
+        threading.Thread(target=_respawn, daemon=True).start()
+
+    def add_bots_batch(self, target_server: str, count: int, password: str, default_task: str = "lvl"):
+        if not password or not password.strip():
+            print("[-] Ошибка: Пароль обязателен для создания ботов!")
+            return []
+
+        password = password.strip()
+        created = []
+        for i in range(count):
+            nick = self.generate_random_nickname()
+            bot = self.add_bot(target_server, nick, password=password, auto_regen_nick=True, default_task=default_task)
+            if bot:
+                created.append(bot)
+            time.sleep(2.0)
+        print(f"[+] Успешно создано и запущено {len(created)} ботов на сервере '{target_server}' с задачей '{default_task}'")
+        return created
+
+    def start_all(self):
+        with self._lock:
+            bots_to_start = [
+                b for b in self.bots.values()
+                if not b.is_banned and "В игре" not in b.status and "Подключение" not in b.status
+            ]
+
+        if not bots_to_start:
+            print("[*] Нет ботов, готовых к запуску (все уже в игре или забанены).")
+            return
+
+        print(f"[*] Запуск {len(bots_to_start)} ботов...")
+
+        def _starter():
+            for b in bots_to_start:
+                if b.is_banned or b.stopping:
+                    continue
+                print(f"[+] Запуск бота #{b.bot_id} [{b.nickname}] на сервере {b.server_name}...")
+                b.start()
+                time.sleep(2.0)
+            print(f"[+] Все боты ({len(bots_to_start)}) запущены!")
+
+        threading.Thread(target=_starter, daemon=True).start()
+
+    def start_bot(self, bot_id: int):
+        with self._lock:
+            bot = self.bots.get(bot_id)
+        if not bot:
+            print(f"[-] Бот #{bot_id} не найден.")
+            return
+        if bot.is_banned:
+            print(f"[!] Бот #{bot_id} помечен как ЗАБАНЕН. Используйте /unban {bot_id} если бан снят.")
+            return
+        bot.start()
+        print(f"[+] Бот #{bot_id} [{bot.nickname}] запускается...")
+
+    def unban_bot(self, bot_id: int):
+        with self._lock:
+            bot = self.bots.get(bot_id)
+        if not bot:
+            print(f"[-] Бот #{bot_id} не найден.")
+            return
+        bot.is_banned = False
+        bot.status = "Отключен"
+        bot.add_log("Статус бана снят пользователем")
+        self.save_accounts()
+        print(f"[+] Бот #{bot_id} [{bot.nickname}] разбанен! Теперь его можно запустить командой /start {bot_id}")
+
+    def delete_bot(self, bot_id: int):
+        with self._lock:
+            bot = self.bots.get(bot_id)
+            if not bot:
+                print(f"[-] Бот #{bot_id} не найден.")
+                return
+            bot.stop()
+            del self.bots[bot_id]
+        self.save_accounts()
+        print(f"[*] Бот #{bot_id} [{bot.nickname}] удален из списка и accounts.json.")
+
+    def list_bots(self):
+        print("\n" + "=" * 90)
+        print(f"{'ID':<4} {'Никнейм':<18} {'Сервер':<12} {'Пароль':<14} {'Задача':<16} {'Статус':<22}")
+        print("-" * 90)
+        with self._lock:
+            if not self.bots:
+                print("   (нет добавленных ботов)")
+            for bid, b in self.bots.items():
+                cur_marker = "* " if bid == self.active_bot_id else "  "
+                online_str = b.status
+                if b.connected_time and "В игре" in b.status:
+                    uptime = int(time.time() - b.connected_time)
+                    m, s = divmod(uptime, 60)
+                    h, m = divmod(m, 60)
+                    online_str += f" ({h:02d}:{m:02d})"
+                task_name = b.active_task.name if b.active_task else (b.default_task_name or "Ручной")
+                pwd_display = b.password if b.password else "(нет)"
+                print(f"{cur_marker}{bid:<2} {b.nickname:<18} {b.server_name[:10]:<12} {pwd_display[:12]:<14} {task_name[:14]:<16} {online_str:<22}")
+        print("=" * 90)
+        if self.active_bot_id is not None:
+            active_bot = self.bots.get(self.active_bot_id)
+            if active_bot:
+                print(f"[*] Активный бот для команд: #{self.active_bot_id} [{active_bot.nickname}]\n")
+
+    def show_logs(self, bot_id: int):
+        with self._lock:
+            bot = self.bots.get(bot_id)
+        if not bot:
+            print(f"[-] Бот #{bot_id} не найден.")
+            return
+
+        print(f"\n--- Последние логи бота #{bot_id} [{bot.nickname}] ({len(bot.logs)} записей) ---")
+        if not bot.logs:
+            print("   (логов пока нет)")
+        else:
+            for line in list(bot.logs):
+                print(line)
+        print("--- Конец логов ---\n")
+
+    def switch_active(self, bot_id: int):
+        with self._lock:
+            if bot_id not in self.bots:
+                print(f"[-] Бот #{bot_id} не существует.")
+                return False
+            self.active_bot_id = bot_id
+            bot = self.bots[bot_id]
+        print(f"[+] Выбран бот #{bot_id} [{bot.nickname}] на сервере {bot.server_name}")
+        return True
+
+    def stop_bot(self, bot_id: int):
+        with self._lock:
+            bot = self.bots.get(bot_id)
+        if not bot:
+            print(f"[-] Бот #{bot_id} не найден.")
+            return
+        bot.stop()
+        print(f"[*] Бот #{bot_id} [{bot.nickname}] остановлен.")
+
+    def stop_all(self):
+        with self._lock:
+            for b in self.bots.values():
+                b.stop()
+        emitter.shutdown(wait=False)
+
+
+def print_help():
+    print("""
+====================== УПРАВЛЕНИЕ МУЛЬТИБОТОМ ======================
+  /menu             - Главное меню управления аккаунтами и задачами
+  /list             - Список всех ботов, серверов, паролей и статусов
+  /startall         - Запустить всех доступных ботов (Кнопка 'Старт всех')
+  /start <ID>       - Запустить конкретного бота по ID
+  /stopall          - Остановить всех ботов
+  /stop <ID>        - Остановить бота по ID
+  /batch <сервер> <кол-во> <пароль> - Создать пачку ботов с авто-никами на качку LVL
+  /add <сервер> <ник> <пароль>      - Добавить аккаунт вручную
+  /task <lvl|quest|mine|stop> [ID]  - Назначить задачу боту
+  /switch <ID>      - Выбрать активного бота для консольных команд
+  /logs [ID]        - Посмотреть последние логи бота
+  /unban <ID>       - Снять статус бана с аккаунта
+  /del <ID>         - Удалить бота из списка и accounts.json
+  /stream           - Вкл/выкл живой вывод логов активного бота в консоль
+  /q                - Выход и остановка всех ботов
+
+--- Команды для активного бота ---
+  /chat <текст>     - Отправить сообщение в чат
+  /<команда>        - Любая серверная команда (например /time, /stats, /mm)
+  /dialog <id> <кнопка> [список] [текст] - Ответить в диалог
+====================================================================
+""")
+
+
+def interactive_menu(manager: BotManager):
+    manager.stream_active_logs = False
+    try:
+        while True:
+            print("\n============ МЕНЮ УПРАВЛЕНИЯ ============")
+            print("1. Показать список всех аккаунтов")
+            print("2. Добавить один аккаунт вручную (Пароль обязателен)")
+            print("3. Создать пачку ботов (Авто-генерация ников + качка LVL)")
+            print("4. ЗАПУСТИТЬ ВСЕХ БОТОВ (Кнопка 'Старт всех')")
+            print("5. Остановить всех ботов")
+            print("6. Запустить режим бота (Качка LVL / Квесты / Шахта)")
+            print("7. Посмотреть логи аккаунта")
+            print("8. Переключить активный аккаунт")
+            print("9. Остановить одного бота")
+            print("10. Снять статус бана с аккаунта")
+            print("11. Удалить аккаунт из списка")
+            print("0. Вернуться в консоль")
+            print("=========================================")
+            choice = input("Выберите пункт (0-11): ").strip()
+
+            if choice == "0":
+                break
+            elif choice == "1":
+                manager.list_bots()
+            elif choice == "2":
+                srv = input("Сервер (название или номер, например tver): ").strip()
+                if not srv:
+                    print("Отменено.")
+                    continue
+                nick = input("Никнейм (Name_Surname): ").strip()
+                if not nick:
+                    print("[-] Ошибка: Ник не может быть пустым.")
+                    continue
+                while True:
+                    pwd = input("Пароль аккаунта (обязательно): ").strip()
+                    if pwd:
+                        break
+                    print("[-] Ошибка: Пароль обязателен!")
+                manager.add_bot(srv, nick, pwd)
+            elif choice == "3":
+                srv = input("Сервер (название или номер, например tver): ").strip()
+                if not srv:
+                    print("Отменено.")
+                    continue
+                cnt_str = input("Количество ботов: ").strip()
+                if not cnt_str.isdigit() or int(cnt_str) <= 0:
+                    print("[-] Ошибка: Неверное количество.")
+                    continue
+                count = int(cnt_str)
+                while True:
+                    pwd = input("Пароль для всех создаваемых аккаунтов (обязательно): ").strip()
+                    if pwd:
+                        break
+                    print("[-] Ошибка: Пароль обязателен!")
+                manager.add_bots_batch(srv, count, password=pwd, default_task="lvl")
+            elif choice == "4":
+                manager.start_all()
+            elif choice == "5":
+                manager.stop_all()
+                print("[*] Все боты остановлены.")
+            elif choice == "6":
+                manager.list_bots()
+                b_str = input("Введите ID бота для смены режима: ").strip()
+                if b_str.isdigit():
+                    bid = int(b_str)
+                    with manager._lock:
+                        target_b = manager.bots.get(bid)
+                    if not target_b:
+                        print(f"[-] Бот #{bid} не найден.")
+                        continue
+                    print("\nВыберите режим:")
+                    print("  1. Качка LVL (Anti-AFK, микро-движения, сбор наград, скип диалогов)")
+                    print("  2. Квесты Дяди Славы (авто-диалоги, маркеры, посадка в авто)")
+                    print("  3. Бот Шахтер (добыча руды и сдача на склад)")
+                    print("  4. Выключить авто-режим (Ручное управление)")
+                    t_choice = input("Режим (1-4): ").strip()
+                    if t_choice == "1":
+                        res = target_b.set_task("lvl")
+                        print(f"[+] Бот #{bid}: {res}")
+                    elif t_choice == "2":
+                        res = target_b.set_task("quest")
+                        print(f"[+] Бот #{bid}: {res}")
+                    elif t_choice == "3":
+                        res = target_b.set_task("mine")
+                        print(f"[+] Бот #{bid}: {res}")
+                    elif t_choice == "4":
+                        res = target_b.set_task("stop")
+                        print(f"[*] Бот #{bid}: {res}")
+            elif choice == "7":
+                manager.list_bots()
+                b_str = input("Введите ID бота для просмотра логов: ").strip()
+                if b_str.isdigit():
+                    manager.show_logs(int(b_str))
+            elif choice == "8":
+                manager.list_bots()
+                b_str = input("Введите ID бота, на которого переключиться: ").strip()
+                if b_str.isdigit():
+                    manager.switch_active(int(b_str))
+            elif choice == "9":
+                manager.list_bots()
+                b_str = input("Введите ID бота для остановки: ").strip()
+                if b_str.isdigit():
+                    manager.stop_bot(int(b_str))
+            elif choice == "10":
+                manager.list_bots()
+                b_str = input("Введите ID бота для снятия бана: ").strip()
+                if b_str.isdigit():
+                    manager.unban_bot(int(b_str))
+            elif choice == "11":
+                manager.list_bots()
+                b_str = input("Введите ID бота для удаления: ").strip()
+                if b_str.isdigit():
+                    manager.delete_bot(int(b_str))
+    finally:
+        manager.stream_active_logs = True
+        print("[*] Вы вернулись в консоль управления. Введите /help для подсказки.")
+
+
+def main():
+    print("=" * 70)
+    print("   Black Russia Headless RakSAMP Bot Client [Multi-Account]   ")
+    print("=" * 70)
+
+    manager = BotManager()
+
+    if len(sys.argv) >= 4:
+        target_server = sys.argv[1]
+        nickname = sys.argv[2]
+        password = sys.argv[3]
+        manager.add_bot(target_server, nickname, password=password)
+    elif len(sys.argv) in (2, 3):
+        print("[-] Ошибка: Для запуска через аргументы пароль обязателен!")
+        print("Использование: python3 bot.py <сервер> <никнейм> <пароль>")
+    else:
+        if manager.bots:
+            print(f"\n[i] Найдено {len(manager.bots)} сохраненных аккаунтов из {os.path.basename(ACCOUNTS_FILE)}.")
+            manager.list_bots()
+            print("Введите /startall чтобы запустить всех, или /menu для перехода в меню.\n")
+        else:
+            print("\n[i] Первый запуск. Добавьте аккаунты через меню.")
+            interactive_menu(manager)
+
+    print_help()
+
+    while True:
+        try:
+            line = input().strip()
+            if not line:
+                continue
+
+            if line in ("/q", "exit", "quit"):
+                break
+
+            elif line in ("/menu", "menu"):
+                interactive_menu(manager)
+
+            elif line in ("/list", "list"):
+                manager.list_bots()
+
+            elif line in ("/startall", "/runall") or line == "/start all":
+                manager.start_all()
+
+            elif line.startswith("/start"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    manager.start_bot(int(parts[1]))
+                elif len(parts) >= 2 and parts[1].lower() == "all":
+                    manager.start_all()
+                else:
+                    print("Использование: /start <ID бота> или /startall")
+
+            elif line in ("/stopall",):
+                manager.stop_all()
+                print("[*] Все боты остановлены.")
+
+            elif line in ("/help", "help"):
+                print_help()
+
+            elif line.startswith("/add"):
+                parts = line.split(maxsplit=3)
+                if len(parts) >= 4 and parts[3].strip():
+                    srv = parts[1]
+                    nick = parts[2]
+                    pwd = parts[3].strip()
+                    manager.add_bot(srv, nick, pwd)
+                else:
+                    print("[-] Ошибка: Пароль обязателен!")
+                    print("Использование: /add <сервер> <никнейм> <пароль>")
+
+            elif line.startswith("/switch"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    manager.switch_active(int(parts[1]))
+                else:
+                    print("Использование: /switch <ID бота>")
+
+            elif line.startswith("/batch"):
+                parts = line.split()
+                if len(parts) >= 4 and parts[2].isdigit() and parts[3].strip():
+                    s_name = parts[1]
+                    b_count = int(parts[2])
+                    b_pwd = parts[3].strip()
+                    manager.add_bots_batch(s_name, b_count, password=b_pwd, default_task="lvl")
+                else:
+                    print("[-] Ошибка: Пароль обязателен!")
+                    print("Использование: /batch <сервер> <кол-во> <пароль>")
+
+            elif line.startswith("/task"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    t_name = parts[1].lower()
+                    target_id = int(parts[2]) if len(parts) >= 3 and parts[2].isdigit() else manager.active_bot_id
+                    if target_id is not None:
+                        with manager._lock:
+                            target_b = manager.bots.get(target_id)
+                        if target_b:
+                            res = target_b.set_task(t_name)
+                            print(f"[+] Бот #{target_id}: {res}")
+                        else:
+                            print(f"[-] Бот #{target_id} не найден.")
+                    else:
+                        print("[-] Укажите ID бота: /task <lvl|quest|mine|stop> [ID]")
+                else:
+                    print("Использование: /task <lvl|quest|mine|stop> [ID бота]")
+
+            elif line.startswith("/logs"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    manager.show_logs(int(parts[1]))
+                elif manager.active_bot_id is not None:
+                    manager.show_logs(manager.active_bot_id)
+                else:
+                    print("Нет активного бота. Укажите ID: /logs <ID>")
+
+            elif line == "/stream":
+                manager.stream_active_logs = not manager.stream_active_logs
+                st = "ВКЛЮЧЕН" if manager.stream_active_logs else "ВЫКЛЮЧЕН"
+                print(f"[*] Живой стриминг логов в консоль: {st}")
+
+            elif line.startswith("/unban"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    manager.unban_bot(int(parts[1]))
+                else:
+                    print("Использование: /unban <ID бота>")
+
+            elif line.startswith(("/del", "/delete")):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    manager.delete_bot(int(parts[1]))
+                else:
+                    print("Использование: /del <ID бота>")
+
+            elif line.startswith("/stop"):
+                parts = line.split()
+                if len(parts) >= 2 and parts[1].isdigit():
+                    manager.stop_bot(int(parts[1]))
+                else:
+                    print("Использование: /stop <ID бота>")
+
+            elif line.startswith("/dialog"):
+                with manager._lock:
+                    active = manager.bots.get(manager.active_bot_id) if manager.active_bot_id else None
+                if not active or not active.session:
+                    print("[-] Нет активного подключенного бота для отправки диалога.")
+                    continue
+                parts = line.split(maxsplit=4)
+                if len(parts) >= 3:
+                    try:
+                        d_id = int(parts[1])
+                        btn = int(parts[2])
+                        list_item = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+                        txt = parts[4] if len(parts) > 4 else (parts[3] if len(parts) > 3 and not parts[3].isdigit() else "")
+                        from samp.packets import PacketBuilder
+                        active.session._sender.send(
+                            PacketBuilder.rpc_build("dialog_response", d_id, btn, list_item, txt),
+                            rpc_name="dialog_response",
+                        )
+                        active.add_log(f"Ответ в диалог #{d_id}: кнопка={btn}, элемент={list_item}, текст='{txt}'")
+                    except Exception as e:
+                        print(f"[-] Ошибка отправки диалога: {e}")
+                else:
+                    print("Использование: /dialog <dialog_id> <кнопка: 0/1> [номер_строки: 0] [текст]")
+
+            elif line.startswith("/chat "):
+                with manager._lock:
+                    active = manager.bots.get(manager.active_bot_id) if manager.active_bot_id else None
+                if active:
+                    active.send_chat(line[6:])
+                else:
+                    print("[-] Нет активного бота.")
+
+            else:
+                with manager._lock:
+                    active = manager.bots.get(manager.active_bot_id) if manager.active_bot_id else None
+                if active:
+                    active.send_chat(line)
+                else:
+                    print("[-] Нет активного бота. Выберите бота через /switch <ID> или введите /menu")
+
+        except (KeyboardInterrupt, EOFError):
+            break
+
+    print("\n[*] Завершение работы всех ботов...")
+    manager.stop_all()
+
+
+if __name__ == "__main__":
+    main()
