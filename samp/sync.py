@@ -223,10 +223,6 @@ class PlayerSyncScheduler:
     def send_player_sync(self) -> None:
         bot_player = self.session.players.bot
 
-        # Режим паузы (AFK для окружающих): если бот на паузе, пакеты синхронизации глушатся
-        if getattr(bot_player, "is_paused", False):
-            return
-
         movement_result = None
 
         if hasattr(bot_player, "advance_movement_step"):

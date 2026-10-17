@@ -14,8 +14,9 @@ import re
 from collections import deque
 
 # Оптимизация системы для поддержки до 300+ ботов одновременно в Termux / Linux
+# 128 KB стек на поток позволяет держать 80-100 потоков всего в ~12 MB RAM
 try:
-    threading.stack_size(256 * 1024)  # 256 KB стек потока вместо 8 MB
+    threading.stack_size(128 * 1024)
 except Exception:
     pass
 
@@ -39,10 +40,104 @@ from logic.events import emitter
 from logic.bot_tasks import LevelGrinderTask, QuestMasterTask, MinerTask, FactoryTask, BusDriverTask
 from tg_controller import TelegramBotController
 
-MAX_NICKNAME_LEN = 20
-MAX_LOG_HISTORY = 100
-ACCOUNTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts.json")
-PROXIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt")
+# Режим экстремальной экономии ресурсов для 50-80+ ботов на слабых смартфонах
+ECO_80_MODE = os.environ.get("BR_ECO_80", "1").lower() in ("1", "true", "yes", "on")
+
+# История логов в памяти (на 80 ботов держим компактный буфер)
+MAX_LOG_HISTORY = 20 if ECO_80_MODE else 60
+
+# Тикрейт сетевого цикла одного бота:
+# В ECO-режиме снижаем до 6 FPS для АФК/прокачки. При 80 ботах это всего 480 wakeups/сек на всю систему!
+BOT_NETWORK_FPS = max(4.0, float(os.environ.get("BR_BOT_FPS", "6.0" if ECO_80_MODE else "12.0")))
+
+# Сколько ботов одновременно проходят хэндшейк на один сервер и суммарно.
+CONNECT_PER_SERVER = max(1, int(os.environ.get("BR_CONNECT_PER_SERVER", "2")))
+CONNECT_GLOBAL = max(1, int(os.environ.get("BR_CONNECT_GLOBAL", "4")))
+CONNECT_START_INTERVAL = max(0.5, float(os.environ.get("BR_CONNECT_INTERVAL", "2.5" if ECO_80_MODE else "1.8")))
+
+# Очередь при переполненном сервере (как в лаунчере).
+QUEUE_BASE_DELAY = max(2.0, float(os.environ.get("BR_QUEUE_BASE", "8")))
+QUEUE_MAX_DELAY = max(QUEUE_BASE_DELAY, float(os.environ.get("BR_QUEUE_MAX", "45")))
+QUEUE_JITTER = 0.35
+
+# Пауза между реконнектами после разрыва.
+RECONNECT_MIN = max(1.0, float(os.environ.get("BR_RECONNECT_MIN", "8")))
+RECONNECT_MAX = max(RECONNECT_MIN, float(os.environ.get("BR_RECONNECT_MAX", "20")))
+
+# accounts.json пишется не чаще раза в N секунд (на телефоне флеш — узкое место).
+SAVE_DEBOUNCE = max(0.0, float(os.environ.get("BR_SAVE_DEBOUNCE", "10")))
+
+# Чем сервер сообщает о переполнении.
+FULL_SERVER_MARKERS = (
+    "переполнен",
+    "нет свободных",
+    "свободных мест",
+    "мест нет",
+    "очеред",
+    "server is full",
+    "server full",
+    "no free slots",
+    "все слоты заняты",
+)
+
+
+class ConnectGate:
+    """Глобальный ограничитель подключений.
+
+    Держит не больше N одновременных хэндшейков на сервер и M суммарно,
+    плюс минимальный интервал между стартами. Тридцать ботов встают
+    в очередь и заходят по одному, а не лавиной — за лавину сервер кикает.
+    """
+
+    def __init__(
+        self,
+        per_server: int = CONNECT_PER_SERVER,
+        global_limit: int = CONNECT_GLOBAL,
+        interval: float = CONNECT_START_INTERVAL,
+    ):
+        self.per_server = max(1, int(per_server))
+        self.global_limit = max(1, int(global_limit))
+        self.interval = max(0.0, float(interval))
+
+        self._cond = threading.Condition()
+        self._active: dict[str, int] = {}
+        self._last_start: dict[str, float] = {}
+        self._global_active = 0
+
+    def wait_turn(self, server: str, timeout: float = 180.0) -> bool:
+        """Блокируется, пока не освободится слот. Возвращает False по таймауту."""
+        deadline = time.monotonic() + timeout
+        key = str(server or "")
+
+        with self._cond:
+            while True:
+                if (
+                    self._global_active < self.global_limit
+                    and self._active.get(key, 0) < self.per_server
+                ):
+                    wait_for = (
+                        self._last_start.get(key, 0.0)
+                        + self.interval
+                        - time.monotonic()
+                    )
+                    if wait_for <= 0:
+                        self._active[key] = self._active.get(key, 0) + 1
+                        self._global_active += 1
+                        self._last_start[key] = time.monotonic()
+                        return True
+                    self._cond.wait(min(wait_for, 0.5))
+                else:
+                    self._cond.wait(0.5)
+
+                if time.monotonic() >= deadline:
+                    return False
+
+    def release(self, server: str) -> None:
+        key = str(server or "")
+        with self._cond:
+            self._active[key] = max(0, self._active.get(key, 0) - 1)
+            self._global_active = max(0, self._global_active - 1)
+            self._cond.notify_all()
 
 
 class BotInstance:
@@ -90,7 +185,18 @@ class BotInstance:
         self.reconnect_thread = None
         self.reconnect_cancel_event = threading.Event()
         self.scheduled_reconnect_delay = None
-        self.stats_timer_thread = None
+
+        # Очередь на переполненный сервер (как в лаунчере)
+        self.queue_mode = False
+        self.queue_attempts = 0
+        self.queue_started_at = 0.0
+        self.queue_reason = ""
+        self._queue_timer_active = False
+        self._sched_lock = threading.Lock()
+        self._reconnect_pending = False
+        self._sched_generation = 0
+        # Подряд идущие неудачные попытки подключения
+        self.connect_failures = 0
 
         self.session = None
         self.api = None
@@ -155,11 +261,79 @@ class BotInstance:
         self.logs.append(formatted)
         return formatted
 
+    # ==================== ОЧЕРЕДЬ НА ПЕРЕПОЛНЕННЫЙ СЕРВЕР ====================
+
+    def _queue_delay(self) -> float:
+        """Адаптивная пауза: первые попытки быстрые, дальше реже, с джиттером."""
+        base = min(
+            QUEUE_MAX_DELAY,
+            QUEUE_BASE_DELAY + self.queue_attempts * 3.0,
+        )
+        # Джиттер только вверх: пауза не должна проваливаться ниже базовой,
+        # иначе бот долбит сервер чаще, чем задумано.
+        jitter = 1.0 + random.uniform(0.0, QUEUE_JITTER)
+        return round(max(2.0, base * jitter), 1)
+
+    def enter_queue(
+        self,
+        reason: str = "Сервер переполнен",
+        increment: bool = True,
+        min_delay: float = 0.0,
+    ) -> None:
+        """Встаёт в очередь и переподключается сам — как лаунчер."""
+        if self.stopping or self.is_banned:
+            return
+
+        self.queue_mode = True
+        self.queue_reason = reason
+        if not self.queue_started_at:
+            self.queue_started_at = time.time()
+
+        # Таймер очереди уже тикает: кик и дисконнект приходят парой на один
+        # и тот же обрыв, второй таймер и вторую попытку не плодим.
+        if self._queue_timer_active:
+            return
+
+        if increment:
+            self.queue_attempts += 1
+
+        delay = max(self._queue_delay(), float(min_delay))
+        self.status = f"Очередь #{self.queue_attempts} (вход через {int(delay)}с)"
+        self.add_log(
+            f"[ОЧЕРЕДЬ] {reason}. Попытка входа #{self.queue_attempts} "
+            f"через {delay:.0f}с."
+        )
+        self.schedule_reconnect(delay=delay)
+
+    def leave_queue(self) -> None:
+        """Сброс очереди при успешном входе."""
+        if self.queue_mode:
+            waited = int(time.time() - self.queue_started_at) if self.queue_started_at else 0
+            self.add_log(
+                f"[ОЧЕРЕДЬ] Вход разрешён с попытки #{self.queue_attempts} "
+                f"(ждал {waited}с)."
+            )
+        self.queue_mode = False
+        self.queue_attempts = 0
+        self.queue_started_at = 0.0
+        self.queue_reason = ""
+        self.connect_failures = 0
+
+    def is_queue_status(self) -> bool:
+        return self.queue_mode or self.status.startswith("Очередь")
+
     def setup_session(self):
         self.stopping = False
         self.network = Network(self.host, self.port)
         self.protocol = RakNetProtocol(self.network, security)
-        self.sync_scheduler = PlayerSyncScheduler()
+        # В ECO-режиме снижаем интервал OnFoot синхронизации для стоячего бота
+        # Вместо частых 5 пакетов/сек шлем раз в 0.7-1.2 секунды. Для сервера это валидный OnFoot.
+        sync_rate = 0.8 if ECO_80_MODE else 0.2
+        self.sync_scheduler = PlayerSyncScheduler(
+            rate_player=sync_rate,
+            rate_player_min=sync_rate,
+            rate_player_max=sync_rate * 1.5,
+        )
 
         reg_config = None
         if self.password:
@@ -188,7 +362,7 @@ class BotInstance:
             self.port,
             self.nickname,
             sync_scheduler=self.sync_scheduler,
-            fps=60.0,
+            fps=BOT_NETWORK_FPS,
             pings_ips_continuous=False,
             server_password=None,
             http_pre_ping=True,
@@ -202,6 +376,11 @@ class BotInstance:
 
         self.api = BotAPI(self.session)
         self.network.set_proxy_manager(self.session.proxy)
+
+        # Регистрируем объекты сессии/API в индексе менеджера для O(1) поиска
+        if self.manager and hasattr(self.manager, "_obj_index"):
+            self.manager._obj_index[id(self.session)] = self.bot_id
+            self.manager._obj_index[id(self.api)] = self.bot_id
 
         if self.proxy:
             try:
@@ -223,34 +402,60 @@ class BotInstance:
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
-        if not self.stats_timer_thread or not self.stats_timer_thread.is_alive():
-            self.stats_timer_thread = threading.Thread(target=self._stats_checker_loop, daemon=True)
-            self.stats_timer_thread.start()
+        # Один общий поток статистики на всех ботов вместо потока на каждого.
+        if self.manager and hasattr(self.manager, "_ensure_stats_scheduler"):
+            self.manager._ensure_stats_scheduler()
 
         return True
 
-    def _stats_checker_loop(self):
-        """Регулярная проверка /mm -> Статистика раз в 30 минут"""
-        while not self.stopping and not self.is_banned:
-            time.sleep(30)
-            if self.stopping or self.is_banned:
-                break
-            if self.session and self.session.connected and "В игре" in self.status:
-                now = time.time()
-                # Если прошло 30 минут с прошлой проверки
-                if now - self.last_stats_check >= 1800:
-                    self.stats_pending = True
-                    self.send_chat("/mm")
-                    self.last_stats_check = now
+    def _stats_tick(self, now: float) -> None:
+        """Один тик проверки статистики (вызывается общим шедулером менеджера)."""
+        if self.stopping or self.is_banned:
+            return
+        if not (self.session and self.session.connected):
+            return
+        if "В игре" not in self.status:
+            return
+        if now - self.last_stats_check >= 1800:
+            self.stats_pending = True
+            self.send_chat("/mm")
+            self.last_stats_check = now
 
     def _run(self):
         try:
-            connected = self.api.connect()
-            if not connected and not self.stopping and not self.is_banned:
-                # Если сервер не ответил на хэндшейк (сервер полон или пакет потерялся),
-                # повторяем быстро через 5-10 сек, а не ждём 5 минут!
-                retry_delay = round(random.uniform(5.0, 10.0), 1)
-                self.add_log(f"Сервер не ответил на подключение. Повтор через {retry_delay}с...")
+            # Гейт: не больше N одновременных хэндшейков на сервер.
+            gate = getattr(self.manager, "connect_gate", None)
+            gate_held = False
+            if gate is not None:
+                gate_held = gate.wait_turn(self.host)
+            try:
+                connected = self.api.connect()
+            finally:
+                if gate_held and gate is not None:
+                    gate.release(self.host)
+
+            if connected:
+                self.connect_failures = 0
+                return
+
+            if self.stopping or self.is_banned:
+                return
+
+            # Реконнект уже запланирован обработчиком кика/дисконнекта —
+            # второй таймер не нужен, иначе попытки считаются дважды.
+            if self.reconnect_thread and self.reconnect_thread.is_alive():
+                return
+
+            self.connect_failures += 1
+
+            # Сервер молчит: чаще всего это переполнение. Встаём в очередь.
+            if self.connect_failures >= 2 or self.queue_mode:
+                self.enter_queue("Сервер не отвечает (переполнен)", increment=True)
+            else:
+                retry_delay = round(random.uniform(RECONNECT_MIN, RECONNECT_MAX), 1)
+                self.add_log(
+                    f"Сервер не ответил на подключение. Повтор через {retry_delay}с..."
+                )
                 self.schedule_reconnect(delay=retry_delay)
         except Exception as e:
             if not self.stopping and not self.is_banned:
@@ -261,9 +466,19 @@ class BotInstance:
     def schedule_reconnect(self, delay: float = 10.0):
         if self.stopping or self.is_banned:
             return
-        
-        # Если старый поток реконнекта еще работает, прерываем его перед планированием нового
-        self.cancel_reconnect()
+
+        # Кик и дисконнект на один обрыв приходят парой, плюс _run может
+        # успеть следом. Флаг ставим синхронно под локом — поток мог ещё
+        # не стартовать, и is_alive() тут не спасёт.
+        with self._sched_lock:
+            if self._reconnect_pending:
+                return
+            self._reconnect_pending = True
+            self._sched_generation += 1
+            my_gen = self._sched_generation
+
+        # Гасим предыдущий таймер, не трогая наш только что поставленный флаг
+        self.reconnect_cancel_event.set()
         if self.reconnect_thread and self.reconnect_thread.is_alive():
             try:
                 self.reconnect_thread.join(timeout=0.2)
@@ -272,28 +487,53 @@ class BotInstance:
 
         self.reconnect_cancel_event.clear()
         target_time = time.time() + delay
-        self.add_log(f"Связь разорвана/ожидание. Авто-вход через {int(delay)} сек...")
+        self._queue_timer_active = bool(self.queue_mode)
+        if self.queue_mode:
+            self.add_log(
+                f"Очередь: следующая попытка входа через {int(delay)} сек..."
+            )
+        else:
+            self.add_log(f"Связь разорвана/ожидание. Авто-вход через {int(delay)} сек...")
 
         def _reconnect_waiter():
-            while time.time() < target_time:
+            try:
+                while time.time() < target_time:
+                    if self.reconnect_cancel_event.is_set() or self.stopping or self.is_banned:
+                        return
+                    rem = max(0, int(target_time - time.time()))
+                    m, s = divmod(rem, 60)
+                    if self.queue_mode:
+                        self.status = f"Очередь #{self.queue_attempts} ({m:02d}:{s:02d})"
+                    else:
+                        self.status = f"Ожидание ({m:02d}:{s:02d})"
+                    time.sleep(1.0)
+
                 if self.reconnect_cancel_event.is_set() or self.stopping or self.is_banned:
                     return
-                rem = max(0, int(target_time - time.time()))
-                m, s = divmod(rem, 60)
-                self.status = f"Ожидание ({m:02d}:{s:02d})"
-                time.sleep(1.0)
 
-            if self.reconnect_cancel_event.is_set() or self.stopping or self.is_banned:
-                return
-
-            self.add_log(f"Ожидание завершено ({int(delay)} сек). Автоматический перезапуск сессии...")
-            self.start()
+                if self.queue_mode:
+                    self.add_log(
+                        f"[ОЧЕРЕДЬ] Попытка входа #{self.queue_attempts} — подключаемся..."
+                    )
+                else:
+                    self.add_log(f"Ожидание завершено ({int(delay)} сек). Автоматический перезапуск сессии...")
+                self.start()
+            finally:
+                # Таймер отработал (или отменён). Флаг снимает только тот
+                # таймер, чья генерация ещё актуальна — иначе старый поток
+                # затрёт флаг новому.
+                self._queue_timer_active = False
+                with self._sched_lock:
+                    if self._sched_generation == my_gen:
+                        self._reconnect_pending = False
 
         self.reconnect_thread = threading.Thread(target=_reconnect_waiter, daemon=True)
         self.reconnect_thread.start()
 
     def cancel_reconnect(self):
         self.reconnect_cancel_event.set()
+        with self._sched_lock:
+            self._reconnect_pending = False
 
     def send_chat(self, msg: str):
         if self.api:
@@ -337,6 +577,9 @@ class BotInstance:
     def stop(self, banned: bool = False):
         self.stopping = True
         self.cancel_reconnect()
+        self.queue_mode = False
+        self.queue_reason = ""
+        self._queue_timer_active = False
         if self.active_task:
             try:
                 self.active_task.stop()
@@ -353,11 +596,25 @@ class BotInstance:
 
 class BotManager:
     def __init__(self):
+        self._ensure_br_alias()
         self.bots: dict[int, BotInstance] = {}
         self._next_id = 1
         self.active_bot_id: int | None = None
         self._lock = threading.Lock()
         self.stream_active_logs = True
+
+        # Гейт подключений: 30 ботов не входят лавиной (иначе кик за частые входы)
+        self.connect_gate = ConnectGate()
+        # Общий поток статистики (вместо потока на каждого бота)
+        self._stats_thread = None
+        # Индекс ник -> бот, чтобы не сканировать всех на каждой строке лога
+        self._nick_index: dict[str, BotInstance] = {}
+        # Индекс id(session/api) -> bot_id: O(1) на событиях пакетов
+        self._obj_index: dict[int, int] = {}
+        # Дебаунс записи accounts.json
+        self._save_lock = threading.Lock()
+        self._last_save = 0.0
+        self._save_pending = False
 
         # Кэш соответствия IP серверов и их названий (для правильного HTTP pre-ping заголовка Host)
         self.server_names_cache = {}
@@ -373,14 +630,92 @@ class BotManager:
         # Загружаем сохраненные аккаунты из accounts.json
         self.load_accounts()
 
+    def _ensure_br_alias(self):
+        """Автоматически регистрирует команду 'br' в системе при первом запуске."""
+        try:
+            repo_dir = os.path.dirname(os.path.abspath(__file__))
+            candidates = [
+                "/data/data/com.termux/files/usr/bin/br",
+                os.path.expanduser("~/.local/bin/br"),
+                "/usr/local/bin/br"
+            ]
+            for target in candidates:
+                target_dir = os.path.dirname(target)
+                if os.path.isdir(target_dir) and os.access(target_dir, os.W_OK):
+                    script_content = (
+                        "#!/bin/bash\n"
+                        f'cd "{repo_dir}" && exec python3 bot.py "$@"\n'
+                    )
+                    need_write = True
+                    if os.path.exists(target):
+                        try:
+                            with open(target, "r", encoding="utf-8") as f:
+                                if f.read() == script_content:
+                                    need_write = False
+                        except Exception:
+                            pass
+                    if need_write:
+                        with open(target, "w", encoding="utf-8") as f:
+                            f.write(script_content)
+                        os.chmod(target, 0o755)
+                    break
+        except Exception:
+            pass
+
+    def _ensure_stats_scheduler(self) -> None:
+        """Один поток статистики на весь ботнет. Экономит N-1 потоков."""
+        if self._stats_thread and self._stats_thread.is_alive():
+            return
+        self._stats_thread = threading.Thread(
+            target=self._stats_scheduler_loop,
+            daemon=True,
+            name="stats-scheduler",
+        )
+        self._stats_thread.start()
+
+    def _stats_scheduler_loop(self) -> None:
+        last_gc = time.time()
+        while True:
+            time.sleep(5.0)
+            now = time.time()
+            with self._lock:
+                bots = list(self.bots.values())
+            for b in bots:
+                try:
+                    b._stats_tick(now)
+                except Exception:
+                    pass
+            # Дописываем отложенные изменения accounts.json
+            try:
+                self.flush_pending_save()
+            except Exception:
+                pass
+
+            # Периодический сборщик мусора (GC) для стабильной работы 80+ ботов в Termux
+            if now - last_gc >= 180.0:
+                try:
+                    import gc
+                    gc.collect()
+                    last_gc = now
+                except Exception:
+                    pass
+
     def _handle_global_log(self, raw_message: str) -> bool:
         assigned = False
+        nick_match = _LOG_NICK_RE.search(raw_message)
+        nick = nick_match.group(1) if nick_match else None
+
         with self._lock:
-            for b in self.bots.values():
-                if b.nickname and b.nickname in raw_message:
-                    b.logs.append(raw_message)
-                    assigned = True
-                    break
+            bot = self._nick_index.get(nick) if nick else None
+            if bot is not None:
+                bot.logs.append(raw_message)
+                assigned = True
+            else:
+                for b in self.bots.values():
+                    if b.nickname and b.nickname in raw_message:
+                        b.logs.append(raw_message)
+                        assigned = True
+                        break
 
             if not assigned and self.active_bot_id is not None:
                 cur = self.bots.get(self.active_bot_id)
@@ -400,9 +735,21 @@ class BotManager:
             return False
 
     def _find_bot_by_session_or_api(self, bot_obj):
+        """O(1) поиск бота по объекту сессии/API.
+
+        Вызывается на каждом событии пакета — при 30 ботах линейный
+        перебор по всем ботам тут был бы главным пожирателем CPU.
+        """
+        bot_id = self._obj_index.get(id(bot_obj))
+        if bot_id is not None:
+            bot = self.bots.get(bot_id)
+            if bot is not None:
+                return bot
+
         with self._lock:
             for b in self.bots.values():
                 if b.api == bot_obj or b.session == bot_obj:
+                    self._obj_index[id(bot_obj)] = b.bot_id
                     return b
         return None
 
@@ -484,6 +831,8 @@ class BotManager:
         def _on_connected(bot_obj, *args, **kwargs):
             b = self._find_bot_by_session_or_api(bot_obj)
             if b:
+                # Вход разрешён — очередь сброшена
+                b.leave_queue()
                 b.status = "В игре (авторизован)"
                 b.connected_time = time.time()
                 b.add_log("Подключение установлено, мир загружен")
@@ -494,21 +843,40 @@ class BotManager:
         def _on_spawn(bot_obj, *args, **kwargs):
             b = self._find_bot_by_session_or_api(bot_obj)
             if b:
+                b.leave_queue()
                 b.status = "В игре (заспавнен)"
                 b.add_log("Персонаж заспавнен на карте")
-                # При спавне запрашиваем scores/pings и /mm
-                def _initial_stats_query():
-                    time.sleep(1.5)
+
+                # Гарантируем синхронизацию позиции и мира
+                def _sync_spawn_world():
+                    time.sleep(1.0)
                     if b.api and b.session and b.session.connected:
+                        # Отправляем подтверждение выбора вокзала и RPC spawn
+                        from samp.interfaces import InterfaceID
+                        from samp.packets import PacketBuilder
+                        try:
+                            b.session.send_json(InterfaceID.SPAWN_SELECT, {"t": 1, "s": 0})
+                            b.session.send_json(InterfaceID.SPAWN_SELECT, {"s": 0})
+                            b.session._sender.send(PacketBuilder.rpc_build("spawn"), rpc_name="spawn")
+                        except Exception:
+                            pass
+                        time.sleep(0.5)
                         try:
                             b.api.sendscoresandpings()
+                        except Exception:
+                            pass
+                        # Микро-прыжок для стрима окружающих игроков и обновления сетевой модели
+                        try:
+                            b.api.SetKey(keys=32)
+                            time.sleep(0.15)
+                            b.api.SetKey(keys=0)
                         except Exception:
                             pass
                     time.sleep(2.0)
                     if b.api and "В игре" in b.status:
                         b.stats_pending = True
                         b.send_chat("/mm")
-                threading.Thread(target=_initial_stats_query, daemon=True).start()
+                threading.Thread(target=_sync_spawn_world, daemon=True).start()
 
         @emitter.on("onShowChat")
         def _on_chat(bot_obj, message, *args, **kwargs):
@@ -520,6 +888,11 @@ class BotManager:
                 msg_lower = str(message).lower()
                 clean_msg = re.sub(r'\{[0-9a-fA-F]{6}\}', '', str(message))
                 clean_msg_lower = clean_msg.lower()
+
+                # 0. Сервер сообщил о переполнении -> встаём в очередь как лаунчер
+                if any(k in clean_msg_lower for k in FULL_SERVER_MARKERS):
+                    b.enter_queue(f"Сервер переполнен: {clean_msg[:60]}")
+                    return
 
                 # 1. Проверяем бан аккаунта / блокировку администратором
                 # Примеры: "Администратор X забанил Y", "Вы были заблокированы", "аккаунт забанен"
@@ -578,6 +951,25 @@ class BotManager:
 
                 dialog_text = f"{title} {info}".lower()
                 clean_info = re.sub(r'\{[0-9a-fA-F]{6}\}', '', info)
+
+                # 0. Диалог о переполнении сервера -> очередь как в лаунчере
+                if any(k in dialog_text for k in FULL_SERVER_MARKERS):
+                    b.add_log(f"[ОЧЕРЕДЬ] Сервер переполнен (диалог #{d_id}): {title}")
+                    # Закрываем диалог, чтобы не висел
+                    def _close_full_dialog():
+                        time.sleep(0.4)
+                        from samp.packets import PacketBuilder
+                        if b.session and b.session.connected:
+                            try:
+                                b.session._sender.send(
+                                    PacketBuilder.rpc_build("dialog_response", int(d_id), 0, 0, ""),
+                                    rpc_name="dialog_response",
+                                )
+                            except Exception:
+                                pass
+                    threading.Thread(target=_close_full_dialog, daemon=True).start()
+                    b.enter_queue("Сервер переполнен (диалог)")
+                    return
 
                 # 1. Автоматический опрос /mm -> Статистика
                 # Меню /mm: выбор "Статистика персонажа" (обычно 0 пункт)
@@ -721,13 +1113,19 @@ class BotManager:
                     b.status = "Отключен"
                     return
 
+                # Уже в очереди на переполненный сервер — таймер уже идёт
+                if b.queue_mode:
+                    return
+
                 # Проверяем, был ли задан кастомный таймер ожидания (рестарт, лимит IP, бан за частые входы)
                 if b.scheduled_reconnect_delay:
                     reconnect_delay = b.scheduled_reconnect_delay
                     b.scheduled_reconnect_delay = None
                 else:
-                    # Быстрый повторный вход (5-10 сек), если это обычный реконнект
-                    reconnect_delay = round(random.uniform(5.0, 10.0), 1)
+                    # Разброс паузы, чтобы 30 ботов не входили одновременно
+                    reconnect_delay = round(
+                        random.uniform(RECONNECT_MIN, RECONNECT_MAX), 1
+                    )
 
                 b.schedule_reconnect(delay=reconnect_delay)
 
@@ -741,6 +1139,21 @@ class BotManager:
                     return
                 if reason_code == 2 and getattr(b, "auto_regen_nick", False):
                     self.replace_bot_nickname(b)
+                    return
+                # 2 = аккаунт уже в сети. Сервер ещё держит призрачную сессию —
+                # ломиться сразу бессмысленно, он будет кикать по кругу.
+                if reason_code == 2:
+                    wait = round(random.uniform(45.0, 90.0), 1)
+                    b.status = f"Сессия занята (повтор через {int(wait)}с)"
+                    b.add_log(
+                        f"[РЕКОННЕКТ] Аккаунт уже в сети. Ждём {int(wait)}с, "
+                        f"пока сервер отпустит старую сессию."
+                    )
+                    b.schedule_reconnect(delay=wait)
+                    return
+                # 4 = нет свободных слотов -> встаём в очередь и заходим сами
+                if reason_code == 4:
+                    b.enter_queue("Сервер переполнен (нет свободных слотов)")
                     return
                 b.status = f"Кикнут (код {reason_code})"
 
@@ -875,8 +1288,34 @@ class BotManager:
                 print(f"[+] Загружено {loaded_count} сохраненных аккаунтов из {os.path.basename(ACCOUNTS_FILE)}")
         except Exception as e:
             print(f"[!] Ошибка загрузки {ACCOUNTS_FILE}: {e}")
+        finally:
+            self._rebuild_nick_index()
 
-    def save_accounts(self):
+    def _forget_bot(self, bot: BotInstance) -> None:
+        """Убирает бота из индексов (при удалении/замене ника)."""
+        self._nick_index.pop(bot.nickname, None)
+        if bot.session is not None:
+            self._obj_index.pop(id(bot.session), None)
+        if bot.api is not None:
+            self._obj_index.pop(id(bot.api), None)
+
+    def _rebuild_nick_index(self) -> None:
+        """Пересобирает индекс ник -> бот. Вызывать после любых изменений состава ботов."""
+        with self._lock:
+            self._nick_index = {
+                b.nickname: b for b in self.bots.values() if b.nickname
+            }
+
+    def save_accounts(self, force: bool = False):
+        """Пишет accounts.json. Без force — не чаще раза в 10 секунд (бережём флеш)."""
+        now = time.time()
+        with self._save_lock:
+            if not force and (now - self._last_save) < SAVE_DEBOUNCE:
+                self._save_pending = True
+                return
+            self._last_save = now
+            self._save_pending = False
+
         with self._lock:
             data = []
             for b in self.bots.values():
@@ -897,6 +1336,13 @@ class BotManager:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception as e:
             print(f"[!] Ошибка сохранения {ACCOUNTS_FILE}: {e}")
+
+    def flush_pending_save(self) -> None:
+        """Дописывает accounts.json, если изменения были отложены дебаунсом."""
+        with self._save_lock:
+            pending = self._save_pending
+        if pending:
+            self.save_accounts(force=True)
 
     def notify_users(self, text: str):
         if hasattr(self, "tg_controller") and self.tg_controller:
@@ -954,8 +1400,9 @@ class BotManager:
             self.bots[bot_id] = bot
             if self.active_bot_id is None:
                 self.active_bot_id = bot_id
+            self._nick_index[bot.nickname] = bot
 
-        self.save_accounts()
+        self.save_accounts(force=True)
         bot.start()
         if default_task:
             bot.set_task(default_task)
@@ -1027,9 +1474,10 @@ class BotManager:
             with self._lock:
                 if bot.bot_id in self.bots:
                     del self.bots[bot.bot_id]
+                self._forget_bot(bot)
 
             new_b = self.add_bot(srv_name, new_nick, password=pwd, auto_regen_nick=True, default_task=task_name)
-            self.save_accounts()
+            self.save_accounts(force=True)
 
         threading.Thread(target=_respawn, daemon=True).start()
 
@@ -1181,7 +1629,8 @@ class BotManager:
                 return
             bot.stop()
             del self.bots[bot_id]
-        self.save_accounts()
+            self._forget_bot(bot)
+        self.save_accounts(force=True)
         print(f"[*] Бот #{bot_id} [{bot.nickname}] удален из списка и accounts.json.")
 
     def _get_bot_location_name(self, bot: BotInstance) -> str:

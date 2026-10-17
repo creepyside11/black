@@ -287,12 +287,23 @@ class SampPacketHandler:
 
     def _emit_set_position_event(self, result: dict) -> None:
         parsed = result.get("parsed_payload") or {}
+        x = parsed.get("x")
+        y = parsed.get("y")
+        z = parsed.get("z")
+
+        # Немедленно обновляем координаты у бота в памяти и запускаем синхронизацию
+        if self.session and self.session.players and self.session.players.bot:
+            bot = self.session.players.bot
+            if x is not None and y is not None and z is not None:
+                bot.update_position(float(x), float(y), float(z))
+                if hasattr(self.session, "sync") and self.session.sync:
+                    self.session.sync.start()
 
         self.session._emit_callback(
             "OnSetPosition",
-            parsed.get("x"),
-            parsed.get("y"),
-            parsed.get("z"),
+            x,
+            y,
+            z,
         )
 
     def _emit_set_skin_event(self, result: dict) -> None:

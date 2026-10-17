@@ -67,11 +67,29 @@ class TelegramBotController:
             return "🔴 БАН"
         elif "в игре" in s or "заспавнен" in s or "авторизован" in s:
             return "🟢 Онлайн"
+        elif "очеред" in s or "ожидани" in s or "сессия занята" in s or "повтор" in s:
+            return "🟢 Ожидание"
         elif "подключение" in s or "реконнект" in s:
-            return "🟡 Коннект..."
-        elif "остановлен" in s or "отключен" in s:
-            return "⚪️ Остановлен"
-        return f"⚪️ {status}"
+            return "🟢 Коннект..."
+        elif "остановлен" in s or "отключен" in s or "ошибка" in s or "кикнут" in s:
+            return "🔴 Остановлен"
+        return f"🔴 {status}"
+
+    def _get_bot_button_style(self, status: str) -> str:
+        s = status.lower()
+        if (
+            "в игре" in s
+            or "заспавнен" in s
+            or "авторизован" in s
+            or "очеред" in s
+            or "ожидани" in s
+            or "сессия занята" in s
+            or "повтор" in s
+            or "подключение" in s
+            or "реконнект" in s
+        ):
+            return "success"
+        return "danger"
 
     def _build_pagination_keyboard(self, page: int = 1):
         with self.manager._lock:
@@ -91,7 +109,14 @@ class TelegramBotController:
         for bid, b in page_bots:
             status_ico = self._format_status_badge(b.status)
             btn_text = f"#{bid} {b.nickname} [{status_ico}]"
-            bot_buttons.append(types.InlineKeyboardButton(btn_text, callback_data=f"bot_view:{bid}:{page}"))
+            btn_style = self._get_bot_button_style(b.status)
+            bot_buttons.append(
+                types.InlineKeyboardButton(
+                    btn_text,
+                    callback_data=f"bot_view:{bid}:{page}",
+                    style=btn_style,
+                )
+            )
         
         # Размещаем ботов парами или по одному
         for i in range(0, len(bot_buttons), 2):
@@ -265,9 +290,29 @@ class TelegramBotController:
 
                 markup = types.InlineKeyboardMarkup(row_width=2)
                 # Кнопки действий
-                btn_start_stop = types.InlineKeyboardButton("▶️ Запустить", callback_data=f"bot_start:{bid}:{page}")
-                if "в игре" in b.status.lower() or "подключение" in b.status.lower():
-                    btn_start_stop = types.InlineKeyboardButton("⏹ Остановить", callback_data=f"bot_stop:{bid}:{page}")
+                s_lower = b.status.lower()
+                is_active = (
+                    "в игре" in s_lower
+                    or "подключение" in s_lower
+                    or "очеред" in s_lower
+                    or "ожидани" in s_lower
+                    or "сессия занята" in s_lower
+                    or "повтор" in s_lower
+                    or b.queue_mode
+                    or getattr(b, "_reconnect_pending", False)
+                )
+                if is_active:
+                    btn_start_stop = types.InlineKeyboardButton(
+                        "⏹ Остановить",
+                        callback_data=f"bot_stop:{bid}:{page}",
+                        style="danger",
+                    )
+                else:
+                    btn_start_stop = types.InlineKeyboardButton(
+                        "▶️ Запустить",
+                        callback_data=f"bot_start:{bid}:{page}",
+                        style="success",
+                    )
 
                 markup.row(btn_start_stop, types.InlineKeyboardButton("📜 Логи", callback_data=f"bot_logs:{bid}:{page}"))
                 markup.row(

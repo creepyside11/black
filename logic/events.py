@@ -1,16 +1,36 @@
 
 from typing import Callable, Hashable
 from concurrent.futures import ThreadPoolExecutor
+import os
 import threading
 from core import logger
 
+def _default_pool_workers() -> int:
+    """64 воркера — это для сервера. На телефоне они только дерутся за GIL.
+
+    Хендлеры событий короткие, поэтому 2 воркера на ядро — оптимум;
+    больше потоков даёт лишь лишние переключения контекста.
+    """
+    override = os.environ.get("BR_EVENT_WORKERS")
+    if override:
+        try:
+            return max(2, int(override))
+        except ValueError:
+            pass
+    try:
+        cpus = os.cpu_count() or 4
+    except Exception:
+        cpus = 4
+    return max(4, min(16, cpus * 2))
+
+
 class EventEmitter:
 
-    def __init__(self, max_workers: int = 64):
+    def __init__(self, max_workers: int | None = None):
         self._listeners: dict[str, list[Callable]] = {}
         self._keyed_listeners: dict[str, dict[Hashable, list[Callable]]] = {}
         self._pool = ThreadPoolExecutor(
-            max_workers=max_workers,
+            max_workers=max_workers or _default_pool_workers(),
             thread_name_prefix="evt-worker",
         )
         self._shutdown = False

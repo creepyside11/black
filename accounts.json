@@ -172,7 +172,7 @@
     "is_banned": false,
     "proxy": "",
     "lvl": "-",
-    "money": 0,
+    "money": 200,
     "target_lvl": null
   },
   {
@@ -694,6 +694,61 @@
   },
   {
     "nickname": "Brittnee_Elchev",
+    "password": "55337q",
+    "server": "BELGOROD",
+    "task": "lvl",
+    "is_banned": false,
+    "proxy": "",
+    "lvl": "-",
+    "money": 0,
+    "target_lvl": null
+  },
+  {
+    "nickname": "Egor_Ivanov",
+    "password": "br_617150",
+    "server": "VORONEZH",
+    "task": "lvl",
+    "is_banned": false,
+    "proxy": "",
+    "lvl": "-",
+    "money": 0,
+    "target_lvl": null
+  },
+  {
+    "nickname": "Danya_Kuznetsov",
+    "password": "pass_12345",
+    "server": "RED",
+    "task": "lvl",
+    "is_banned": false,
+    "proxy": "",
+    "lvl": "-",
+    "money": 0,
+    "target_lvl": null
+  },
+  {
+    "nickname": "Helana_Kusekeev",
+    "password": "55337q",
+    "server": "BELGOROD",
+    "task": "lvl",
+    "is_banned": false,
+    "proxy": "",
+    "lvl": "-",
+    "money": 0,
+    "target_lvl": null
+  },
+  {
+    "nickname": "Roma_Ynmqdq",
+    "password": "pass_br_123",
+    "server": "BELGOROD",
+    "task": "lvl",
+    "is_banned": false,
+    "proxy": "",
+    "lvl": "-",
+    "money": 0,
+    "target_lvl": null
+  },
+  {
+    "nickname": "Soledad_Kelso",
     "password": "55337q",
     "server": "BELGOROD",
     "task": "lvl",

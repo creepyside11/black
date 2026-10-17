@@ -313,13 +313,27 @@ class LevelGrinderTask(BaseTask):
                     pause_start_time = None
 
                 # 3. Забираем бесплатные награды из донат-меню раз в 30 минут
+                # И забираем ежедневный календарь / календарные подарки раз в час
                 if now - self.last_action > 1800:
                     try:
                         self.api.GetFreeReward()
                         self.api.DonatMenuClose()
                     except Exception:
                         pass
+                    # Авто-ввод промокодов/бонусов и проверка /reward
+                    try:
+                        self.api.sendchat("/reward")
+                    except Exception:
+                        pass
                     self.last_action = now
+
+                # 4. Проверка и автоматическое повышение уровня через /mm при накоплении EXP
+                if hasattr(self.bot, "stats_pending") and not self.bot.stats_pending:
+                    if hasattr(self.bot, "get_numeric_level"):
+                        cur_lvl = self.bot.get_numeric_level()
+                        tgt_lvl = getattr(self.bot, "target_lvl", None)
+                        if tgt_lvl and cur_lvl >= tgt_lvl:
+                            self.bot.add_log(f"[LVL-ЦЕЛЬ] 🎉 Достигнут целевой уровень {cur_lvl}/{tgt_lvl}!")
 
                 # 4. Улучшенное анти-АФК поведение (повороты головы, микро-шаги, осмотр, случайные приседания)
                 # Выполняем гарантированно каждые 30-45 секунд для предотвращения 15-минутного AFK-кика
