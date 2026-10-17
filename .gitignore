@@ -3,3 +3,10 @@
 __pycache__/
 *.pyc
 *.jpg
+br/
+*.py
+!bot.py
+!tg_controller.py
+!ai_controller.py
+!br_servers.py
+!raknet_core.py
