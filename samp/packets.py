@@ -105,6 +105,10 @@ class RPCBuilder:
         return b"", 0
 
     @staticmethod
+    def request_spawn() -> tuple[bytes, int]:
+        return b"", 0
+
+    @staticmethod
     def payload_send_chat(message: str) -> tuple[bytes, int]:
         message_bytes = message.encode(
             "utf-8",

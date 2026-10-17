@@ -187,13 +187,25 @@ class RPCParser:
             errors="ignore"
         )
 
+        # In Black Russia dialogs, button1 holds the list text if style in (2, 4, 5) or info is in button1
+        # Let's inspect length
         info_len = bs.read_uint32()
-
         info = bs.read_string(
             info_len,
             "utf-8",
             errors="ignore"
-        )
+        ) if info_len > 0 else ""
+
+        # Normalize fields if Black Russia swapped list content into button1
+        if "\n" in button1 and not info:
+            info = button1
+            button1 = button2
+            button2 = ""
+        elif "\n" in button1 and button2 in ("Выбрать", "Да", "Ок", "Закрыть", "Отмена"):
+            temp = button1
+            button1 = button2
+            button2 = info
+            info = temp
 
         return {
             "dialog_id": dialog_id,
@@ -560,14 +572,18 @@ class RPCParser:
 
     @staticmethod
     def set_vehicle_z_angle(bs: BitStream) -> dict | None:
+        try:
+            if bs.remaining_bits < 16:
+                return None
+            vehicle_id = bs.read_uint16()
+            rotation = bs.read_float() if bs.remaining_bits >= 32 else 0.0
 
-        vehicle_id = bs.read_uint16()
-        rotation = bs.read_float()
-
-        return {
-            "vehicle_id": int(vehicle_id),
-            "rotation": float(rotation),
-        }
+            return {
+                "vehicle_id": int(vehicle_id),
+                "rotation": float(rotation),
+            }
+        except Exception:
+            return None
 
 
     @staticmethod
@@ -708,56 +724,59 @@ class RPCParser:
 
     @staticmethod
     def show_text_draw(bs: BitStream) -> dict | None:
-        wTextDrawID = bs.read_uint16()
-        flags = bs.read_uint8()
-        fLetterWidth = bs.read_float()
-        fLetterHeight = bs.read_float()
-        dLetterColor = bs.read_uint32()
-        fLineWidth = bs.read_float()
-        fLineHeight = bs.read_float()
-        dBoxColor = bs.read_uint32()
-        shadow = bs.read_uint8()
-        outline = bs.read_uint8()
-        dBackgroundColor = bs.read_uint32()
-        style = bs.read_uint8()
-        selectable = bs.read_uint8()
-        fX = bs.read_float()
-        fY = bs.read_float()
-        wModelID = bs.read_uint16()
-        fRotX = bs.read_float()
-        fRotY = bs.read_float()
-        fRotZ = bs.read_float()
-        fZoom = bs.read_float()
-        wColor1 = bs.read_uint16()
-        wColor2 = bs.read_uint16()
-        szTextLen = bs.read_uint16()
-        szText = bs.read_string(szTextLen, "cp1251", errors="ignore") if szTextLen > 0 else ""
+        try:
+            wTextDrawID = bs.read_uint16()
+            flags = bs.read_uint8()
+            fLetterWidth = bs.read_float()
+            fLetterHeight = bs.read_float()
+            dLetterColor = bs.read_uint32()
+            fLineWidth = bs.read_float()
+            fLineHeight = bs.read_float()
+            dBoxColor = bs.read_uint32()
+            shadow = bs.read_uint8()
+            outline = bs.read_uint8()
+            dBackgroundColor = bs.read_uint32()
+            style = bs.read_uint8()
+            selectable = bs.read_uint8()
+            fX = bs.read_float()
+            fY = bs.read_float()
+            wModelID = bs.read_uint16() if bs.remaining_bits >= 16 else 0
+            fRotX = bs.read_float() if bs.remaining_bits >= 32 else 0.0
+            fRotY = bs.read_float() if bs.remaining_bits >= 32 else 0.0
+            fRotZ = bs.read_float() if bs.remaining_bits >= 32 else 0.0
+            fZoom = bs.read_float() if bs.remaining_bits >= 32 else 1.0
+            wColor1 = bs.read_uint16() if bs.remaining_bits >= 16 else 0
+            wColor2 = bs.read_uint16() if bs.remaining_bits >= 16 else 0
+            szTextLen = bs.read_uint16() if bs.remaining_bits >= 16 else 0
+            szText = bs.read_string(szTextLen, "cp1251", errors="ignore") if szTextLen > 0 and bs.remaining_bits >= (szTextLen * 8) else ""
 
-        return {
-            "textdraw_id": wTextDrawID,
-            "flags": flags,
-            "letter_width": fLetterWidth,
-            "letter_height": fLetterHeight,
-            "letter_color": dLetterColor,
-            "line_width": fLineWidth,
-            "line_height": fLineHeight,
-            "box_color": dBoxColor,
-            "shadow": shadow,
-            "outline": outline,
-            "background_color": dBackgroundColor,
-            "style": style,
-            "selectable": selectable,
-            "x": fX,
-            "y": fY,
-            "model_id": wModelID,
-            "rot_x": fRotX,
-            "rot_y": fRotY,
-            "rot_z": fRotZ,
-            "zoom": fZoom,
-            "color1": wColor1,
-            "color2": wColor2,
-            "text": szText,
-        }
+            return {
+                "textdraw_id": wTextDrawID,
+                "flags": flags,
+                "letter_width": fLetterWidth,
+                "letter_height": fLetterHeight,
+                "letter_color": dLetterColor,
+                "line_width": fLineWidth,
+                "line_height": fLineHeight,
+                "box_color": dBoxColor,
+                "shadow": shadow,
+                "outline": outline,
+                "background_color": dBackgroundColor,
+                "style": style,
+                "selectable": selectable,
+                "x": fX,
+                "y": fY,
+                "model_id": wModelID,
+                "rot_x": fRotX,
+                "rot_y": fRotY,
+                "rot_z": fRotZ,
+                "zoom": fZoom,
+                "color1": wColor1,
+                "color2": wColor2,
+                "text": szText,
+            }
+        except Exception:
+            return None
 
     @staticmethod
     def text_draw_set_string(bs: BitStream) -> dict | None:

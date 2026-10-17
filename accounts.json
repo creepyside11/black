@@ -7,7 +7,7 @@
     "is_banned": false,
     "proxy": "",
     "lvl": "-",
-    "money": 0,
+    "money": 200,
     "target_lvl": null
   },
   {
@@ -147,7 +147,7 @@
     "password": "55337q",
     "server": "VORONEZH",
     "task": "lvl",
-    "is_banned": false,
+    "is_banned": true,
     "proxy": "",
     "lvl": "1 lvl",
     "money": 200,
@@ -161,7 +161,7 @@
     "is_banned": false,
     "proxy": "",
     "lvl": "-",
-    "money": 0,
+    "money": 200,
     "target_lvl": null
   },
   {
@@ -180,7 +180,7 @@
     "password": "55337q",
     "server": "IZHEVSK",
     "task": "lvl",
-    "is_banned": false,
+    "is_banned": true,
     "proxy": "",
     "lvl": "1 lvl",
     "money": 200,
@@ -392,7 +392,7 @@
     "is_banned": false,
     "proxy": "",
     "lvl": "1 lvl",
-    "money": 0,
+    "money": 200,
     "target_lvl": null
   },
   {
@@ -444,7 +444,7 @@
     "password": "55337q",
     "server": "PENZA",
     "task": "lvl",
-    "is_banned": false,
+    "is_banned": true,
     "proxy": "",
     "lvl": "2 lvl",
     "money": 0,
@@ -499,7 +499,7 @@
     "password": "55337q",
     "server": "BRATSK",
     "task": "lvl",
-    "is_banned": false,
+    "is_banned": true,
     "proxy": "",
     "lvl": "2 lvl",
     "money": 0,
@@ -609,7 +609,7 @@
     "password": "55337q",
     "server": "KOSTROMA",
     "task": "lvl",
-    "is_banned": false,
+    "is_banned": true,
     "proxy": "",
     "lvl": "1 lvl",
     "money": 0,

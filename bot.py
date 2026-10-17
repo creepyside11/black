@@ -10,6 +10,7 @@ import random
 import threading
 import json
 import resource
+import re
 from collections import deque
 
 # Оптимизация системы для поддержки до 300+ ботов одновременно в Termux / Linux
@@ -260,8 +261,14 @@ class BotInstance:
     def schedule_reconnect(self, delay: float = 10.0):
         if self.stopping or self.is_banned:
             return
+        
+        # Если старый поток реконнекта еще работает, прерываем его перед планированием нового
+        self.cancel_reconnect()
         if self.reconnect_thread and self.reconnect_thread.is_alive():
-            return
+            try:
+                self.reconnect_thread.join(timeout=0.2)
+            except Exception:
+                pass
 
         self.reconnect_cancel_event.clear()
         target_time = time.time() + delay
@@ -408,6 +415,70 @@ class BotManager:
         bot.stop(banned=True)
         self.save_accounts()
 
+        # 1. Отправляем в Telegram и ИИ-анализ если подключен Telegram контроллер
+        if hasattr(self, "tg_controller") and self.tg_controller:
+            alert_text = (
+                f"🚨 <b>АККАУНТ ЗАБАНЕН!</b>\n"
+                f"• Бот: #{bot.bot_id} <b>{bot.nickname}</b>\n"
+                f"• Сервер: <b>{bot.server_name}</b>\n"
+                f"• Причина: <code>{reason}</code>\n"
+            )
+            # Отправляем в ИИ для анализа причины и рекомендаций
+            if hasattr(self.tg_controller, "ai") and self.tg_controller.ai.config.get("api_key"):
+                def _ai_ban_inspect():
+                    ai_res = self.tg_controller.ai.execute_natural_command(
+                        f"Бот {bot.nickname} на сервере {bot.server_name} получил бан по причине: '{reason}'. Проанализируй причину."
+                    )
+                    self.tg_controller.broadcast(f"{alert_text}\n🤖 <b>Анализ ИИ:</b>\n{ai_res}")
+                threading.Thread(target=_ai_ban_inspect, daemon=True).start()
+            else:
+                self.tg_controller.broadcast(alert_text)
+
+        # 2. Если бан выдан именно за бота / читы / автокликер — создаем новый аккаунт на том же сервере
+        r_lower = reason.lower()
+        if any(w in r_lower for w in ["бот", "bot", "читер", "чит", "постороннее по", "кликер", "auto-clicker", "connection_banned"]):
+            def _create_replacement():
+                time.sleep(random.uniform(5.0, 10.0))
+                print(f"[*] Создаем новый аккаунт взамен забаненного бота на сервере {bot.server_name}...")
+                new_bot = self.add_bot(
+                    server_name=bot.server_name,
+                    nickname=None, # Случайный реалистичный ник
+                    password=bot.password,
+                    proxy=bot.proxy,
+                    default_task=bot.default_task_name
+                )
+                if new_bot:
+                    notice = (
+                        f"♻️ <b>Автозамена забаненного бота!</b>\n"
+                        f"На сервере <b>{bot.server_name}</b> создан новый бот: #{new_bot.bot_id} <b>{new_bot.nickname}</b>.\n"
+                        f"Задача: <code>{new_bot.default_task_name}</code>. Запускаем..."
+                    )
+                    if hasattr(self, "tg_controller") and self.tg_controller:
+                        self.tg_controller.broadcast(notice)
+                    new_bot.start()
+            threading.Thread(target=_create_replacement, daemon=True).start()
+
+    def start_monitor_loop(self):
+        """Запуск непрерывного 24/7 фонового мониторинга ботнета"""
+        if getattr(self, "_monitor_running", False):
+            return
+        self._monitor_running = True
+        def _loop():
+            print("[*] Непрерывный мониторинг 24/7 запущен.")
+            while self._monitor_running:
+                time.sleep(60.0)
+                try:
+                    with self._lock:
+                        for bid, b in self.bots.items():
+                            # Автоматический перезапуск упавших активных ботов
+                            if not b.is_banned and not b.stopping:
+                                if b.status in ("Остановлен", "Отключен") and b.default_task_name:
+                                    b.add_log("[МОНИТОР] Авто-подъем упавшего бота 24/7...")
+                                    b.start()
+                except Exception as e:
+                    print(f"[-] Ошибка монитора: {e}")
+        threading.Thread(target=_loop, daemon=True).start()
+
     def _setup_event_hooks(self):
         @emitter.on("onconnect")
         def _on_connected(bot_obj, *args, **kwargs):
@@ -460,17 +531,26 @@ class BotManager:
                 is_admin_ban = any(re.search(pat, clean_msg_lower) for pat in admin_ban_patterns)
                 if not is_admin_ban and b.nickname.lower() in clean_msg_lower:
                     ban_words = ["заблокирован", "забанен", "получил бан", "выдан бан", "banned"]
-                    if any(k in clean_msg_lower for k in ban_words) and "чат" not in clean_msg_lower and "мут" not in clean_msg_lower:
+                    if any(k in clean_msg_lower for k in ban_words) and "чат" not in clean_msg_lower and "мут" not in clean_msg_lower and "20 мин" not in clean_msg_lower and "частые" not in clean_msg_lower:
                         is_admin_ban = True
+
+                # 2. Бан / ограничение на 15-20 минут за частые входы/подключения
+                # Сервер может написать: "вы были заблокированы за частые подключения", "подождите 20 минут", "частые входы", "повторите попытку через 20 минут"
+                freq_ban_keywords = [
+                    "20 минут", "20 мин", "15 минут", "15 мин",
+                    "частые входы", "частых входов", "частые подключения", "частых подключений",
+                    "слишком много подключений", "подозрение на спам", "повторите попытку через"
+                ]
+                is_freq_ban = any(k in clean_msg_lower for k in freq_ban_keywords)
+
+                if is_freq_ban:
+                    b.add_log(f"[РЕКОННЕКТ] Бан за частые входы/лимит времени (20 мин): '{clean_msg}'. Вход через 25 минут.")
+                    b.scheduled_reconnect_delay = 25 * 60.0
+                    return
 
                 if is_admin_ban:
                     self.mark_bot_banned(b, reason=f"Чат: {clean_msg}")
                     return
-
-                # 2. Бан на 20 минут за частые входы -> реконнект через 25 минут (1500 сек)
-                if "забанен" in clean_msg_lower and ("20 минут" in clean_msg_lower or "20 мин" in clean_msg_lower or "частые входы" in clean_msg_lower or "частых входов" in clean_msg_lower):
-                    b.add_log("[РЕКОННЕКТ] Бан за частые входы (20 мин). Повторный вход запланирован через 25 минут.")
-                    b.scheduled_reconnect_delay = 25 * 60.0
 
                 # 3. Много заходов с вашего IP -> реконнект через 5 минут (300 сек)
                 if "много заходов" in clean_msg_lower or ("ip" in clean_msg_lower and ("слишком много" in clean_msg_lower or "подозрител" in clean_msg_lower or "повторите попытку позже" in clean_msg_lower)):
@@ -587,9 +667,25 @@ class BotManager:
                     "до разблокировки",
                     "вы получили бан",
                     "ваш аккаунт был заблокирован",
+                    "подозрение в использовании чит",
+                    "постороннее по",
+                    "connection_banned",
+                    "читы",
+                    "чит-программ",
+                    "чит программа",
+                    "читы/ппв",
+                    "бот",
+                    "использование бот",
+                    "auto-clicker",
+                    "автокликер",
                 ]
                 # Исключаем временный бан за частые входы из перманентного бана
-                is_freq_ban = "20 минут" in dialog_text or "20 мин" in dialog_text or "частые входы" in dialog_text or "частых входов" in dialog_text
+                freq_dialog_keywords = [
+                    "20 минут", "20 мин", "15 минут", "15 мин",
+                    "частые входы", "частых входов", "частые подключения", "частых подключений",
+                    "слишком много подключений", "повторите попытку через"
+                ]
+                is_freq_ban = any(k in dialog_text for k in freq_dialog_keywords)
                 if is_freq_ban:
                     b.add_log(f"[РЕКОННЕКТ] Бан за частые входы в диалоге #{d_id}. Вход через 25 минут.")
                     b.scheduled_reconnect_delay = 25 * 60.0
@@ -797,10 +893,8 @@ class BotManager:
                 })
 
         try:
-            tmp_file = ACCOUNTS_FILE + ".tmp"
-            with open(tmp_file, "w", encoding="utf-8") as f:
+            with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp_file, ACCOUNTS_FILE)
         except Exception as e:
             print(f"[!] Ошибка сохранения {ACCOUNTS_FILE}: {e}")
 
@@ -1102,14 +1196,24 @@ class BotManager:
 
             # База координат локаций области Black Russia
             locations = [
+                ("Спавн Батырево", 1795.375, 2518.425, 120.0),
+                ("Территория шахты", 2378.989, 1670.212, 80.0),
+                ("Вход в шахту", 2379.218, 1677.226, 30.0),
+                ("Переодевание в шахте", 540.554, 515.490, 20.0),
+                ("Добыча руды", 542.027, 535.701, 20.0),
+                ("Сдача руды", 557.287, 516.363, 20.0),
+                ("Спавн Лыткарино", -2428.754, 203.862, 120.0),
+                ("Спавн Южный", 2745.431, -2436.016, 120.0),
+                ("Спавн Нижегородск 1", -2661.548, 2000.877, 120.0),
+                ("Спавн Нижегородск 2", -2152.833, 1558.348, 120.0),
+                ("Место для АФК", 1549.989, 2717.540, 60.0),
+                ("Банк Арзамаса", 2280.0, -1450.0, 60.0),
                 ("Вокзал Арзамас", 2125.0, -1145.0, 180.0),
                 ("Центр Арзамаса", 2250.0, -1350.0, 250.0),
                 ("Больница Арзамас", 2040.0, -1410.0, 150.0),
                 ("Вокзал Батырево", 1060.0, 1260.0, 150.0),
                 ("Военкомат / Батырево", 1100.0, 1340.0, 200.0),
-                ("Шахта (Карьер)", 815.0, 860.0, 220.0),
                 ("Автошкола Лыткарино", 2065.0, -2385.0, 120.0),
-                ("Завод (Арзамас - Нижегородск)", 2450.0, -450.0, 250.0),
                 ("Вокзал Лыткарино", 2800.0, -2320.0, 180.0),
                 ("г. Нижегородск", 2850.0, 500.0, 400.0),
                 ("Вокзал Южный", -2430.0, 2350.0, 180.0),
@@ -1243,6 +1347,8 @@ def print_help():
   /q                - Выход и остановка всех ботов
 
 --- Команды для активного бота ---
+  /pos              - Показать текущие координаты X, Y, Z бота
+  /goto <X> <Y> <Z> [mode] - Отправить бота на координаты (walk/run/sprint)
   /chat <текст>     - Отправить сообщение в чат
   /<команда>        - Любая серверная команда (например /time, /stats, /mm)
   /dialog <id> <кнопка> [список] [текст] - Ответить в диалог
@@ -1535,6 +1641,22 @@ def main():
         elif line in ("/startall", "/runall") or line == "/start all":
             manager.start_all()
 
+        elif line.startswith("/tg"):
+            parts = line.split(maxsplit=2)
+            if len(parts) >= 2:
+                token_val = parts[1].strip()
+                admin_val = int(parts[2].strip()) if len(parts) >= 3 and parts[2].strip().isdigit() else None
+                print(f"[*] Запуск Telegram-контроллера с указанным токеном...")
+                try:
+                    tg_bot = TelegramBotController(token_val, manager, admin_id=admin_val)
+                    manager.tg_controller = tg_bot
+                    tg_bot.start()
+                    print(f"[+] Telegram бот успешно запущен и слушает команды!")
+                except Exception as e:
+                    print(f"[-] Ошибка запуска Telegram бота: {e}")
+            else:
+                print("Использование: /tg <ТОКЕН_БОТА> [ADMIN_ID]")
+
         elif line.startswith("/start"):
             parts = line.split(maxsplit=1)
             if len(parts) >= 2:
@@ -1636,6 +1758,36 @@ def main():
                 manager.unban_bot(int(parts[1]))
             else:
                 print("Использование: /unban <ID бота>")
+
+        elif line.startswith("/pos"):
+            with manager._lock:
+                active = manager.bots.get(manager.active_bot_id) if manager.active_bot_id else None
+            if not active or not active.api:
+                print("[-] Нет активного подключенного бота.")
+                continue
+            pos = active.api.getbotposition()
+            if pos and len(pos) >= 3:
+                print(f"[+] Бот #{active.bot_id} [{active.nickname}] координаты: X={pos[0]:.2f}, Y={pos[1]:.2f}, Z={pos[2]:.2f}")
+            else:
+                print("[-] Координаты бота пока недоступны.")
+
+        elif line.startswith("/goto"):
+            with manager._lock:
+                active = manager.bots.get(manager.active_bot_id) if manager.active_bot_id else None
+            if not active or not active.api:
+                print("[-] Нет активного подключенного бота.")
+                continue
+            parts = line.split()
+            if len(parts) >= 4:
+                try:
+                    gx, gy, gz = float(parts[1]), float(parts[2]), float(parts[3])
+                    mode = parts[4] if len(parts) > 4 else "walk"
+                    print(f"[*] Отправка бота #{active.bot_id} на координаты ({gx}, {gy}, {gz}) [режим: {mode}]...")
+                    threading.Thread(target=lambda: active.api.MoveToCoord(gx, gy, gz, mode=mode), daemon=True).start()
+                except ValueError:
+                    print("[-] Ошибка: координаты должны быть числами. Пример: /goto 123.4 -567.8 12.0 walk")
+            else:
+                print("Использование: /goto <X> <Y> <Z> [walk/run/sprint]")
 
         elif line.startswith(("/del", "/delete")):
             parts = line.split()

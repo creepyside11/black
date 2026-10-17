@@ -4,6 +4,7 @@ import math
 import os
 import telebot
 from telebot import types
+from ai_controller import AICommander, load_ai_config, save_ai_config
 
 BOTS_PER_PAGE = 8
 PROXIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt")
@@ -40,6 +41,7 @@ class TelegramBotController:
         self.admin_id = admin_id  # Если указан, команды принимает только админ
         self.bot = telebot.TeleBot(self.token, parse_mode="HTML")
         self.user_states = {}  # {chat_id: {"action": "...", "data": {...}}}
+        self.ai = AICommander(self.manager)
         self.active_chats = set()
         if self.admin_id:
             self.active_chats.add(self.admin_id)
@@ -119,6 +121,10 @@ class TelegramBotController:
             types.InlineKeyboardButton("▶️ Запустить выбранных", callback_data=f"act_start_some:{page}"),
             types.InlineKeyboardButton("▶️ Всех", callback_data="act_startall"),
             types.InlineKeyboardButton("⏹ Всех", callback_data="act_stopall")
+        )
+        markup.row(
+            types.InlineKeyboardButton("🧠 ИИ Командир", callback_data="ai_menu"),
+            types.InlineKeyboardButton("🛡 Проверить баны", callback_data="act_check_bans")
         )
         markup.row(
             types.InlineKeyboardButton("➕ Массовое создание", callback_data="act_batch"),
@@ -516,6 +522,91 @@ class TelegramBotController:
                 self.bot.send_message(chat_id, msg)
                 self.bot.answer_callback_query(call.id)
 
+            elif data == "ai_menu":
+                cfg = self.ai.config
+                b_url = cfg.get("base_url", "https://api.openai.com/v1")
+                key_masked = ("..." + cfg.get("api_key")[-4:]) if cfg.get("api_key") else "<i>не задан</i>"
+                model = cfg.get("model_id", "gpt-4o-mini")
+
+                text = (
+                    f"<b>🧠 Меню Нейроконтроллера (ИИ Командир)</b>\n\n"
+                    f"Текущие настройки:\n"
+                    f"• <b>Base URL:</b> <code>{b_url}</code>\n"
+                    f"• <b>API Key:</b> <code>{key_masked}</code>\n"
+                    f"• <b>Модель:</b> <code>{model}</code>\n\n"
+                    f"Вы можете дать ИИ любую задачу естественным языком, например:\n"
+                    f"<i>«Запусти 5 случайных ботов на Воронеж качать лвл»</i>\n"
+                    f"<i>«Проверь всех аккаунты на баны и покажи статистику»</i>\n"
+                    f"<i>«Останови всех ботов кроме 12 и 13»</i>"
+                )
+
+                markup = types.InlineKeyboardMarkup(row_width=1)
+                markup.add(types.InlineKeyboardButton("💬 Дать задачу ИИ (текстом)", callback_data="ai_prompt_task"))
+                markup.add(types.InlineKeyboardButton("🌐 Изменить Base URL", callback_data="ai_change_base_url"))
+                markup.add(types.InlineKeyboardButton("🔑 Изменить API Token", callback_data="ai_change_api_key"))
+                markup.add(types.InlineKeyboardButton("🤖 Изменить ID Модели", callback_data="ai_change_model"))
+                markup.add(types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="page:1"))
+
+                try:
+                    self.bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=markup)
+                except Exception:
+                    pass
+                self.bot.answer_callback_query(call.id)
+
+            elif data == "ai_prompt_task":
+                self.user_states[chat_id] = {"action": "ai_natural_command"}
+                msg = (
+                    "<b>💬 Напишите задачу для ИИ:</b>\n\n"
+                    "Примеры:\n"
+                    "• <i>Запусти ботов на сервер VORONEZH</i>\n"
+                    "• <i>Распредели всех по случайным серверам</i>\n"
+                    "• <i>Останови всех ботов</i>\n"
+                    "• <i>Поставь всем задачу качать лвл</i>\n\n"
+                    "Для отмены отправьте /cancel"
+                )
+                self.bot.send_message(chat_id, msg)
+                self.bot.answer_callback_query(call.id)
+
+            elif data == "ai_change_base_url":
+                self.user_states[chat_id] = {"action": "ai_set_base_url"}
+                self.bot.send_message(chat_id, "🌐 Отправьте новый Base URL (например, <code>https://api.openai.com/v1</code> или локальный Ollama / OpenRouter / vLLM):")
+                self.bot.answer_callback_query(call.id)
+
+            elif data == "ai_change_api_key":
+                self.user_states[chat_id] = {"action": "ai_set_api_key"}
+                self.bot.send_message(chat_id, "🔑 Отправьте ваш API-ключ / токен:")
+                self.bot.answer_callback_query(call.id)
+
+            elif data == "ai_change_model":
+                self.user_states[chat_id] = {"action": "ai_set_model"}
+                self.bot.send_message(chat_id, "🤖 Отправьте ID модели (например, <code>gpt-4o-mini</code>, <code>claude-3-5-sonnet</code>, <code>deepseek-chat</code>, <code>qwen2.5</code>):")
+                self.bot.answer_callback_query(call.id)
+
+            elif data == "act_check_bans":
+                # Запуск мгновенной проверки банов по всем аккаунтам
+                self.bot.answer_callback_query(call.id, "Запуск сканирования банов...", show_alert=False)
+                banned_now = []
+                with self.manager._lock:
+                    for bid, b in self.manager.bots.items():
+                        if b.is_banned:
+                            banned_now.append(f"• #{bid} <b>{b.nickname}</b> @ {b.server_name}")
+
+                banned_count = len(banned_now)
+                report = f"🛡 <b>Результаты сканирования банов:</b>\n\n"
+                if banned_count == 0:
+                    report += "✅ Забаненных аккаунтов не обнаружено!"
+                else:
+                    report += f"🔴 Обнаружено забаненных аккаунтов: <b>{banned_count}</b>\n\n" + "\n".join(banned_now[:25])
+                    if banned_count > 25:
+                        report += f"\n<i>...и еще {banned_count - 25} аккаунтов</i>"
+
+                markup = types.InlineKeyboardMarkup(row_width=1)
+                markup.add(types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="page:1"))
+                try:
+                    self.bot.edit_message_text(report, chat_id=chat_id, message_id=message_id, reply_markup=markup)
+                except Exception:
+                    pass
+
             elif data == "act_proxies_list":
                 saved_proxies = load_proxy_list()
                 text = "<b>🌐 Список сохраненных прокси:</b>\n\n"
@@ -704,6 +795,34 @@ class TelegramBotController:
                     message.chat.id,
                     f"✅ Прокси <code>{apply_val}</code> успешно назначен боту #{bid}!\nТеперь можно запустить его через /start."
                 )
+
+            elif action == "ai_set_base_url":
+                del self.user_states[message.chat.id]
+                new_url = message.text.strip()
+                self.ai.update_settings(base_url=new_url)
+                self.bot.reply_to(message, f"✅ Base URL сохранен:\n<code>{new_url}</code>")
+
+            elif action == "ai_set_api_key":
+                del self.user_states[message.chat.id]
+                new_key = message.text.strip()
+                self.ai.update_settings(api_key=new_key)
+                self.bot.reply_to(message, "✅ API-ключ сохранен!")
+
+            elif action == "ai_set_model":
+                del self.user_states[message.chat.id]
+                new_model = message.text.strip()
+                self.ai.update_settings(model_id=new_model)
+                self.bot.reply_to(message, f"✅ Модель сохранена:\n<code>{new_model}</code>")
+
+            elif action == "ai_natural_command":
+                del self.user_states[message.chat.id]
+                prompt = message.text.strip()
+                status_msg = self.bot.reply_to(message, "🧠 <i>ИИ анализирует задачу и управляет ботами...</i>", parse_mode="HTML")
+                res = self.ai.execute_natural_command(prompt)
+                try:
+                    self.bot.edit_message_text(res, chat_id=message.chat.id, message_id=status_msg.message_id, parse_mode="HTML")
+                except Exception:
+                    self.bot.send_message(message.chat.id, res, parse_mode="HTML")
 
             elif action == "add_global_proxy":
                 del self.user_states[message.chat.id]

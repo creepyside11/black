@@ -6,6 +6,7 @@ import time
 import threading
 import random
 import re
+import math
 from core import logger
 from samp.packets import PacketBuilder
 
@@ -138,14 +139,17 @@ class LevelGrinderTask(BaseTask):
         self.exp_collected = 0
 
     def on_chat_message(self, message: str):
-        """Интеллектуальный авто-ответ на вопросы игроков и админов рядом"""
+        """Интеллектуальный авто-ответ на вопросы игроков и админов рядом, в /pm и общем чате"""
         if not self.running:
             return
         clean_msg = re.sub(r'\{[0-9a-fA-F]{6}\}', '', message).strip()
         msg_l = clean_msg.lower()
 
-        # Проверяем обращение к боту или общие вопросы проверки
-        # "ты тут?", "тут?", "вы тут?", "бот?", "afk?", "ау", "ответь", "слышишь"
+        # 1. Проверка на сообщение в /pm от администратора
+        # Например: "[PM] Администратор Nick_Name: Вы тут?", "Администратор ... вам в /pm: вы тут?"
+        is_pm = any(k in msg_l for k in ["/pm", "[pm]", "пм", "шепчет вам", "вам в пм", "администратор"])
+
+        # 2. Вопросы проверки на бота
         is_check = any(re.search(pat, msg_l) for pat in [
             r'\bты\s+тут\b',
             r'\bвы\s+тут\b',
@@ -159,22 +163,28 @@ class LevelGrinderTask(BaseTask):
             r'\bпривет\b'
         ])
 
-        if is_check:
+        if is_check or is_pm:
             # Выбираем естественный человеческий ответ
-            if "ку" in msg_l or "привет" in msg_l:
+            if is_pm:
+                answer = random.choice(["Да, я тут", "тут я, не афк", "да, играю", "тут", "да, на месте"])
+            elif "ку" in msg_l or "привет" in msg_l:
                 answer = random.choice(["ку", "ку бро", "привет", "куку", "дарова"])
             elif "бот" in msg_l:
                 answer = random.choice(["сам ты бот ахах", "не, я тут", "нет, играю", "я тут, че надо?"])
             else:
                 answer = random.choice(["тут", "да тут я", "да", "тут я", "тут, че хотел?", "+", "да, на месте"])
 
-            self.bot.add_log(f"[LVL-ЧАТ] Замечен вопрос игрока: '{clean_msg}'. Отвечаем: '{answer}'")
+            self.bot.add_log(f"[LVL-ЧАТ] Замечено обращение/проверка: '{clean_msg}'. Отвечаем: '{answer}'")
             def _answer():
-                # Случайная человеческая задержка печати (1.5 - 3.5 секунды)
-                time.sleep(random.uniform(1.8, 3.8))
+                # Случайная задержка печати (от 2 до 4.5 секунд)
+                time.sleep(random.uniform(2.1, 4.5))
                 try:
-                    self.api.sendchat(answer)
-                    self.bot.add_log(f"[LVL-ЧАТ] Ответ отправлен в чат: '{answer}'")
+                    if is_pm and "/" in clean_msg:
+                        # Если админ просил ответить в /b или /pm
+                        self.api.sendchat(f"/b {answer}")
+                    else:
+                        self.api.sendchat(answer)
+                    self.bot.add_log(f"[LVL-ЧАТ] Ответ отправлен: '{answer}'")
                 except Exception as e:
                     self.bot.add_log(f"[LVL-ЧАТ] Ошибка отправки ответа: {e}")
             threading.Thread(target=_answer, daemon=True).start()
@@ -227,8 +237,35 @@ class LevelGrinderTask(BaseTask):
                     pass
             threading.Thread(target=_reply, daemon=True).start()
 
+    def _ensure_spawn_in_real_world(self):
+        """Гарантирует, что бот находится на реальном вокзале с другими игроками, а не под текстурами"""
+        pos = self.api.getbotposition()
+        if not pos or (pos[0] == 0.0 and pos[1] == 0.0) or pos[2] < -5.0:
+            self.bot.add_log("[LVL-BOT] Бот обнаружен в спект-зоне/под текстурами. Инициализируем спавн на вокзале...")
+            from samp.interfaces import InterfaceID
+            from samp.packets import PacketBuilder
+            # Отправляем подтверждение спавна
+            try:
+                self.session.send_json(InterfaceID.SPAWN_SELECT, {"t": 1, "s": 0})
+                self.session.send_json(InterfaceID.SPAWN_SELECT, {"s": 0})
+            except Exception:
+                pass
+            time.sleep(0.5)
+            # Отправляем RPC spawn
+            try:
+                self.session._sender.send(PacketBuilder.rpc_build("spawn"), rpc_name="spawn")
+            except Exception:
+                pass
+            time.sleep(1.0)
+            # Прыжок для прогрузки стрима
+            self.api.SetKey(keys=32)
+            time.sleep(0.2)
+            self.api.SetKey(keys=0)
+
     def _run_loop(self):
         self.bot.add_log("[LVL-BOT] Режим качки уровня активирован. Поддержание активности 24/7.")
+        pause_start_time = None
+        self._ensure_spawn_in_real_world()
         while self.running:
             try:
                 if not self.session.connected:
@@ -246,8 +283,8 @@ class LevelGrinderTask(BaseTask):
                     else:
                         bot_player.godmode_zero_xp = False
 
-                # 2. Детект игроков рядом (эмуляция ухода в AFK / паузу)
-                # Если игрок подошел ближе 8-10 метров, бот встает в настоящую паузу (прекращает слать sync-пакеты)
+                # 2. Детект игроков рядом (эмуляция короткого AFK)
+                # ВАЖНО: Никогда полностью не глушим пакеты синхронизации (is_paused), чтобы сервер не считал соединение разорванным
                 nearby_player_found = False
                 cur_pos = self.api.getbotposition()
                 if cur_pos and len(cur_pos) >= 3 and cur_pos[0] != 0.0:
@@ -262,19 +299,18 @@ class LevelGrinderTask(BaseTask):
                             nearby_player_found = True
                             break
 
-                if nearby_player_found:
-                    if bot_player and not getattr(bot_player, "is_paused", False):
-                        bot_player.is_paused = True
-                        self.bot.add_log("[LVL-BOT] Рядом замечен игрок (<9м). Эмуляция паузы (AFK в меню)...")
-                    # Ждем в паузе 4-8 секунд и проверяем снова
-                    time.sleep(random.uniform(4.0, 7.0))
-                    continue
-                else:
-                    if bot_player and getattr(bot_player, "is_paused", False):
-                        bot_player.is_paused = False
-                        self.bot.add_log("[LVL-BOT] Игрок отошел. Снятие с паузы, возобновление активности.")
-
                 now = time.time()
+                if nearby_player_found:
+                    if pause_start_time is None:
+                        pause_start_time = now
+                    # Если игрок рядом, просто не бегаем активно, стоим на месте (но шлем onfoot-sync!)
+                    if (now - pause_start_time) < 25.0:
+                        time.sleep(random.uniform(3.0, 5.0))
+                        continue
+                    else:
+                        pause_start_time = None
+                else:
+                    pause_start_time = None
 
                 # 3. Забираем бесплатные награды из донат-меню раз в 30 минут
                 if now - self.last_action > 1800:
@@ -286,6 +322,7 @@ class LevelGrinderTask(BaseTask):
                     self.last_action = now
 
                 # 4. Улучшенное анти-АФК поведение (повороты головы, микро-шаги, осмотр, случайные приседания)
+                # Выполняем гарантированно каждые 30-45 секунд для предотвращения 15-минутного AFK-кика
                 if cur_pos and len(cur_pos) >= 3 and cur_pos[0] != 0.0:
                     x, y, z = cur_pos[0], cur_pos[1], cur_pos[2]
                     # Случайный угол обзора (эмуляция вращения камеры человеком)
@@ -296,26 +333,29 @@ class LevelGrinderTask(BaseTask):
                     except Exception:
                         pass
 
-                    # Случайное микро-смещение в радиусе 1.2м
-                    dx = random.uniform(-1.0, 1.0)
-                    dy = random.uniform(-1.0, 1.0)
+                    # Реальное смещение шагом (от 1.0 до 2.0 метров), чтобы сервер зарегистрировал полноценное движение
+                    angle_rad = math.radians(rand_angle)
+                    dist = random.uniform(1.0, 2.0)
+                    target_x = x + dist * math.cos(angle_rad)
+                    target_y = y + dist * math.sin(angle_rad)
                     try:
-                        self.api.MoveToCoord(x + dx, y + dy, z, mode="walk", coord_delay=0.03)
+                        self.api.MoveToCoord(target_x, target_y, z, mode="walk", coord_delay=0.03)
                     except Exception:
                         pass
 
                 # 5. Случайное действие: нажатие приседания (C), прыжка или осмотра
-                time.sleep(random.uniform(1.5, 3.5))
+                time.sleep(random.uniform(1.2, 2.5))
                 action_roll = random.random()
                 try:
                     if action_roll < 0.35:
                         # Приседание (KEY_CROUCH = 2)
                         self.api.SetKey(keys=2)
-                        time.sleep(random.uniform(0.4, 0.9))
+                        time.sleep(random.uniform(0.4, 0.8))
                         self.api.SetKey(keys=0)
                     elif action_roll < 0.65:
-                        # Осмотр / смена фокуса (KEY_ACTION = 1)
-                        self.api.SetKey(keys=1)
+                        # Осмотр / прыжок (KEY_JUMP = 32 или KEY_ACTION = 1)
+                        key_to_press = 32 if random.random() < 0.5 else 1
+                        self.api.SetKey(keys=key_to_press)
                         time.sleep(0.2)
                         self.api.SetKey(keys=0)
                     else:
@@ -324,12 +364,15 @@ class LevelGrinderTask(BaseTask):
                 except Exception:
                     pass
 
-                # Спим интервал 35-60 сек
-                sleep_time = random.uniform(35.0, 60.0)
-                for _ in range(int(sleep_time)):
-                    if not self.running:
-                        break
-                    time.sleep(1)
+                # Динамический рандомный интервал простоя:
+                # Минимально: 20 секунд
+                # Максимально: 9 минут (540 секунд, чтобы гарантированно не получить AFK-кик сервера)
+                # Рандомизация с точностью до десятых долей секунды
+                sleep_time = random.uniform(20.0, 540.0)
+                self.bot.add_log(f"[LVL-AFK] Действие завершено. Рандомный таймер простоя: {sleep_time:.1f} сек.")
+                start_sleep = time.time()
+                while self.running and (time.time() - start_sleep < sleep_time):
+                    time.sleep(1.0)
 
             except Exception as e:
                 self.bot.add_log(f"[LVL-BOT] Ошибка цикла: {e}")
@@ -671,15 +714,15 @@ class MinerTask(BaseTask):
         self.minigame_active = False
         self.minigame_done = threading.Event()
         self.last_scooter_attempt = 0
-        # Базовые координаты шахты (пгт. Батырево карьер)
-        self.mine_entrance = (825.0, 855.0, 12.0)
-        self.mine_dressup = (815.0, 862.0, 11.5)
+        # Точные координаты шахты и спавнов Нижегородской области
+        self.mine_territory = (2378.989, 1670.212, 13.782)
+        self.mine_entrance = (2379.218, 1677.226, 15.284)
+        self.mine_dressup = (540.554, 515.490, 1000.315)
         self.mine_ore_points = [
-            (798.0, 875.0, 10.0),
-            (805.0, 882.0, 9.8),
-            (812.0, 870.0, 10.2),
+            (542.027, 535.701, 998.669),
         ]
-        self.mine_storage = (828.0, 850.0, 12.0)
+        self.mine_storage = (557.287, 516.363, 999.710)
+        self.afk_spot = (1549.989, 2717.540, 13.880)
 
     def on_textdraw(self, textdraw_id: int, info: dict):
         """Перехват капчи, отправляемой сервером через TextDraw / мини-картинку"""

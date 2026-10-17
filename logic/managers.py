@@ -1656,6 +1656,12 @@ class AllPlayersInfo:
         if parsed.get("state") == "set_spawn_info":
             self.bot.team = int(parsed.get("team", 0))
             self.bot.skin = int(parsed.get("skin", 0))
+            if "x" in parsed:
+                self.bot.update_position(
+                    parsed.get("x"),
+                    parsed.get("y"),
+                    parsed.get("z")
+                )
 
             self.bot.set_spawn_weapons(
                 int(parsed.get("weapon1", 0)),

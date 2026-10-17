@@ -118,6 +118,17 @@ class AutoRegistration:
                                ({'c': 1}, 'finish', False))
             elif step == 'login':
                 self._state('authenticated')
+                def _trigger_spawn():
+                    time.sleep(0.5)
+                    try:
+                        self.session.send_rpc_request_class(0)
+                        time.sleep(0.3)
+                        self.session._sender.send(PacketBuilder.rpc_build("request_spawn"), rpc_name="request_spawn")
+                        time.sleep(0.3)
+                        self.session.send_rpc_spawn()
+                    except Exception:
+                        pass
+                threading.Thread(target=_trigger_spawn, daemon=True).start()
 
     def tick(self):
         with self._lock:

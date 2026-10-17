@@ -367,10 +367,19 @@ class SampPacketHandler:
         )
 
 
+    def _handle_request_spawn(self, result: dict) -> None:
+        parsed = result.get("parsed_payload") or {}
+        spawn_resp = parsed.get("spawn_response")
+        logger.info(f"Received request_spawn response: {spawn_resp}")
+        self.session.server_info.spawn_response = bool(spawn_resp)
+        if spawn_resp:
+            self.session.send_rpc_spawn()
+
     def __init__(self, session):
         self.session = session
 
         self._rpc_router = {
+            "request_spawn": self._handle_request_spawn,
             "connection_rejected": self._emit_connection_rejected_event,
             "enter_vehicle": self._emit_enter_vehicle_event,
             "put_player_in_vehicle": self._emit_put_player_in_vehicle_event,

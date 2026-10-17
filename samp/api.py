@@ -847,7 +847,7 @@ class BotAPI(JsonAPI):
         resolved_mode = str(mode or "auto").lower()
         if resolved_mode == "auto":
             resolved_mode = "vehicle" if bot_player.is_in_vehicle() else "walk"
-        if resolved_mode in ("onfoot", "foot", "player"):
+        if resolved_mode in ("onfoot", "foot", "player", "run", "sprint"):
             resolved_mode = "walk"
         if resolved_mode not in ("walk", "vehicle"):
             fail("mode must be 'auto', 'walk' or 'vehicle'")

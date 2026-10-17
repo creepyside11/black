@@ -119,9 +119,7 @@ class SampSession:
         self._spawn_lock = threading.Lock()
         self._rpc_spawn_queued = False
 
-        self._update_scores_pings_continuous = bool(
-            pings_ips_continuous
-        )
+        self._update_scores_pings_continuous = True
         self._update_scores_pings_interval = 15.0
         self._next_update_scores_pings_time = 0.0
         self._scores_pings_request_lock = threading.Lock()
@@ -133,7 +131,7 @@ class SampSession:
                 self.players.bot.set_onfoot()
 
         self._last_server_packet_time = time.time()
-        self._server_silence_timeout = 20.0
+        self._server_silence_timeout = 45.0
 
         self.proxy = ProxyManager(self)
         self._sender = PacketSender(self)
@@ -560,7 +558,12 @@ class SampSession:
         except Exception as e:
             logger.warn(f"onServerTimeout emit failed: {e}")
 
-        self.reconnect(delay=1.0, threaded=True)
+        # Уведомляем верхний уровень о разрыве связи вместо неконтролируемого параллельного реконнекта
+        self.disconnect(reason=f"server silence timeout ({elapsed:.1f}s)")
+        try:
+            self._emit_callback("disconnect")
+        except Exception:
+            pass
 
     def _reset_session_runtime_flags(self) -> None:
         self.registration.reset()
