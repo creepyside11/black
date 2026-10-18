@@ -4,15 +4,25 @@ from .interfaces import parse_json_payload
 
 class JsonAPI:
 
-    def send_npc_dialog_response(self, button_key: int) -> None:
+    def send_npc_dialog_response(self, button_key: int) -> bool:
         if not self.session.connected:
-            return
-        self._send_interface_packet(PacketBuilder.interface_npc_dialog_response(int(button_key)), packet_name='interface_npc_dialog_response')
+            return False
+        return bool(
+            self._send_interface_packet(
+                PacketBuilder.interface_npc_dialog_response(int(button_key)),
+                packet_name='interface_npc_dialog_response',
+            )
+        )
 
-    def setbotfood(self, item_id: int) -> None:
+    def setbotfood(self, item_id: int) -> bool:
         if not self.session.connected:
-            return
-        self._send_interface_packet(PacketBuilder.interface_shop_food(int(item_id)), packet_name='interface_shop_food')
+            return False
+        return bool(
+            self._send_interface_packet(
+                PacketBuilder.interface_shop_food(int(item_id)),
+                packet_name='interface_shop_food',
+            )
+        )
 
     def GetFreeReward(self) -> bool:
         if not self.session.connected:
@@ -76,15 +86,29 @@ class JsonAPI:
             return
         self._send_interface_packet(PacketBuilder.interface_dialog_menu_select(selected_item, next_items_count, r), packet_name='interface_dialog_menu_select')
 
-    def send_call_notification_response(self, notification_type: int=2, button: int=1) -> None:
+    def send_call_notification_response(self, notification_type: int=2, button: int=1) -> bool:
         if not self.session.connected:
-            return
-        self._send_interface_packet(PacketBuilder.interface_call_notification_response(int(notification_type), int(button)), packet_name='interface_call_notification_response')
+            return False
+        return bool(
+            self._send_interface_packet(
+                PacketBuilder.interface_call_notification_response(
+                    int(notification_type), int(button)
+                ),
+                packet_name='interface_call_notification_response',
+            )
+        )
 
-    def send_notification_response(self, c: int=13, notification_type: int=0, notification_s: int=0, button: int=0) -> None:
+    def send_notification_response(self, c: int=13, notification_type: int=0, notification_s: int=0, button: int=0) -> bool:
         if not self.session.connected:
-            return
-        self._send_interface_packet(PacketBuilder.interface_notification_response(int(c), int(notification_type), int(notification_s), int(button)), packet_name='interface_notification_response')
+            return False
+        return bool(
+            self._send_interface_packet(
+                PacketBuilder.interface_notification_response(
+                    int(c), int(notification_type), int(notification_s), int(button)
+                ),
+                packet_name='interface_notification_response',
+            )
+        )
 
     def _set_reward_cache(self, rewards) -> None:
         try:

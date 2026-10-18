@@ -3,7 +3,6 @@ import time
 import threading
 import queue
 from collections import deque
-from functools import partial
 
 from .packets import PacketBuilder
 from .constants import PacketPriority
@@ -144,6 +143,36 @@ class SampSession:
             return False
         self._sender.send(packet, packet_name=packet_name)
         self._emit_callback("onSendJSON", interface_id, data, key=interface_id)
+        return True
+
+    def send_dialog_response(
+        self,
+        dialog_id: int,
+        response: int = 1,
+        list_item: int = 0,
+        text: str = "",
+    ) -> bool:
+        """Ответ на SA-MP диалог.
+
+        list_item для списков считается с нуля, response: 1 = первая кнопка,
+        0 = вторая. Для поля ввода ответ уходит в text.
+        """
+        if not self.connected:
+            return False
+
+        self._sender.send(
+            PacketBuilder.rpc_build(
+                "dialog_response",
+                int(dialog_id),
+                int(response),
+                int(list_item),
+                str(text),
+            ),
+            rpc_name="dialog_response",
+        )
+        self._emit_callback(
+            "onSendDialogResponse", int(dialog_id), int(response), int(list_item), str(text)
+        )
         return True
 
     def attach_api(self, api) -> None:

@@ -4,6 +4,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
+from core import logger
 from samp.interfaces import InterfaceID
 
 
@@ -119,15 +120,34 @@ class AutoRegistration:
             elif step == 'login':
                 self._state('authenticated')
                 def _trigger_spawn():
+                    # Порядок важен: request_class открывает класс, spawn
+                    # подтверждает его. RPC 344 REQUEST_SPAWN — серверный,
+                    # клиент его не шлёт, поэтому здесь только 361 и 441.
                     time.sleep(0.5)
-                    try:
-                        self.session.send_rpc_request_class(0)
-                        time.sleep(0.3)
-                        self.session._sender.send(PacketBuilder.rpc_build("request_spawn"), rpc_name="request_spawn")
-                        time.sleep(0.3)
-                        self.session.send_rpc_spawn()
-                    except Exception:
-                        pass
+                    for attempt in range(1, 4):
+                        if not self.session.connected:
+                            return
+                        try:
+                            self.session.send_rpc_request_class(0)
+                        except Exception as exc:
+                            logger.warn(
+                                "spawn: request_class не ушёл "
+                                f"(попытка {attempt}/3) | {exc!r}"
+                            )
+                            time.sleep(1.0)
+                            continue
+                        time.sleep(0.4)
+                        try:
+                            self.session.send_rpc_spawn()
+                        except Exception as exc:
+                            logger.warn(
+                                "spawn: spawn не ушёл "
+                                f"(попытка {attempt}/3) | {exc!r}"
+                            )
+                        time.sleep(2.5)
+                        if self.session.players.bot.player_id:
+                            return
+
                 threading.Thread(target=_trigger_spawn, daemon=True).start()
 
     def tick(self):

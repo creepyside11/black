@@ -799,12 +799,148 @@ class BotAPI(JsonAPI):
     def getbotposition(self):
         return self.session.players.bot.get_position()
 
-    def setbotposition(self, x: float, y: float, z: float):
+    def setbotposition(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        *,
+        instant: bool = False,
+        speed: float | None = None,
+    ):
+        """Переместить бота.
+
+        instant=True — мгновенный прыжок одним пакетом (сервер такое режет).
+        Иначе delta-метод на безопасной скорости: 8.5 м/с сервер принимает,
+        быстрее — откатывает на доверенную точку.
+        """
         bot_player = self.session.players.bot
         target_position = (float(x), float(y), float(z))
-        bot_player.cancel_coord_movement(reason="teleported")
-        bot_player.update_position(*target_position)
-        return bot_player.get_position()
+
+        if instant:
+            bot_player.cancel_coord_movement(reason="teleported")
+            bot_player.update_position(*target_position)
+            return bot_player.get_position()
+
+        result = self.DeltaTeleportTo(
+            target_position[0],
+            target_position[1],
+            target_position[2],
+            speed=speed,
+            blocking=True,
+        )
+        return result.get("final_position", bot_player.get_position())
+
+    # --------------------------------------------------------------- delta tp
+
+    def _delta_sync_sender(self):
+        """Один sync-пакет текущего состояния (onfoot/vehicle/passenger)."""
+        bot_player = self.session.players.bot
+        state = getattr(bot_player, "sync_state", "onfoot")
+        if state == "vehicle":
+            self.session.sync.send_vehicle_sync()
+        elif state == "passenger":
+            self.session.sync.send_passenger_sync()
+        else:
+            self.session.sync.send_player_sync()
+
+    def DeltaTeleportTo(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        *,
+        step: float | None = None,
+        interval: float | None = None,
+        speed: float | None = None,
+        velocity_mode: str = "consistent",
+        legit_speed: float | None = None,
+        keys: int = 0,
+        face_movement: bool = True,
+        jitter: float | None = None,
+        settle_packets: int | None = None,
+        blocking: bool = True,
+        on_progress=None,
+    ):
+        """Телепорт delta-методом: путь режется на шаги, каждый шаг — свой sync.
+
+        speed     — целевая скорость в м/с. Шаг считается из неё, чтобы
+                    позиция и velocity в пакете не расходились. По умолчанию
+                    SAFE_SPEED (8.5 м/с) — быстрее сервер откатывает.
+        step      — метров за один пакет (перебивает speed)
+        interval  — секунд между пакетами (по умолчанию один тик, 0.02с)
+        velocity_mode — consistent | legit | zero
+        """
+        if not self.session or not self.session.connected:
+            raise RuntimeError("DeltaTeleportTo: сессия не подключена")
+
+        from logic.delta_teleport import (
+            DeltaTeleport,
+            DEFAULT_LEGIT_SPEED,
+            SAFE_INTERVAL,
+            SAFE_SPEED,
+            step_for_speed,
+        )
+
+        bot_player = self.session.players.bot
+        target = (float(x), float(y), float(z))
+
+        def _run() -> dict:
+            bot_player.cancel_coord_movement(reason="delta_teleport")
+            bot_player.clear_position_target()
+            bot_player.reset_velocity()
+
+            resolved_interval = SAFE_INTERVAL if interval is None else interval
+            if step is not None:
+                resolved_step = step
+            elif speed is not None:
+                resolved_step = step_for_speed(speed, resolved_interval)
+            else:
+                resolved_step = step_for_speed(SAFE_SPEED, resolved_interval)
+
+            engine = DeltaTeleport(
+                bot_player,
+                self._delta_sync_sender,
+                step=resolved_step,
+                interval=resolved_interval,
+                velocity_mode=velocity_mode,
+                legit_speed=DEFAULT_LEGIT_SPEED if legit_speed is None else legit_speed,
+                keys=keys,
+                face_movement=face_movement,
+                jitter=0.05 if jitter is None else jitter,
+                settle_packets=3 if settle_packets is None else settle_packets,
+                abort_check=lambda: not self.session.connected,
+                on_progress=on_progress,
+            )
+
+            # Шедулер не должен вклиниваться между шагами: он пришлёт
+            # нулевой дельта-пакет с нашей же velocity и сломает картину.
+            scheduler_was_enabled = bool(getattr(self.session.sync, "enabled", False))
+            if scheduler_was_enabled:
+                self.session.sync.stop()
+            try:
+                result = engine.run(target)
+            finally:
+                if scheduler_was_enabled and self.session.connected:
+                    self.session.sync.start()
+
+            result["bot_id"] = getattr(self.session, "player_id", None)
+            try:
+                self.session._emit_callback(
+                    "OnDeltaTeleportEnd", dict(result), result.get("status")
+                )
+            except Exception:
+                pass
+            return result
+
+        if not blocking:
+            import threading
+
+            thread = threading.Thread(target=_run, daemon=True, name="delta-teleport")
+            thread.start()
+            return {"status": "started", "target": target}
+
+        return _run()
 
     def _emit_coord_move_end(self, result: dict) -> None:
         emitter.emit("OnCoordMoveEnd", self, dict(result), result.get("status"))

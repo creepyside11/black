@@ -4,7 +4,8 @@ class RPC:
     SERVER_QUIT = 326 
     INIT_GAME = 421
     CLIENT_JOIN = 67
-    NPC_JOIN = 517
+    # NPC_JOIN = 517 — 517 -> RPC 5, значение неверное. Константа не
+    # используется; вернём, когда будет подтверждённый id.
     DEATH = 371
     REQUEST_CLASS = 361
     REQUEST_SPAWN = 344
@@ -43,10 +44,17 @@ class RPC:
     PICKED_UP_PICKUP = 436 
     PICKED_UP_INTERACT = 413 
     VEHICLE_DESTROYED = 502
-    DIALOG_RESPONSE = 514
+    # Ответ на SA-MP диалог. Раньше стояло 514 — оно не влезает в 9 бит
+    # RPC-заголовка и молча уходило как RPC 2 (внутренний пинг). Из-за этого
+    # ни одно меню никогда не отвечало: сервер получал пинг и молчал.
+    # Раскладка payload совпадает с SA-MP DialogResponse, поэтому 62.
+    DIALOG_RESPONSE = 62
     PLAY_AUDIO_STREAM = 313
-    STOP_AUDIO_STREAM = 512
-    CLICK_PLAYER = 515
+    # STOP_AUDIO_STREAM = 512 — то же самое: 512 -> RPC 0. Значение
+    # неизвестно, разбор этого RPC снят в parsers.py.
+    # CLICK_PLAYER = 515 — id не влезает в 9 бит RPC-заголовка, значит
+    # значение неверное. Пока нет захвата с живым id, константа убрана:
+    # с ней пакет уходил бы как RPC 3.
     PLAYER_UPDATE = 343
     SELECT_TEXT_DRAW = 437 
     MAP_MARKER = 317

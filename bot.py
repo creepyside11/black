@@ -40,6 +40,24 @@ from logic.events import emitter
 from logic.bot_tasks import LevelGrinderTask, QuestMasterTask, MinerTask, FactoryTask, BusDriverTask
 from tg_controller import TelegramBotController
 
+# Файл с аккаунтами (рядом с bot.py, независимо от cwd)
+ACCOUNTS_FILE = os.environ.get(
+    "BR_ACCOUNTS_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts.json"),
+)
+
+PROXIES_FILE = os.environ.get(
+    "BR_PROXIES_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt"),
+)
+
+# Максимальная длина игрового ника в Black Russia
+MAX_NICKNAME_LEN = 20
+
+# Формат строки лога, привязанной к боту: "[12:34:56] [Nick_Name] текст".
+# Используется для O(1) маршрутизации лога по _nick_index.
+_LOG_NICK_RE = re.compile(r"^\[\d{2}:\d{2}:\d{2}\]\s+\[([^\]\s]+)\]")
+
 # Режим экстремальной экономии ресурсов для 50-80+ ботов на слабых смартфонах
 ECO_80_MODE = os.environ.get("BR_ECO_80", "1").lower() in ("1", "true", "yes", "on")
 
@@ -171,6 +189,7 @@ class BotInstance:
         self.level_str = "-"
         self.money = 0
         self.target_lvl = None  # Целевой уровень (например 4)
+        self._quest_helpers = None
         self.target_achieved = False
         self.last_stats_check = 0.0
         self.stats_pending = False
@@ -181,6 +200,12 @@ class BotInstance:
         self.connected_time = None
         self.thread = None
         self.active_task = None
+
+        # Спавн: watchdog выводит бота из зоны авторизации на вокзал
+        self.spawn_watchdog = None
+        self.spawned_at = None
+        self.spawn_point = None
+        self.spawn_report = None
 
         self.reconnect_thread = None
         self.reconnect_cancel_event = threading.Event()
@@ -255,6 +280,19 @@ class BotInstance:
             return f"{self.money:,} руб.".replace(",", " ")
         return "0 руб."
 
+    @property
+    def quest_helpers(self):
+        """Помощники сюжетки: НПС-диалоги, ларёк, звонки, покраска.
+
+        Создаются лениво — боту без сюжетки они не нужны.
+        """
+        if self._quest_helpers is None:
+            from logic.quest_helpers import QuestHelpers
+            self._quest_helpers = QuestHelpers(
+                self, log=self.add_log
+            )
+        return self._quest_helpers
+
     def add_log(self, text: str):
         t_str = time.strftime("[%H:%M:%S]")
         formatted = f"{t_str} [{self.nickname}] {text}"
@@ -322,6 +360,61 @@ class BotInstance:
     def is_queue_status(self) -> bool:
         return self.queue_mode or self.status.startswith("Очередь")
 
+    # ==================== СПАВН В РЕАЛЬНОМ МИРЕ ====================
+
+    def mark_spawned(self, position=None):
+        """Бот реально в мире: статус, лог, метка времени."""
+        from logic.spawn import is_spawned_position, nearest_spawn_name, remember_station
+
+        pos = position or (self.api.getbotposition() if self.api else None)
+        if not is_spawned_position(pos):
+            return False
+        remember_station(pos)
+
+        self.spawned_at = time.time()
+        self.spawn_point = tuple(float(v) for v in pos)
+        self.status = "В игре (заспавнен)"
+        try:
+            name, dist = nearest_spawn_name(pos)
+            label = name or f"вокзал ({pos[0]:.0f}, {pos[1]:.0f})"
+            self.add_log(
+                f"[SPAWN] на карте: {label} ({dist:.0f}м) "
+                f"X={pos[0]:.1f} Y={pos[1]:.1f} Z={pos[2]:.1f}"
+            )
+        except Exception:
+            pass
+        return True
+
+    def begin_spawn_watchdog(self):
+        """Доводит спавн до конца: бот должен уйти из зоны авторизации."""
+        from logic.spawn import SpawnWatchdog, is_spawned_position
+
+        if self.stopping or self.is_banned:
+            return
+        if self.spawn_watchdog is not None and self.spawn_watchdog.running:
+            return
+        # Уже на вокзале — второй хендшейк только дёрнет нас назад.
+        if is_spawned_position(self.api.getbotposition() if self.api else None):
+            return
+
+        self.spawn_watchdog = SpawnWatchdog(self, log=self.add_log)
+        self.spawn_watchdog.start()
+
+    def stop_spawn_watchdog(self):
+        if self.spawn_watchdog is not None:
+            self.spawn_watchdog.stop()
+
+    def request_spawn(self, index=None):
+        """Ручной выбор вокзала: индекс или дефолтный для этого бота."""
+        from logic.spawn import force_spawn, spawn_index_for
+
+        idx = spawn_index_for(self.bot_id) if index is None else int(index)
+        report = force_spawn(self, index=idx, log=self.add_log)
+        self.spawn_report = report
+        if report["status"] in ("spawned", "already_spawned"):
+            self.mark_spawned(report.get("position"))
+        return report
+
     def setup_session(self):
         self.stopping = False
         self.network = Network(self.host, self.port)
@@ -343,8 +436,8 @@ class BotInstance:
                 password=self.password,
                 gender=0,
                 skin=78,
-                step_delay=0.6,
-                ack_timeout=15.0,
+                step_delay=float(os.environ.get("BR_AUTH_STEP_DELAY", "0.6")),
+                ack_timeout=float(os.environ.get("BR_AUTH_TIMEOUT", "15.0")),
             )
 
         json_ui = JsonUIConfig(
@@ -577,6 +670,7 @@ class BotInstance:
     def stop(self, banned: bool = False):
         self.stopping = True
         self.cancel_reconnect()
+        self.stop_spawn_watchdog()
         self.queue_mode = False
         self.queue_reason = ""
         self._queue_timer_active = False
@@ -788,11 +882,12 @@ class BotManager:
                 time.sleep(random.uniform(5.0, 10.0))
                 print(f"[*] Создаем новый аккаунт взамен забаненного бота на сервере {bot.server_name}...")
                 new_bot = self.add_bot(
-                    server_name=bot.server_name,
-                    nickname=None, # Случайный реалистичный ник
+                    target_server=bot.server_name,
+                    nickname=None,  # None -> сгенерировать реалистичный ник
                     password=bot.password,
+                    auto_regen_nick=True,
                     proxy=bot.proxy,
-                    default_task=bot.default_task_name
+                    default_task=bot.default_task_name,
                 )
                 if new_bot:
                     notice = (
@@ -831,6 +926,10 @@ class BotManager:
         def _on_connected(bot_obj, *args, **kwargs):
             b = self._find_bot_by_session_or_api(bot_obj)
             if b:
+                # Новая сессия — старое меню вокзалов недействительно
+                from logic.spawn import reset_menu
+
+                reset_menu()
                 # Вход разрешён — очередь сброшена
                 b.leave_queue()
                 b.status = "В игре (авторизован)"
@@ -844,39 +943,51 @@ class BotManager:
             b = self._find_bot_by_session_or_api(bot_obj)
             if b:
                 b.leave_queue()
-                b.status = "В игре (заспавнен)"
-                b.add_log("Персонаж заспавнен на карте")
+                # Статус «заспавнен» ставим только когда бот реально в мире,
+                # а не когда мы сами отправили RPC_SPAWN.
+                b.begin_spawn_watchdog()
 
-                # Гарантируем синхронизацию позиции и мира
-                def _sync_spawn_world():
-                    time.sleep(1.0)
-                    if b.api and b.session and b.session.connected:
-                        # Отправляем подтверждение выбора вокзала и RPC spawn
-                        from samp.interfaces import InterfaceID
-                        from samp.packets import PacketBuilder
-                        try:
-                            b.session.send_json(InterfaceID.SPAWN_SELECT, {"t": 1, "s": 0})
-                            b.session.send_json(InterfaceID.SPAWN_SELECT, {"s": 0})
-                            b.session._sender.send(PacketBuilder.rpc_build("spawn"), rpc_name="spawn")
-                        except Exception:
-                            pass
-                        time.sleep(0.5)
-                        try:
-                            b.api.sendscoresandpings()
-                        except Exception:
-                            pass
-                        # Микро-прыжок для стрима окружающих игроков и обновления сетевой модели
-                        try:
-                            b.api.SetKey(keys=32)
-                            time.sleep(0.15)
-                            b.api.SetKey(keys=0)
-                        except Exception:
-                            pass
-                    time.sleep(2.0)
-                    if b.api and "В игре" in b.status:
-                        b.stats_pending = True
-                        b.send_chat("/mm")
-                threading.Thread(target=_sync_spawn_world, daemon=True).start()
+        @emitter.on("onSpawnSelect")
+        def _on_spawn_select(bot_obj, data, *args, **kwargs):
+            """Сервер прислал меню вокзалов — сразу выбираем первый."""
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if not b:
+                return
+
+            from logic.spawn import (
+                available_spawns,
+                in_auth_zone,
+                is_spawn_menu,
+                menu_choice,
+                remember_spawn_menu,
+                select_spawn,
+            )
+
+            payload = data if isinstance(data, dict) else {}
+
+            if is_spawn_menu(payload):
+                items = remember_spawn_menu(payload)
+                choice = menu_choice(items)
+                b.add_log(f"[SPAWN] меню вокзалов {items}, выбираем {choice}")
+                # Отвечаем прямо здесь: меню живёт несколько секунд.
+                if select_spawn(b, choice):
+                    b.add_log(f"[SPAWN] отправлен выбор вокзала {choice}")
+                    # Сторож нужен только если спавн не состоится: он сам
+                    # выждет меню-паузу и не полезет с хендшейком раньше.
+                    if b.spawn_watchdog is None or not b.spawn_watchdog.running:
+                        b.begin_spawn_watchdog()
+                return
+
+            # {'s': N} — либо приглашение, либо подтверждение выбора.
+            # Приглашение {"s": 1} без списка сервер не обслуживает,
+            # вокзал выбирается RPC-хендшейком.
+            if not payload.get("s"):
+                return
+
+            pos = b.api.getbotposition() if b.api else None
+            if available_spawns() and in_auth_zone(pos):
+                if b.spawn_watchdog is None or not b.spawn_watchdog.running:
+                    b.begin_spawn_watchdog()
 
         @emitter.on("onShowChat")
         def _on_chat(bot_obj, message, *args, **kwargs):
@@ -1062,14 +1173,19 @@ class BotManager:
                     "подозрение в использовании чит",
                     "постороннее по",
                     "connection_banned",
-                    "читы",
                     "чит-программ",
                     "чит программа",
                     "читы/ппв",
-                    "бот",
                     "использование бот",
                     "auto-clicker",
                     "автокликер",
+                ]
+                # Короткие слова проверяем по границам слова, иначе "работы"
+                # (Информация о работах) ловится на подстроку "бот" и ферма
+                # мгновенно уходит в ложный бан.
+                ban_patterns = [
+                    re.compile(r"\bбот(?:ы|а|ов|ом|е)?\b", re.IGNORECASE),
+                    re.compile(r"\bчит(?:ы|ов|ами|ер)?\b", re.IGNORECASE),
                 ]
                 # Исключаем временный бан за частые входы из перманентного бана
                 freq_dialog_keywords = [
@@ -1081,7 +1197,9 @@ class BotManager:
                 if is_freq_ban:
                     b.add_log(f"[РЕКОННЕКТ] Бан за частые входы в диалоге #{d_id}. Вход через 25 минут.")
                     b.scheduled_reconnect_delay = 25 * 60.0
-                elif any(trigger in dialog_text for trigger in ban_triggers):
+                elif any(trigger in dialog_text for trigger in ban_triggers) or any(
+                    pattern.search(dialog_text) for pattern in ban_patterns
+                ):
                     self.mark_bot_banned(b, reason=f"Диалог #{d_id}: {title} | {clean_info[:80]}")
 
                 # Много заходов с одного IP в диалоге
@@ -1164,34 +1282,62 @@ class BotManager:
                 b.add_log(f"[АВТОРИЗАЦИЯ] Статус: {state}")
                 if state == "logging_in" and getattr(b, "auto_regen_nick", False):
                     self.replace_bot_nickname(b)
+                if state == "authenticated":
+                    # Только после логина имеет смысл выбирать вокзал
+                    b.begin_spawn_watchdog()
 
         @emitter.on("onCallNotification")
         def _on_call(bot_obj, header, text, button, notif_type, *args, **kwargs):
             b = self._find_bot_by_session_or_api(bot_obj)
             if b:
                 b.add_log(f"[ВХОДЯЩИЙ ЗВОНОК] {header}: {text}")
+                try:
+                    b.quest_helpers.on_json(
+                        65,
+                        {"o": 1, "t": notif_type, "h": header, "s": text, "b": button},
+                    )
+                except Exception as exc:
+                    b.add_log(f"[ЗВОНОК] помощник упал: {exc!r}")
                 if b.active_task and hasattr(b.active_task, "on_call_notification"):
                     b.active_task.on_call_notification(header, text, button, notif_type)
 
         @emitter.on("onReceiveJSON")
         def _on_receive_json(bot_obj, interface_id, json_data, *args, **kwargs):
             b = self._find_bot_by_session_or_api(bot_obj)
-            if b and b.active_task and hasattr(b.active_task, "on_receive_json"):
+            if not b:
+                return
+            # Помощники сюжетки видят всё: диалоги НПС, ларёк, звонки, палитру.
+            try:
+                handled = b.quest_helpers.on_json(interface_id, json_data)
+            except Exception as exc:
+                b.add_log(f"[ПОМОЩНИК] сбой на iid={interface_id}: {exc!r}")
+                handled = None
+            if b.active_task and hasattr(b.active_task, "on_receive_json"):
                 b.active_task.on_receive_json(interface_id, json_data)
+            return handled
 
         @emitter.on("onQuestTask")
-        def _on_quest_task(text, *args, **kwargs):
-            with self._lock:
-                for b in self.bots.values():
-                    if b.active_task and isinstance(b.active_task, QuestMasterTask):
-                        b.active_task.on_quest_task(text)
+        def _on_quest_task(bot_obj, text, *args, **kwargs):
+            # _emit_callback подставляет объект бота первым аргументом.
+            # Раньше здесь не было bot_obj, и в text приезжал сам бот —
+            # задача получала объект вместо текста квеста.
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if b and b.active_task and isinstance(b.active_task, QuestMasterTask):
+                b.active_task.on_quest_task(text)
 
         @emitter.on("onNpcDialog")
-        def _on_npc_dialog(name, text, model, buttons, *args, **kwargs):
-            with self._lock:
-                for b in self.bots.values():
-                    if b.active_task and hasattr(b.active_task, "on_npc_dialog"):
-                        b.active_task.on_npc_dialog(name, text, model, buttons)
+        def _on_npc_dialog(bot_obj, name, text, model, buttons, *args, **kwargs):
+            # Тот же сдвиг: без bot_obj имя НПС оказывалось в bot_obj,
+            # текст в name, модель в text, а кнопки терялись в *args.
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if not b:
+                return
+            try:
+                b.quest_helpers.on_npc_dialog(name, text, buttons, model)
+            except Exception as exc:
+                b.add_log(f"[НПС] помощник упал: {exc!r}")
+            if b.active_task and hasattr(b.active_task, "on_npc_dialog"):
+                b.active_task.on_npc_dialog(name, text, model, buttons)
 
         @emitter.on("OnSetCheckpoint")
         def _on_checkpoint(bot_obj, x, y, z, radius, *args, **kwargs):
@@ -1211,11 +1357,10 @@ class BotManager:
                     pass
 
         @emitter.on("onRewardList")
-        def _on_rewards(rewards, *args, **kwargs):
-            with self._lock:
-                for b in self.bots.values():
-                    if b.active_task and isinstance(b.active_task, QuestMasterTask):
-                        b.active_task.on_rewards(rewards)
+        def _on_rewards(bot_obj, rewards, *args, **kwargs):
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if b and b.active_task and isinstance(b.active_task, QuestMasterTask):
+                b.active_task.on_rewards(rewards)
 
     def load_accounts(self):
         if not os.path.exists(ACCOUNTS_FILE):
@@ -1798,6 +1943,9 @@ def print_help():
 --- Команды для активного бота ---
   /pos              - Показать текущие координаты X, Y, Z бота
   /goto <X> <Y> <Z> [mode] - Отправить бота на координаты (walk/run/sprint)
+  /tpnext [скорость] - Доехать до ближайшего ДРУГОГО вокзала (8.5 м/с)
+  /tpspawn <имя>    - Доехать до конкретного вокзала
+  /spawn            - Переспавниться на вокзал
   /chat <текст>     - Отправить сообщение в чат
   /<команда>        - Любая серверная команда (например /time, /stats, /mm)
   /dialog <id> <кнопка> [список] [текст] - Ответить в диалог
@@ -2207,6 +2355,161 @@ def main():
                 manager.unban_bot(int(parts[1]))
             else:
                 print("Использование: /unban <ID бота>")
+
+        elif line.startswith("/tp "):
+            with manager._lock:
+                active = manager.bots.get(manager.active_bot_id) if manager.active_bot_id else None
+            if not active or not active.api:
+                print("[-] Нет активного подключенного бота.")
+                continue
+            parts = line.split()
+            if len(parts) < 4:
+                print(
+                    "Использование: /tp <X> <Y> <Z> [шаг_м] [интервал_с] [consistent|legit|zero]"
+                    "\n  по умолчанию 0.17м за 0.02с = 8.5 м/с (безопасная скорость)"
+                )
+                continue
+            try:
+                from logic.delta_teleport import SAFE_INTERVAL, SAFE_STEP
+
+                tx, ty, tz = float(parts[1]), float(parts[2]), float(parts[3])
+                # По умолчанию — безопасная скорость: 0.17м за тик, 8.5 м/с.
+                # Быстрее сервер откатывает на доверенную точку.
+                step = float(parts[4]) if len(parts) > 4 else SAFE_STEP
+                interval = float(parts[5]) if len(parts) > 5 else SAFE_INTERVAL
+                vel_mode = parts[6] if len(parts) > 6 else "consistent"
+            except ValueError:
+                print("[-] Ошибка: координаты, шаг и интервал должны быть числами.")
+                continue
+
+            def _delta_tp_worker(bot_obj, target, step_m, interval_s, mode):
+                from logic.delta_teleport import DeltaTeleport, DeltaTeleportError
+
+                try:
+                    bot_player = bot_obj.session.players.bot
+                    engine = DeltaTeleport(
+                        bot_player,
+                        bot_obj.api._delta_sync_sender,
+                        step=step_m,
+                        interval=interval_s,
+                        velocity_mode=mode,
+                    )
+                    plan = engine.plan(target)
+                    print(
+                        f"[*] Delta-телепорт #{bot_obj.bot_id}: {plan['distance']:.1f}м | "
+                        f"{plan['steps']} шагов по {step_m:.2f}м | ~{plan['estimated_seconds']:.0f}с"
+                    )
+                    was_enabled = bool(getattr(bot_obj.session.sync, "enabled", False))
+                    if was_enabled:
+                        bot_obj.session.sync.stop()
+                    try:
+                        result = engine.run(target)
+                    finally:
+                        if was_enabled and bot_obj.session.connected:
+                            bot_obj.session.sync.start()
+                    print(
+                        f"[+] Delta-телепорт: {result['status']} | шагов {result['steps']} | "
+                        f"{result['elapsed']:.2f}с | ср.скорость {result['avg_speed']:.1f} м/с | "
+                        f"позиция {result['final_position']}"
+                    )
+                    if result.get("reason"):
+                        print(f"[!] Остановка: {result['reason']}")
+                except (DeltaTeleportError, RuntimeError) as e:
+                    print(f"[-] Delta-телепорт не запущен: {e}")
+
+            threading.Thread(
+                target=_delta_tp_worker,
+                args=(active, (tx, ty, tz), step, interval, vel_mode),
+                daemon=True,
+            ).start()
+
+        elif line.startswith("/tpnext"):
+            with manager._lock:
+                active = manager.bots.get(manager.active_bot_id) if manager.active_bot_id else None
+            if not active or not active.api:
+                print("[-] Нет активного подключенного бота.")
+                continue
+            from logic.spawn import travel_to_nearest_station
+
+            parts = line.split()[1:]
+            try:
+                speed = float(parts[0]) if parts else None
+            except ValueError:
+                print("[-] Скорость должна быть числом.")
+                continue
+            threading.Thread(
+                target=lambda: print(f"[TP] {travel_to_nearest_station(active, speed=speed, log=active.add_log)}"),
+                daemon=True,
+            ).start()
+
+        elif line.startswith("/tpspawn"):
+            with manager._lock:
+                active = manager.bots.get(manager.active_bot_id) if manager.active_bot_id else None
+            if not active or not active.api:
+                print("[-] Нет активного подключенного бота.")
+                continue
+            from logic.delta_teleport import SPAWNS, find_spawn
+
+            args = line.split()[1:]
+            if not args:
+                print("Спавны: " + ", ".join(SPAWNS))
+                print("Использование: /tpspawn <имя|номер> [шаг_м] [интервал_с]")
+                continue
+            name, coords = find_spawn(args[0])
+            if coords is None:
+                print(f"[-] Спавн '{args[0]}' не найден. Доступно: {', '.join(SPAWNS)}")
+                continue
+            from logic.delta_teleport import SAFE_INTERVAL, SAFE_STEP
+
+            try:
+                step = float(args[1]) if len(args) > 1 else SAFE_STEP
+                interval = float(args[2]) if len(args) > 2 else SAFE_INTERVAL
+            except ValueError:
+                print("[-] Шаг и интервал должны быть числами.")
+                continue
+            print(f"[*] Спавн '{name}': {coords}")
+            threading.Thread(
+                target=lambda: print(
+                    active.api.DeltaTeleportTo(
+                        coords[0], coords[1], coords[2], step=step, interval=interval
+                    )
+                ),
+                daemon=True,
+            ).start()
+
+        elif line.startswith("/spawn"):
+            with manager._lock:
+                active = manager.bots.get(manager.active_bot_id) if manager.active_bot_id else None
+            if not active:
+                print("[-] Нет активного бота.")
+                continue
+            parts = line.split()
+            idx = None
+            if len(parts) > 1:
+                try:
+                    idx = int(parts[1])
+                except ValueError:
+                    print("[-] Индекс вокзала должен быть числом.")
+                    continue
+            print(f"[*] Форсируем спавн бота #{active.bot_id} [{active.nickname}]...")
+            threading.Thread(
+                target=lambda: print(f"[SPAWN] {active.request_spawn(idx)}"),
+                daemon=True,
+            ).start()
+
+        elif line.startswith("/spawns"):
+            from logic.spawn import PROBE_INDEXES, SPAWN_INDEX, in_auth_zone
+            with manager._lock:
+                active = manager.bots.get(manager.active_bot_id) if manager.active_bot_id else None
+            print(f"[*] Перебираемые индексы: {PROBE_INDEXES}")
+            if SPAWN_INDEX:
+                for i, (name, coords) in sorted(SPAWN_INDEX.items()):
+                    print(f"    #{i} {name}: ({coords[0]:.1f}, {coords[1]:.1f}, {coords[2]:.1f})")
+            else:
+                print("    (маппинг ещё не выучен — заполнится после первого спавна)")
+            if active and active.api:
+                pos = active.api.getbotposition()
+                print(f"[*] Бот #{active.bot_id}: pos={pos} | в зоне авторизации: {in_auth_zone(pos)}")
 
         elif line.startswith("/pos"):
             with manager._lock:

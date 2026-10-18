@@ -62,6 +62,8 @@ class JsonUI:
             if self.api is not None:
                 self.api._set_case_reward_cache(result['prize_ids'])
             emit('CaseRewardOpen', result['prize_ids'])
+        elif state == 'spawn_select':
+            emit('onSpawnSelect', result['json'])
         elif state == 'cinematic_started':
             name = result['cinematic_name']
             emit('onCinematic', name)

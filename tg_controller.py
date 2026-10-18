@@ -2,6 +2,7 @@ import threading
 import time
 import math
 import os
+import re
 import telebot
 from telebot import types
 from ai_controller import AICommander, load_ai_config, save_ai_config

@@ -25,13 +25,16 @@ PACKET_DELIVERY = {
     "interface_notification_response": (REL, PRI_SYS, 0),
     "interface_reward_take": (REL, PRI_SYS, 0),
     "interface_close_reward": (REL, PRI_SYS, 0),
-    "interface_auth_password": (REL_ORD, PRI_MED, 0),
-    "interface_register_password": (REL_ORD, PRI_MED, 0),
-    "interface_register_unknown_after_password": (REL_ORD, PRI_MED, 0),
-    "interface_register_referral": (REL_ORD, PRI_MED, 0),
-    "interface_register_gender": (REL_ORD, PRI_MED, 0),
-    "interface_register_skin": (REL_ORD, PRI_MED, 0),
-    "interface_register_finish": (REL_ORD, PRI_MED, 0),
+    # Авторизация и регистрация: сервер принимает их только как RELIABLE
+    # SYSTEM_PRIORITY. На REL_ORD/MEDIUM пакет доходит, но обработчик его
+    # игнорирует — ответа нет вообще.
+    "interface_auth_password": (REL, PRI_SYS, 0),
+    "interface_register_password": (REL, PRI_SYS, 0),
+    "interface_register_unknown_after_password": (REL, PRI_SYS, 0),
+    "interface_register_referral": (REL, PRI_SYS, 0),
+    "interface_register_gender": (REL, PRI_SYS, 0),
+    "interface_register_skin": (REL, PRI_SYS, 0),
+    "interface_register_finish": (REL, PRI_SYS, 0),
     "interface_cinematic_stop": (REL, PRI_HIGH, 0),
     "interface_sync": (REL_ORD, PRI_MED, 0),
     "player_sync": (UNREL_SEQ, PRI_HIGH, 0),
@@ -48,7 +51,9 @@ PACKET_DELIVERY = {
 }
 
 RPC_DELIVERY = {
-    "spawn": (REL_ORD, PRI_MED, 0),
+    # Спавн: только RELIABLE SYSTEM_PRIORITY. На REL_ORD/MEDIUM сервер пакет
+    # получает, но не отвечает — мир не стримится, в /tab нас нет.
+    "spawn": (REL, PRI_SYS, 0),
     "client_join": (REL, PRI_MED, 0),
     "enter_vehicle": (REL_SEQ, PRI_SYS, 0),
     "exit_vehicle": (REL_SEQ, PRI_SYS, 0),
@@ -59,7 +64,9 @@ RPC_DELIVERY = {
     "picked_up_pickup": (REL, PRI_MED, 0),
     "picked_up_interact": (REL, PRI_MED, 0),
     "death_notification": (REL, PRI_MED, 0),
-    "dialog_response": (REL, PRI_MED, 0),
+    # Ответ на диалог — как и спавн, только RELIABLE SYSTEM_PRIORITY:
+    # на MEDIUM сервер пакет принимает, но обработчик его не видит.
+    "dialog_response": (REL, PRI_SYS, 0),
 }
 
 _RPC_DELIVERY_DEFAULT = (REL, PRI_MED, 0)

@@ -3,6 +3,7 @@ import struct
 import socket
 import random
 from functools import partial
+from typing import Callable
 
 from core.bitstream import BitStream
 from .constants import (
@@ -17,8 +18,20 @@ from core.br_auth import _sub_4d368c
 
 class RPCBuilder:
 
+    # В заголовке RakNet под id отведено 9 бит: 8 младших + 1 старший.
+    MAX_RPC_ID = 0x1FF
+
     @staticmethod
     def _write_rpc_id(bs: BitStream, rpc_id: int) -> None:
+        # Без этой проверки id > 511 обрезается и уходит ЧУЖИМ RPC —
+        # сервер молчит, а мы думаем, что пакет доставлен.
+        if not 0 <= int(rpc_id) <= RPCBuilder.MAX_RPC_ID:
+            raise ValueError(
+                f"rpc_id {rpc_id} не влезает в 9 бит (максимум "
+                f"{RPCBuilder.MAX_RPC_ID}); такой пакет ушёл бы как "
+                f"{int(rpc_id) & 0x1FF}"
+            )
+
         low8 = rpc_id & 0xFF
         high1 = (rpc_id >> 8) & 1
 

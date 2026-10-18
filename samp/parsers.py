@@ -881,10 +881,9 @@ RPC_PARSE_REGISTRY: dict[str, tuple[int, "Callable[[BitStream], dict | None]"]] 
         RPCConstants.PLAY_AUDIO_STREAM,
         RPCParser.play_audio_stream,
     ),
-    "stop_audio_stream": (
-        RPCConstants.STOP_AUDIO_STREAM,
-        RPCParser.stop_audio_stream,
-    ),
+    # "stop_audio_stream" снят: id 512 не влезает в 9 бит, то есть в таблице
+    # было заведомо неверное значение и обработчик не срабатывал никогда.
+    # Вернём с подтверждённым id.
     "set_player_health": (
         RPCConstants.SCR_SET_PLAYER_HEALTH,
         RPCParser.set_player_health,
