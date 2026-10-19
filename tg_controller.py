@@ -154,12 +154,89 @@ class TelegramBotController:
         )
         markup.row(
             types.InlineKeyboardButton("➕ Массовое создание", callback_data="act_batch"),
-            types.InlineKeyboardButton("🌐 Список Прокси", callback_data="act_proxies_list")
+            types.InlineKeyboardButton("🌐 Прокси и VPN", callback_data="vpn_menu")
         )
         markup.row(
             types.InlineKeyboardButton("🔄 Обновить список", callback_data=f"page:{page}")
         )
         return markup, total_bots, total_pages
+
+    def _render_vpn_menu(self, chat_id, message_id=None, callback_id=None, quiet=False):
+        """Раздел «Прокси и VPN»: узлы цветом, добавление, проверка, раздача."""
+        pool = getattr(self.manager, "proxy_pool", None)
+        markup = types.InlineKeyboardMarkup(row_width=1)
+
+        if pool is None:
+            text = "<b>🌐 Прокси и VPN</b>\n\n<i>Пул прокси не запущен.</i>"
+        else:
+            statuses = pool.statuses()
+            summary = pool.summary()
+            lines = ["<b>🌐 Прокси и VPN</b>", ""]
+
+            if statuses:
+                lines.append(
+                    f"Рабочих: <b>{summary['usable']}</b> из {summary['total']} · "
+                    f"проверка каждые {summary['interval']:.0f}с"
+                )
+                if summary["last_refresh"]:
+                    stamp = time.strftime("%H:%M:%S", time.localtime(summary["last_refresh"]))
+                    lines.append(f"Обновлено: {stamp}")
+                lines.append("")
+                for res in statuses[:12]:
+                    node = res.node
+                    if res.usable:
+                        mark = "🟢"
+                    elif res.alive:
+                        mark = "🟡"
+                    else:
+                        mark = "🔴"
+                    latency = f" · {res.latency_ms:.0f}мс" if res.latency_ms else ""
+                    note = f"\n     <i>{res.reason}</i>" if res.reason else ""
+                    lines.append(
+                        f"{mark} <b>{node.name}</b>\n"
+                        f"     <code>{node.address}:{node.port}</code> "
+                        f"[{node.protocol}]{latency}{note}"
+                    )
+                if len(statuses) > 12:
+                    lines.append(f"<i>…и ещё {len(statuses) - 12}</i>")
+                lines.append("")
+                lines.append("🟢 рабочий · 🟡 нужен клиент · 🔴 мёртвый")
+            else:
+                lines.append("<i>Узлов нет. Добавь подписку или локальный прокси.</i>")
+
+            if summary["last_error"]:
+                lines.append(f"\n⚠️ {summary['last_error']}")
+
+            text = "\n".join(lines)
+
+            if summary["usable"]:
+                markup.add(types.InlineKeyboardButton(
+                    "⚡️ Раздать рабочие всем ботам", callback_data="vpn_apply_all"))
+            markup.add(types.InlineKeyboardButton(
+                "🔄 Проверить сейчас", callback_data="vpn_refresh"))
+
+        markup.add(types.InlineKeyboardButton(
+            "🔗 Добавить VPN-подписку", callback_data="vpn_add_sub"))
+        markup.add(types.InlineKeyboardButton(
+            "🔌 Добавить локальный прокси", callback_data="vpn_add_local"))
+        markup.add(types.InlineKeyboardButton(
+            "⬅️ Назад в меню", callback_data="page:1"))
+
+        if message_id is None:
+            self.bot.send_message(chat_id, text, reply_markup=markup)
+        else:
+            try:
+                self.bot.edit_message_text(
+                    text, chat_id=chat_id, message_id=message_id, reply_markup=markup
+                )
+            except Exception:
+                if not quiet:
+                    self.bot.send_message(chat_id, text, reply_markup=markup)
+        if callback_id:
+            try:
+                self.bot.answer_callback_query(callback_id)
+            except Exception:
+                pass
 
     def _setup_handlers(self):
         @self.bot.message_handler(commands=["start", "menu", "help"])
@@ -519,6 +596,34 @@ class TelegramBotController:
                 for name, px_val in saved_proxies[:6]:
                     markup.add(types.InlineKeyboardButton(f"⚡️ {name}", callback_data=f"apply_px:{bid}:{page}:{name}"))
 
+                # Узлы из пула: зелёные рабочие, жёлтые живые без клиента,
+                # красные мёртвые. Нажать можно только зелёный.
+                pool = getattr(self.manager, "proxy_pool", None)
+                if pool is not None:
+                    for res in pool.statuses()[:8]:
+                        node = res.node
+                        if res.usable:
+                            mark = "🟢"
+                        elif res.alive:
+                            mark = "🟡"
+                        else:
+                            mark = "🔴"
+                        latency = f" {res.latency_ms:.0f}мс" if res.latency_ms else ""
+                        label = f"{mark} {node.name[:24]}{latency}"
+                        if node.is_direct:
+                            markup.add(types.InlineKeyboardButton(
+                                label,
+                                callback_data=f"pool_px:{bid}:{page}:{node.key}",
+                            ))
+                        else:
+                            markup.add(types.InlineKeyboardButton(
+                                f"{label} (нужен клиент)",
+                                callback_data=f"pool_dead:{bid}:{page}",
+                            ))
+                    markup.add(types.InlineKeyboardButton(
+                        "🔄 Проверить прокси", callback_data=f"pool_refresh:{bid}:{page}"
+                    ))
+
                 markup.add(types.InlineKeyboardButton("✏️ Ввести прокси вручную", callback_data=f"bot_proxy_custom:{bid}:{page}"))
                 markup.add(types.InlineKeyboardButton("🚫 Сбросить прокси (Свой IP)", callback_data=f"bot_proxy_reset:{bid}:{page}"))
                 markup.add(types.InlineKeyboardButton("⬅️ Назад к боту", callback_data=f"bot_view:{bid}:{page}"))
@@ -539,6 +644,47 @@ class TelegramBotController:
                     self.manager.set_bot_proxy(bid, target_px)
                     self.bot.answer_callback_query(call.id, f"Прокси '{px_name}' применен!", show_alert=True)
                 call.data = f"bot_view:{bid}:{page}"
+                handle_callbacks(call)
+
+            elif data.startswith("pool_px:"):
+                _, bid_s, page_s, node_key = data.split(":", 3)
+                bid = int(bid_s)
+                page = int(page_s)
+                pool = getattr(self.manager, "proxy_pool", None)
+                node = pool.find_node(node_key) if pool else None
+                if node is None or not node.is_direct:
+                    self.bot.answer_callback_query(call.id, "Узел не годится", show_alert=True)
+                    return
+                ok, reason = pool.verify_before_connect(node.proxy_url())
+                if not ok:
+                    self.bot.answer_callback_query(call.id, f"Не работает: {reason}", show_alert=True)
+                    return
+                if self.manager.set_bot_proxy(bid, node.proxy_url()):
+                    self.bot.answer_callback_query(call.id, f"Применён: {node.name}", show_alert=True)
+                else:
+                    self.bot.answer_callback_query(call.id, "Не вышло", show_alert=True)
+                call.data = f"bot_view:{bid}:{page}"
+                handle_callbacks(call)
+
+            elif data.startswith("pool_dead:"):
+                self.bot.answer_callback_query(
+                    call.id,
+                    "Этот узел требует внешний клиент (VLESS/VMess/Trojan). "
+                    "Бот умеет только socks5/http.",
+                    show_alert=True,
+                )
+
+            elif data.startswith("pool_refresh:"):
+                _, bid_s, page_s = data.split(":")
+                bid = int(bid_s)
+                page = int(page_s)
+                pool = getattr(self.manager, "proxy_pool", None)
+                if pool is None:
+                    self.bot.answer_callback_query(call.id, "Пул прокси не запущен", show_alert=True)
+                    return
+                self.bot.answer_callback_query(call.id, "Проверяю узлы...", show_alert=False)
+                threading.Thread(target=pool.refresh, daemon=True).start()
+                call.data = f"bot_proxy_menu:{bid}:{page}"
                 handle_callbacks(call)
 
             elif data.startswith("bot_proxy_reset:"):
@@ -653,25 +799,61 @@ class TelegramBotController:
                 except Exception:
                     pass
 
-            elif data == "act_proxies_list":
-                saved_proxies = load_proxy_list()
-                text = "<b>🌐 Список сохраненных прокси:</b>\n\n"
-                if not saved_proxies:
-                    text += "<i>(Список пока пуст)</i>\nДобавить можно кнопкой ниже."
-                else:
-                    for name, px_val in saved_proxies:
-                        masked = px_val.split("@")[-1] if "@" in px_val else px_val.split(":")[0] + ":***"
-                        text += f"• <b>{name}</b>: <code>{masked}</code>\n"
+            elif data in ("vpn_menu", "act_proxies_list"):
+                self._render_vpn_menu(chat_id, message_id, call.id)
 
-                markup = types.InlineKeyboardMarkup(row_width=1)
-                markup.add(types.InlineKeyboardButton("➕ Добавить прокси в список", callback_data="act_add_saved_proxy"))
-                markup.add(types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="page:1"))
+            elif data == "vpn_refresh":
+                pool = getattr(self.manager, "proxy_pool", None)
+                if pool is None:
+                    self.bot.answer_callback_query(call.id, "Пул прокси не запущен", show_alert=True)
+                    return
+                self.bot.answer_callback_query(call.id, "Проверяю узлы...")
+                threading.Thread(target=pool.refresh, daemon=True).start()
+                self._render_vpn_menu(chat_id, message_id, call.id, quiet=True)
 
-                try:
-                    self.bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=markup)
-                except Exception:
-                    pass
+            elif data == "vpn_add_sub":
+                self.user_states[chat_id] = {"action": "add_vpn_sub"}
+                self.bot.send_message(
+                    chat_id,
+                    "<b>🔗 Новая VPN-подписка</b>\n\n"
+                    "Пришли ссылку подписки:\n"
+                    "<code>https://panel.example/sub/xxxxx</code>\n\n"
+                    "Можно с именем через <code>|</code>:\n"
+                    "<code>Германия|https://panel.example/sub/xxxxx</code>\n\n"
+                    "Для отмены: /cancel",
+                )
                 self.bot.answer_callback_query(call.id)
+
+            elif data == "vpn_add_local":
+                self.user_states[chat_id] = {"action": "add_vpn_local"}
+                self.bot.send_message(
+                    chat_id,
+                    "<b>🔌 Локальный прокси</b>\n\n"
+                    "Пришли имя и адрес через <code>|</code>:\n"
+                    "<code>HAPP|socks5://127.0.0.1:10808</code>\n\n"
+                    "Бот умеет socks5 и http. Для RakNet нужен socks5 с UDP.",
+                )
+                self.bot.answer_callback_query(call.id)
+
+            elif data == "vpn_apply_all":
+                pool = getattr(self.manager, "proxy_pool", None)
+                working = pool.usable_proxies() if pool else []
+                if not working:
+                    self.bot.answer_callback_query(
+                        call.id, "Нет рабочих прокси — сначала проверь", show_alert=True
+                    )
+                    return
+                with self.manager._lock:
+                    targets = list(self.manager.bots.values())
+                for index, item in enumerate(targets):
+                    item.proxy = working[index % len(working)]
+                self.manager.save_accounts()
+                self.bot.answer_callback_query(
+                    call.id,
+                    f"Роздано {len(working)} прокси на {len(targets)} ботов",
+                    show_alert=True,
+                )
+                self._render_vpn_menu(chat_id, message_id, call.id, quiet=True)
 
             elif data == "act_add_saved_proxy":
                 self.user_states[chat_id] = {"action": "add_global_proxy"}
@@ -869,6 +1051,60 @@ class TelegramBotController:
                     self.bot.edit_message_text(res, chat_id=message.chat.id, message_id=status_msg.message_id, parse_mode="HTML")
                 except Exception:
                     self.bot.send_message(message.chat.id, res, parse_mode="HTML")
+
+            elif action == "add_vpn_sub":
+                del self.user_states[message.chat.id]
+                raw_val = message.text.strip()
+                if "|" in raw_val:
+                    sub_name, sub_url = raw_val.split("|", 1)
+                    sub_name, sub_url = sub_name.strip(), sub_url.strip()
+                else:
+                    sub_name, sub_url = "", raw_val
+                pool = getattr(self.manager, "proxy_pool", None)
+                if pool is None:
+                    self.bot.reply_to(message, "❌ Пул прокси не запущен.")
+                    return
+                status = self.bot.reply_to(message, "⏳ Тяну подписку...")
+                try:
+                    nodes = pool.add_subscription(sub_url, name=sub_name)
+                except Exception as exc:
+                    self.bot.edit_message_text(
+                        f"❌ Не вышло: <code>{exc}</code>",
+                        chat_id=message.chat.id,
+                        message_id=status.message_id,
+                    )
+                    return
+                self.bot.edit_message_text(
+                    f"✅ Подписка принята, узлов: <b>{len(nodes)}</b>. Проверяю...",
+                    chat_id=message.chat.id,
+                    message_id=status.message_id,
+                )
+                threading.Thread(target=pool.refresh, kwargs={"fetch": False}, daemon=True).start()
+                time.sleep(1.0)
+                self._render_vpn_menu(message.chat.id, None, None, quiet=True)
+
+            elif action == "add_vpn_local":
+                del self.user_states[message.chat.id]
+                raw_val = message.text.strip()
+                if "|" not in raw_val:
+                    self.bot.reply_to(
+                        message, "❌ Нужно: <code>Имя|socks5://host:port</code>"
+                    )
+                    return
+                local_name, local_proxy = raw_val.split("|", 1)
+                pool = getattr(self.manager, "proxy_pool", None)
+                if pool is None:
+                    self.bot.reply_to(message, "❌ Пул прокси не запущен.")
+                    return
+                try:
+                    pool.add_manual(local_proxy.strip(), name=local_name.strip())
+                except Exception as exc:
+                    self.bot.reply_to(message, f"❌ Не вышло: <code>{exc}</code>")
+                    return
+                ok, reason = pool.verify_before_connect(local_proxy.strip())
+                mark = "✅" if ok else "⚠️"
+                self.bot.reply_to(message, f"{mark} <b>{local_name.strip()}</b>: {reason or 'ок'}")
+                self._render_vpn_menu(message.chat.id, None, None, quiet=True)
 
             elif action == "add_global_proxy":
                 del self.user_states[message.chat.id]

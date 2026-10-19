@@ -31,3 +31,9 @@ _diag/
 !test_regressions.py
 !test_farm_flow.py
 !test_undermap.py
+!logic/vpn_sub.py
+!logic/vpn_probe.py
+!logic/proxy_pool.py
+!test_proxy_pool.py
+!test_proxy_integration.py
+!test_spawn_status.py

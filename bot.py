@@ -51,6 +51,15 @@ PROXIES_FILE = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt"),
 )
 
+# Пул прокси и VPN-подписок: состояние рядом с accounts.json
+PROXY_POOL_FILE = os.environ.get(
+    "BR_PROXY_POOL_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies_pool.json"),
+)
+
+# Как часто перепроверять узлы. 300 секунд = 5 минут, как и просили.
+PROXY_REFRESH_INTERVAL = float(os.environ.get("BR_PROXY_REFRESH", "300"))
+
 # Максимальная длина игрового ника в Black Russia
 MAX_NICKNAME_LEN = 20
 
@@ -394,7 +403,11 @@ class BotInstance:
         if self.spawn_watchdog is not None and self.spawn_watchdog.running:
             return
         # Уже на вокзале — второй хендшейк только дёрнет нас назад.
-        if is_spawned_position(self.api.getbotposition() if self.api else None):
+        # Но статус поставить надо: без него бот навсегда остаётся
+        # «В игре (авторизован)», и всё, что смотрит на статус, его не видит.
+        pos = self.api.getbotposition() if self.api else None
+        if is_spawned_position(pos):
+            self.mark_spawned(pos)
             return
 
         self.spawn_watchdog = SpawnWatchdog(self, log=self.add_log)
@@ -482,9 +495,41 @@ class BotInstance:
             except Exception as e:
                 self.add_log(f"Ошибка настройки прокси {self.proxy}: {e}")
 
+    def check_proxy_before_start(self) -> tuple[bool, str]:
+        """Сначала запрос, потом заход.
+
+        Если у бота задан прокси, он должен пройти сквозную проверку: TCP до
+        внешнего хоста и UDP через STUN. Без UDP бот зайдёт и зависнет в зоне
+        авторизации, поэтому такой прокси тоже считается непригодным.
+
+        Прокси не задан — проверять нечего, идём со своего IP.
+        """
+        if not self.proxy:
+            return True, ""
+        pool = getattr(self.manager, "proxy_pool", None) if self.manager else None
+        if pool is None:
+            return True, ""
+        try:
+            ok, reason = pool.verify_before_connect(self.proxy)
+        except Exception as exc:
+            return False, f"проверка прокси упала: {exc}"
+        if ok:
+            self.add_log(f"[ПРОКСИ] проверка пройдена: {reason}")
+        else:
+            self.add_log(f"[ПРОКСИ] проверка НЕ пройдена: {reason}")
+        return ok, reason
+
     def start(self):
         if self.is_banned:
             self.add_log("Попытка запуска забаненного аккаунта отклонена.")
+            return False
+
+        # Прокси проверяем ДО подключения: с мёртвым прокси бот только
+        # потратит попытки входа и попадёт в лимит частых подключений.
+        ok, reason = self.check_proxy_before_start()
+        if not ok:
+            self.status = f"Прокси не работает: {reason}"
+            self.add_log(f"[-] Запуск отменён, прокси не работает: {reason}")
             return False
 
         self.cancel_reconnect()
@@ -720,6 +765,22 @@ class BotManager:
 
         logger.set_log_interceptor(self._handle_global_log)
         self._setup_event_hooks()
+
+        # Пул прокси: подписки, ручные прокси и их проверка по таймеру.
+        # Проверка идёт в фоне раз в 5 минут, чтобы к моменту запуска бота
+        # уже было известно, какой прокси живой.
+        try:
+            from logic.proxy_pool import ProxyPool
+
+            self.proxy_pool = ProxyPool(
+                PROXY_POOL_FILE,
+                log=lambda msg: print(msg, flush=True),
+                interval=PROXY_REFRESH_INTERVAL,
+            )
+            self.proxy_pool.start()
+        except Exception as exc:
+            self.proxy_pool = None
+            print(f"[-] Пул прокси не поднялся: {exc}")
 
         # Загружаем сохраненные аккаунты из accounts.json
         self.load_accounts()
@@ -1509,6 +1570,14 @@ class BotManager:
             print("[-] Ошибка: Пароль обязателен для каждого аккаунта!")
             return None
 
+        # Ключ из пула («HAPP») превращаем в socks5://... до создания бота,
+        # иначе в accounts.json уедет имя вместо адреса.
+        if proxy:
+            resolved = self.resolve_proxy(proxy)
+            if not resolved:
+                print(f"[-] Прокси не годится: {proxy}. Бот пойдёт со своего IP.")
+            proxy = resolved
+
         password = password.strip()
 
         try:
@@ -1652,6 +1721,25 @@ class BotManager:
         password = password.strip()
         created = []
         proxies_pool = list(proxies) if proxies else []
+        if proxies_pool:
+            # Проверяем прокси один раз на всю пачку: незачем дёргать сервер
+            # N раз за одно и то же, а мёртвые надо выкинуть до захода.
+            working = []
+            for item in proxies_pool:
+                resolved = self.resolve_proxy(item)
+                if not resolved:
+                    print(f"[-] Прокси не годится, пропущен: {item}")
+                    continue
+                pool = getattr(self, "proxy_pool", None)
+                if pool is not None:
+                    ok, reason = pool.verify_before_connect(resolved)
+                    if not ok:
+                        print(f"[-] Прокси мёртв, пропущен: {item} ({reason})")
+                        continue
+                working.append(resolved)
+            proxies_pool = working
+            if not proxies_pool:
+                print("[-] Ни один прокси не прошёл проверку — создаю без прокси.")
 
         for i in range(count):
             nick = self.generate_random_nickname()
@@ -1746,25 +1834,122 @@ class BotManager:
         self.save_accounts()
         print(f"[+] Бот #{bot_id} [{bot.nickname}] разбанен! Теперь его можно запустить командой /start {bot_id}")
 
+    def resolve_proxy(self, proxy_str: str) -> str:
+        """Ключ из пула или голая строка -> строка для bot.proxy.
+
+        Пусто, если прокси не годится: мёртвый узел или узел, которому нужен
+        внешний клиент. Возвращать «как есть» нельзя — бот уйдёт в коннект
+        с заведомо нерабочим прокси.
+        """
+        proxy_clean = (proxy_str or "").strip()
+        if not proxy_clean:
+            return ""
+        if proxy_clean.lower() in ("none", "0", "off", "no", "direct", "-"):
+            return ""
+        # Ссылка уже готова — берём как есть
+        if "://" in proxy_clean:
+            if proxy_clean.startswith("http://"):
+                return "socks5://" + proxy_clean[7:]
+            if proxy_clean.startswith("https://"):
+                return "socks5://" + proxy_clean[8:]
+            return proxy_clean
+        # Иначе это ключ из пула
+        pool = getattr(self, "proxy_pool", None)
+        if pool is None:
+            return proxy_clean
+        node = pool.find_node(proxy_clean)
+        if node is None:
+            return proxy_clean
+        if not node.is_direct:
+            return ""
+        return node.proxy_url()
+
     def set_bot_proxy(self, bot_id: int, proxy_str: str) -> bool:
         with self._lock:
             bot = self.bots.get(bot_id)
             if not bot:
                 return False
-            proxy_clean = proxy_str.strip()
-            if proxy_clean.lower() in ("none", "0", "off", "no", "direct", "-"):
+            raw = (proxy_str or "").strip()
+            if raw.lower() in ("none", "0", "off", "no", "direct", "-"):
                 bot.proxy = ""
             else:
-                # Если в строке http:// или https://, предупреждаем/конвертируем в socks5 для UDP если протокол не указан
-                if proxy_clean.startswith("http://"):
-                    # Заменяем префикс на socks5://
-                    proxy_clean = "socks5://" + proxy_clean[7:]
-                elif proxy_clean.startswith("https://"):
-                    proxy_clean = "socks5://" + proxy_clean[8:]
-                bot.proxy = proxy_clean
+                resolved = self.resolve_proxy(raw)
+                if not resolved:
+                    return False
+                bot.proxy = resolved
 
         self.save_accounts()
         return True
+
+    def apply_proxy_to_bots(self, proxy_str: str, bot_ids: list[int] | None = None) -> dict:
+        """Раздать прокси пачке ботов. Пустой список — всем.
+
+        Сначала проверка прокси, потом раздача: если прокси мёртв, ни одному
+        боту он не достанется.
+        """
+        pool = getattr(self, "proxy_pool", None)
+        resolved = self.resolve_proxy(proxy_str)
+        if not resolved:
+            return {"ok": False, "reason": "прокси не годится", "applied": []}
+
+        if pool is not None:
+            ok, reason = pool.verify_before_connect(resolved)
+            if not ok:
+                return {"ok": False, "reason": reason, "applied": []}
+
+        with self._lock:
+            targets = (
+                [self.bots[bid] for bid in bot_ids if bid in self.bots]
+                if bot_ids
+                else list(self.bots.values())
+            )
+            for bot in targets:
+                bot.proxy = resolved
+            applied = [bot.bot_id for bot in targets]
+
+        self.save_accounts()
+        return {"ok": True, "reason": resolved, "applied": applied}
+
+    def proxy_report(self) -> str:
+        """Текст отчёта по прокси для консоли и Telegram."""
+        pool = getattr(self, "proxy_pool", None)
+        if pool is None:
+            return "Пул прокси не запущен."
+        statuses = pool.statuses()
+        if not statuses:
+            summary = pool.summary()
+            if summary["subscriptions"] or summary["manual"]:
+                return (
+                    f"Узлы есть ({summary['subscriptions']} подписок, "
+                    f"{summary['manual']} ручных), но ещё не проверены. "
+                    "Запусти /vpn ping"
+                )
+            return (
+                "Прокси нет. Добавь VPN-подписку или локальный прокси:\n"
+                "  /vpn add <ссылка>\n"
+                "  /vpn local <имя> socks5://host:port"
+            )
+        summary = pool.summary()
+        lines = [
+            f"Прокси: {summary['usable']} рабочих из {summary['total']} "
+            f"(обновлено {time.strftime('%H:%M:%S', time.localtime(summary['last_refresh']))})",
+            "",
+        ]
+        for res in statuses:
+            node = res.node
+            if res.usable:
+                mark = "🟢"
+            elif res.alive:
+                mark = "🟡"
+            else:
+                mark = "🔴"
+            latency = f"{res.latency_ms:.0f}мс" if res.latency_ms else "—"
+            note = res.reason or "ок"
+            lines.append(
+                f"{mark} {node.name} — {node.address}:{node.port} "
+                f"[{node.protocol}] {latency} · {note}"
+            )
+        return "\n".join(lines)
 
     def delete_bot(self, bot_id: int):
         with self._lock:
@@ -1930,8 +2115,14 @@ def print_help():
   /start <ID|1,2,3> - Запустить бота или нескольких через запятую
   /stopall          - Остановить всех ботов
   /stop <ID|1,2,3>  - Остановить бота или нескольких через запятую
-  /batch <сервер> <кол-во> <пароль> - Создать пачку ботов с авто-никами на качку LVL
-  /add <сервер> <ник> <пароль>      - Добавить аккаунт вручную
+  /batch <сервер> <кол-во> <пароль> [прокси] - Создать пачку ботов с авто-никами
+  /add <сервер> <ник> <пароль> [прокси]      - Добавить аккаунт вручную
+  /vpn                              - Прокси и VPN-подписки: отчёт
+  /vpn add [имя] <ссылка>           - Добавить VPN-подписку
+  /vpn local <имя> <socks5://...>   - Добавить прокси вручную
+  /vpn ping                         - Перепроверить все узлы сейчас
+  /vpn use <узел> [ID|all]          - Применить прокси к ботам
+  /proxy <ID|all> <узел|none>       - Прокси конкретному боту
   /task <lvl|quest|mine|factory|bus|stop> [ID] - Назначить задачу боту
   /switch <ID>      - Выбрать активного бота для консольных команд
   /logs [ID]        - Посмотреть последние логи бота
@@ -2134,6 +2325,183 @@ def interactive_menu(manager: BotManager):
         print("[*] Вы вернулись в консоль управления. Введите /help для подсказки.")
 
 
+def _parse_bot_ids(text: str, manager) -> list[int] | None:
+    """`1,2,5` или `all` -> список id. None — значит «все»."""
+    text = (text or "").strip().lower()
+    if not text or text in ("all", "все", "*"):
+        return None
+    ids = [int(part) for part in text.split(",") if part.strip().isdigit()]
+    return ids or None
+
+
+def handle_vpn_command(manager, line: str) -> None:
+    """Команды пула прокси и VPN-подписок."""
+    parts = line.split()
+    pool = getattr(manager, "proxy_pool", None)
+    if pool is None:
+        print("[-] Пул прокси не запущен.")
+        return
+
+    action = parts[1].lower() if len(parts) > 1 else ""
+
+    if action in ("", "list", "status"):
+        print(manager.proxy_report())
+        summary = pool.summary()
+        print(
+            f"\n[i] Подписок: {summary['subscriptions']} | "
+            f"ручных: {summary['manual']} | обновление каждые "
+            f"{summary['interval']:.0f}с"
+        )
+        if summary["last_error"]:
+            print(f"[!] Последняя ошибка: {summary['last_error']}")
+        return
+
+    if action == "add":
+        rest = parts[2:]
+        if not rest:
+            print("Использование: /vpn add [имя] <ссылка>")
+            return
+        if len(rest) == 1:
+            name, url = "", rest[0]
+        else:
+            name, url = rest[0], rest[1]
+        print(f"[*] Тяну подписку {url} ...")
+        try:
+            nodes = pool.add_subscription(url, name=name)
+        except Exception as exc:
+            print(f"[-] Не вышло: {exc}")
+            return
+        print(f"[+] Узлов в подписке: {len(nodes)}. Проверяю...")
+        pool.refresh(fetch=False)
+        print(manager.proxy_report())
+        return
+
+    if action in ("local", "manual"):
+        rest = parts[2:]
+        if len(rest) < 2:
+            print("Использование: /vpn local <имя> socks5://host:port")
+            return
+        name, proxy = rest[0], rest[1]
+        try:
+            pool.add_manual(proxy, name=name)
+        except Exception as exc:
+            print(f"[-] Не вышло: {exc}")
+            return
+        ok, reason = pool.verify_before_connect(proxy)
+        if ok:
+            print(f"[+] {name}: {reason}")
+        else:
+            print(f"[!] {name} добавлен, но проверка не прошла: {reason}")
+        return
+
+    if action in ("ping", "check", "refresh"):
+        print("[*] Проверяю все узлы...")
+        results = pool.refresh()
+        if not results:
+            print("[-] Нечего проверять: нет узлов.")
+            return
+        print(manager.proxy_report())
+        return
+
+    if action in ("del", "remove", "rm"):
+        if len(parts) < 3:
+            print("Использование: /vpn del <имя|ссылка|прокси>")
+            return
+        needle = parts[2]
+        if pool.remove_subscription(needle):
+            print(f"[+] Подписка удалена: {needle}")
+        elif pool.remove_manual(needle):
+            print(f"[+] Ручной прокси удалён: {needle}")
+        else:
+            print(f"[-] Не нашла: {needle}")
+        return
+
+    if action == "use":
+        if len(parts) < 3:
+            print("Использование: /vpn use <ключ|имя|адрес> [id,id|all]")
+            return
+        needle = parts[2]
+        bot_ids = _parse_bot_ids(parts[3], manager) if len(parts) > 3 else None
+        found = pool.find(needle)
+        if found is None:
+            print(f"[-] Узел не найден: {needle}")
+            return
+        if not found.node.is_direct:
+            print(
+                f"[-] {found.node.protocol.upper()} боту не годится: "
+                "нужен внешний клиент, бот умеет socks5/http."
+            )
+            return
+        if not found.usable:
+            print(f"[-] Узел не работает: {found.reason or 'проверка не прошла'}")
+            return
+        report = manager.apply_proxy_to_bots(found.node.proxy_url(), bot_ids)
+        if not report["ok"]:
+            print(f"[-] Не применила: {report['reason']}")
+            return
+        print(
+            f"[+] Прокси {found.node.name} применён к "
+            f"{len(report['applied'])} ботам: {report['applied']}"
+        )
+        return
+
+    if action in ("auto", "spread"):
+        working = pool.usable_proxies()
+        if not working:
+            print("[-] Нет рабочих прокси. Сначала /vpn ping.")
+            return
+        with manager._lock:
+            targets = list(manager.bots.values())
+        if not targets:
+            print("[-] Ботов нет.")
+            return
+        for index, bot in enumerate(targets):
+            bot.proxy = working[index % len(working)]
+        manager.save_accounts()
+        print(
+            f"[+] Роздано {len(working)} прокси на {len(targets)} ботов "
+            f"(по кругу)."
+        )
+        return
+
+    print(
+        "Команды VPN:\n"
+        "  /vpn                      отчёт по прокси\n"
+        "  /vpn add [имя] <ссылка>   добавить подписку\n"
+        "  /vpn local <имя> <прокси> добавить socks5 вручную\n"
+        "  /vpn ping                 перепроверить сейчас\n"
+        "  /vpn del <имя>            удалить подписку или ручной\n"
+        "  /vpn use <узел> [ids]     применить к ботам\n"
+        "  /vpn auto                 раздать рабочие по кругу"
+    )
+
+
+def handle_proxy_command(manager, line: str) -> None:
+    """/proxy — прокси конкретного бота или всех."""
+    parts = line.split(maxsplit=2)
+    if len(parts) < 3:
+        print("Использование: /proxy <ID|all> <ключ|прокси|none>")
+        return
+    target, value = parts[1], parts[2]
+    if target.lower() in ("all", "все", "*"):
+        report = manager.apply_proxy_to_bots(value, None)
+        if not report["ok"]:
+            print(f"[-] Не применила: {report['reason']}")
+            return
+        print(f"[+] Прокси применён к {len(report['applied'])} ботам.")
+        return
+    if not target.isdigit():
+        print("Использование: /proxy <ID|all> <ключ|прокси|none>")
+        return
+    bid = int(target)
+    if manager.set_bot_proxy(bid, value):
+        bot = manager.bots.get(bid)
+        current = bot.proxy if bot else ""
+        print(f"[+] Бот #{bid}: прокси = {current or 'свой IP'}")
+    else:
+        print(f"[-] Не вышло: бот #{bid} не найден или прокси не годится.")
+
+
 def main():
     print("=" * 70)
     print("   Black Russia Headless RakSAMP Bot Client [Multi-Account]   ")
@@ -2312,10 +2680,25 @@ def main():
                 s_name = parts[1]
                 b_count = int(parts[2])
                 b_pwd = parts[3].strip()
-                manager.add_bots_batch(s_name, b_count, password=b_pwd, default_task="lvl")
+                # Прокси можно указать один (применится ко всем) или списком
+                # через запятую — тогда разойдутся по кругу.
+                px_arg = parts[4].strip() if len(parts) >= 5 else ""
+                px_list = [x.strip() for x in px_arg.split(",") if x.strip()]
+                if px_list:
+                    print(f"[*] Прокси для пачки: {len(px_list)} шт., проверяю...")
+                manager.add_bots_batch(
+                    s_name, b_count, password=b_pwd, default_task="lvl",
+                    proxies=px_list or None,
+                )
             else:
                 print("[-] Ошибка: Пароль обязателен!")
-                print("Использование: /batch <сервер> <кол-во> <пароль>")
+                print("Использование: /batch <сервер> <кол-во> <пароль> [прокси|список]")
+
+        elif line.startswith("/vpn"):
+            handle_vpn_command(manager, line)
+
+        elif line.startswith("/proxy"):
+            handle_proxy_command(manager, line)
 
         elif line.startswith("/task"):
             parts = line.split()
