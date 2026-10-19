@@ -36,19 +36,47 @@ def save_proxy_to_file(name: str, proxy_str: str):
         pass
 
 class TelegramBotController:
-    def __init__(self, token: str, manager, admin_id: int | None = None):
+    def __init__(self, token: str, manager, admin_id=None):
         self.token = token.strip()
         self.manager = manager
-        self.admin_id = admin_id  # Если указан, команды принимает только админ
+        # Админов может быть несколько: один человек с телефона, второй с
+        # ноутбука — оба должны управлять. Принимаем и одиночный id, и
+        # список, и строку через запятую: раньше принимался только один id,
+        # и второй админ молча получал «Доступ запрещен».
+        self.admin_ids = self._parse_admins(admin_id)
+        # Оставлено для совместимости: часть кода и внешние скрипты читают
+        # admin_id как «главный админ».
+        self.admin_id = self.admin_ids[0] if self.admin_ids else None
         self.bot = telebot.TeleBot(self.token, parse_mode="HTML")
         self.user_states = {}  # {chat_id: {"action": "...", "data": {...}}}
         self.ai = AICommander(self.manager)
-        self.active_chats = set()
-        if self.admin_id:
-            self.active_chats.add(self.admin_id)
+        self.active_chats = set(self.admin_ids)
         self.thread = None
         self.running = False
         self._setup_handlers()
+
+    @staticmethod
+    def _parse_admins(admin_id) -> list[int]:
+        """Привести аргумент к списку id, отбросив мусор."""
+        if admin_id is None:
+            return []
+        if isinstance(admin_id, (int, str)):
+            raw = [admin_id]
+        else:
+            raw = list(admin_id)
+        out = []
+        for item in raw:
+            for piece in str(item).replace(";", ",").replace(" ", ",").split(","):
+                piece = piece.strip()
+                if not piece:
+                    continue
+                try:
+                    value = int(piece)
+                except ValueError:
+                    continue
+                if value > 0 and value not in out:
+                    out.append(value)
+        return out
 
     def broadcast(self, text: str):
         for cid in list(self.active_chats):
@@ -58,9 +86,9 @@ class TelegramBotController:
                 pass
 
     def _is_authorized(self, user_id: int) -> bool:
-        if self.admin_id is None:
+        if not self.admin_ids:
             return True
-        return user_id == self.admin_id
+        return user_id in self.admin_ids
 
     def _format_status_badge(self, status: str) -> str:
         s = status.lower()

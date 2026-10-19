@@ -43,3 +43,4 @@ _diag/
 !test_ban_detect.py
 !test_menuscan.py
 !test_button_style.py
+!test_multi_admin.py

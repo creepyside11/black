@@ -119,36 +119,23 @@ class AutoRegistration:
                                ({'c': 1}, 'finish', False))
             elif step == 'login':
                 self._state('authenticated')
-                def _trigger_spawn():
-                    # Порядок важен: request_class открывает класс, spawn
-                    # подтверждает его. RPC 344 REQUEST_SPAWN — серверный,
-                    # клиент его не шлёт, поэтому здесь только 361 и 441.
-                    time.sleep(0.5)
-                    for attempt in range(1, 4):
-                        if not self.session.connected:
-                            return
-                        try:
-                            self.session.send_rpc_request_class(0)
-                        except Exception as exc:
-                            logger.warn(
-                                "spawn: request_class не ушёл "
-                                f"(попытка {attempt}/3) | {exc!r}"
-                            )
-                            time.sleep(1.0)
-                            continue
-                        time.sleep(0.4)
-                        try:
-                            self.session.send_rpc_spawn()
-                        except Exception as exc:
-                            logger.warn(
-                                "spawn: spawn не ушёл "
-                                f"(попытка {attempt}/3) | {exc!r}"
-                            )
-                        time.sleep(2.5)
-                        if self.session.players.bot.player_id:
-                            return
-
-                threading.Thread(target=_trigger_spawn, daemon=True).start()
+                # Здесь раньше жил слепой _trigger_spawn: через 0.5с после
+                # логина он слал request_class, ещё через 0.4с — spawn, и
+                # повторял это до трёх раз, не глядя на экран.
+                #
+                # Это и был кик античита кодом 25. Сервер присылает меню
+                # вокзалов (iid=50) через полсекунды после авторизации, а
+                # мы в тот же миг били хендшейком при открытом меню. В
+                # трассе пакетов видно построчно:
+                #     3.44  << iid=38 authenticated
+                #     3.94  << iid=50 меню вокзалов
+                #     3.94  >> request_class
+                #     4.34  >> spawn
+                #     4.34  << Anti-Cheat, код 25
+                #
+                # Спавном теперь занимается один путь: ответ на меню
+                # (logic.spawn.select_spawn) и сторож, который этот ответ
+                # дожидается. Второй, слепой путь только ломал первый.
 
     def tick(self):
         with self._lock:

@@ -889,5 +889,49 @@
     "lvl": "-",
     "money": 200,
     "target_lvl": null
+  },
+  {
+    "nickname": "Ivan_Petrov",
+    "password": "55337q",
+    "server": "TOLYATTI",
+    "task": "stop",
+    "is_banned": false,
+    "proxy": "",
+    "lvl": "-",
+    "money": 0,
+    "target_lvl": null
+  },
+  {
+    "nickname": "Chess_Kerinmon",
+    "password": "55337q",
+    "server": "TOLYATTI",
+    "task": "stop",
+    "is_banned": false,
+    "proxy": "",
+    "lvl": "-",
+    "money": 200,
+    "target_lvl": null
+  },
+  {
+    "nickname": "Chess_Kerinmon",
+    "password": "55337q",
+    "server": "TOLYATTI",
+    "task": "stop",
+    "is_banned": true,
+    "proxy": "",
+    "lvl": "-",
+    "money": 200,
+    "target_lvl": null
+  },
+  {
+    "nickname": "Chess_Novikop",
+    "password": "55337q",
+    "server": "TOLYATTI",
+    "task": "stop",
+    "is_banned": false,
+    "proxy": "",
+    "lvl": "-",
+    "money": 200,
+    "target_lvl": null
   }
 ]

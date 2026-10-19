@@ -505,8 +505,37 @@ class SpawnWatchdog:
                         return
 
                 if in_sky(pos) or in_auth_zone(pos) or pos is None:
-                    # Меню приходит через секунду-две после логина. Если оно
-                    # ещё в пути — даём ему шанс, иначе хендшейк выберет
+                    # Меню вокзалов открыто, но ответ ещё не ушёл — ждём
+                    # ответ, а не бьём хендшейком.
+                    #
+                    # Это была главная причина кика античита кодом 25.
+                    # Ответ на меню отложен на 1.6-3.4с (человеческая
+                    # реакция), а сторож видел «меню только что пришло» и
+                    # решал, что ответит кто-то другой, после чего сразу
+                    # звал force_spawn. В логе это видно построчно:
+                    #     iid=50 меню вокзалов
+                    #     >> request_class   — через 0.00с
+                    #     >> spawn           — через 0.40с
+                    # Сервер получает хендшейк при открытом меню и кикает.
+                    if menu_received_recent() and not menu_answer_recent():
+                        # Штатный обработчик отвечает с человеческой паузой.
+                        # Даём ему время, и только если он так и не ответил —
+                        # отвечаем сами. Но ни в каком случае не хендшейком:
+                        # RPC при открытом меню — это и есть кик.
+                        if not wait_menu_answered(self.bot, self.menu_wait):
+                            select_spawn(self.bot, menu_choice())
+                            wait_menu_answered(self.bot, 5.0)
+                        ok, pos = wait_spawned(
+                            self.bot, self.grace, stable_seconds=self.stable_seconds
+                        )
+                        if ok:
+                            self.report = {"status": "spawned", "position": pos}
+                            self._mark_spawned(pos)
+                            return
+                        self._stop.wait(0.5)
+                        continue
+
+                    # Меню ещё в пути: даём ему шанс, иначе хендшейк выберет
                     # вокзал за нас и уведёт с того, что выбрал бы игрок.
                     if not menu_received_recent() and not menu_answer_recent():
                         # Ожидание меню не должно съедать бюджет попытки:
@@ -714,6 +743,23 @@ def reset_menu() -> None:
     MENU_RECEIVED_AT = 0.0
     MENU_ANSWERED_AT = 0.0
     ANSWERED_MENU_KEY = None
+
+
+def wait_menu_answered(bot, timeout: float = 8.0, *, poll: float = 0.15) -> bool:
+    """Дождаться, пока ответ на меню вокзалов реально уйдёт.
+
+    Нужен сторожу: ответ отложен на человеческую паузу, и всё это время
+    нельзя бить хендшейком — сервер кикает за RPC при открытом меню.
+    Возвращает True, если ответ ушёл или отвечать уже нечего.
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while time.monotonic() < deadline:
+        if menu_answer_recent():
+            return True
+        if not _connected(bot):
+            return False
+        time.sleep(poll)
+    return menu_answer_recent()
 
 
 def menu_choice(items=None) -> int:

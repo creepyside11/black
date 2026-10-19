@@ -2648,6 +2648,21 @@ def main():
     print("   Black Russia Headless RakSAMP Bot Client [Multi-Account]   ")
     print("=" * 70)
 
+    def _add_admin(current, raw):
+        """Добавить id админа к списку. Принимает и один id, и список."""
+        ids = list(current or [])
+        for piece in str(raw).replace(";", ",").replace(" ", ",").split(","):
+            piece = piece.strip()
+            if not piece:
+                continue
+            try:
+                value = int(piece)
+            except ValueError:
+                continue
+            if value > 0 and value not in ids:
+                ids.append(value)
+        return ids
+
     # Разбор аргументов для Telegram Bot
     tg_token = None
     tg_admin = None
@@ -2662,16 +2677,13 @@ def main():
             tg_token = arg.split("=", 1)[1]
             i += 1
         elif arg in ("--admin", "--tg-admin") and i + 1 < len(sys.argv):
-            try:
-                tg_admin = int(sys.argv[i + 1])
-            except ValueError:
-                pass
+            # Админов может быть несколько: --admin 111 --admin 222
+            # или --admin 111,222. Раньше каждый следующий флаг затирал
+            # предыдущий, и оставался только последний id.
+            tg_admin = _add_admin(tg_admin, sys.argv[i + 1])
             i += 2
         elif arg.startswith("--admin="):
-            try:
-                tg_admin = int(arg.split("=", 1)[1])
-            except ValueError:
-                pass
+            tg_admin = _add_admin(tg_admin, arg.split("=", 1)[1])
             i += 1
         else:
             filtered_args.append(arg)
@@ -2681,10 +2693,7 @@ def main():
     if not tg_token:
         tg_token = os.environ.get("TG_BOT_TOKEN")
     if not tg_admin and os.environ.get("TG_ADMIN_ID"):
-        try:
-            tg_admin = int(os.environ.get("TG_ADMIN_ID"))
-        except ValueError:
-            pass
+        tg_admin = _add_admin(None, os.environ["TG_ADMIN_ID"])
 
     manager = BotManager()
 
