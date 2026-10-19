@@ -231,3 +231,41 @@ class RotateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class NodeKeyTests(unittest.TestCase):
+    """Ключ узла должен различать аккаунты на одном сервере.
+
+    В подписке несколько узлов висят на одном хосте и порту с разными
+    UUID. Ключ был «протокол://адрес:порт», они сливались: общий порт
+    моста, общий туннель, и боту отдавался чужой узел.
+    """
+
+    def _node(self, login, name="DE"):
+        return VpnNode(
+            name=name, protocol="vless", address="site.babay.su", port=443,
+            security="reality", login=login,
+        )
+
+    def test_same_host_different_uuid_differ(self):
+        a = self._node("11111111-1111-1111-1111-111111111111")
+        b = self._node("22222222-2222-2222-2222-222222222222")
+        self.assertNotEqual(a.key, b.key)
+
+    def test_same_node_same_key(self):
+        a = self._node("11111111-1111-1111-1111-111111111111")
+        b = self._node("11111111-1111-1111-1111-111111111111")
+        self.assertEqual(a.key, b.key)
+
+    def test_key_starts_with_scheme(self):
+        node = self._node("abc")
+        self.assertTrue(node.key.startswith("vless://site.babay.su:443"))
+
+    def test_node_without_login_still_has_key(self):
+        node = VpnNode(name="x", protocol="vless", address="a.b", port=443)
+        self.assertEqual(node.key, "vless://a.b:443")
+
+    def test_find_node_still_matches_by_address(self):
+        """Поиск по адресу не должен сломаться из-за UUID в ключе."""
+        node = self._node("11111111-1111-1111-1111-111111111111")
+        self.assertIn("site.babay.su", node.key)

@@ -82,7 +82,17 @@ class VpnNode:
 
     @property
     def key(self) -> str:
-        return f"{self.protocol}://{self.address}:{self.port}"
+        """Уникальный идентификатор узла.
+
+        Одного адреса и порта мало: у подписки на одном хосте висит
+        несколько узлов с разными UUID, и они сливались в один — общий
+        порт моста, общий туннель, а боту отдавался чужой. Логин и есть
+        то, что отличает аккаунты на одном сервере.
+        """
+        base = f"{self.protocol}://{self.address}:{self.port}"
+        if self.login:
+            return f"{base}#{self.login}"
+        return base
 
     @property
     def uses_tls(self) -> bool:
