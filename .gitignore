@@ -44,3 +44,4 @@ _diag/
 !test_menuscan.py
 !test_button_style.py
 !test_multi_admin.py
+!test_no_duplicates.py

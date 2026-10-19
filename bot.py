@@ -1737,6 +1737,18 @@ class BotManager:
         clean_name = clean_name.upper()
 
         with self._lock:
+            # Один ник — одна запись. Раньше проверки не было, и повторное
+            # добавление плодило дубли: в accounts.json копились по восемь
+            # записей одного ника, а потом все они по очереди лезли в один
+            # и тот же аккаунт и выбивали друг друга киком «уже в сети».
+            for existing in self.bots.values():
+                if str(existing.nickname).lower() == str(nickname).lower():
+                    print(
+                        f"[!] Бот с ником {nickname} уже есть (ID "
+                        f"{existing.bot_id}) — второй раз не добавляю."
+                    )
+                    return existing
+
             bot_id = self._next_id
             self._next_id += 1
             bot = BotInstance(
