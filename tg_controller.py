@@ -707,7 +707,7 @@ class TelegramBotController:
                     lines.append(
                         "⚠️ <b>Мост sing-box не установлен.</b> Узлы 🟡 применить "
                         "нельзя — бот ходит только через SOCKS5.\n"
-                        "На сервере: <code>bash _diag/vps/install_singbox.sh</code>"
+                        "На сервере: <code>bash deploy/install_singbox.sh</code>"
                     )
             else:
                 lines.append("<i>Узлов нет. Добавь подписку или локальный прокси.</i>")

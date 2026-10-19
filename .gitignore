@@ -61,3 +61,7 @@ bot_settings.json
 !run_tests.py
 accounts.test.json
 accounts.test.json.bak
+
+# установщик на сервер — не диагностика, должен ехать в репозитории
+!deploy/
+!deploy/install_singbox.sh
