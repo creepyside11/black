@@ -239,13 +239,13 @@ MENU_TIMEOUT = 20.0
 
 def wait_spawn_menu(bot, timeout: float = MENU_TIMEOUT, *, poll: float = 0.2) -> list:
     """Ждать от сервера список вокзалов. Возвращает [] если не пришёл."""
-    items = available_spawns()
+    items = available_spawns(bot)
     if items:
         return items
 
     deadline = time.monotonic() + max(0.0, float(timeout))
     while time.monotonic() < deadline:
-        items = available_spawns()
+        items = available_spawns(bot)
         if items:
             return items
         if not _connected(bot):
@@ -270,11 +270,11 @@ def spawn_via_menu(
         report["status"] = "no_session"
         return report
 
-    items = available_spawns() or wait_spawn_menu(bot, menu_timeout)
+    items = available_spawns(bot) or wait_spawn_menu(bot, menu_timeout)
     if not items:
         return report
 
-    choice = menu_choice(items) if index is None else int(index)
+    choice = menu_choice(items, bot) if index is None else int(index)
     report["choice"] = choice
     if log:
         log(f"[SPAWN] меню вокзалов {items}, выбираем {choice}")
@@ -361,7 +361,7 @@ def force_spawn(
 
     # Меню вокзалов — самый короткий путь. Если сервер его прислал,
     # RPC-хендшейк не нужен вовсе. Но меню от прошлой сессии не в счёт.
-    if menu_received_recent() and available_spawns():
+    if menu_received_recent(bot) and available_spawns(bot):
         menu_report = spawn_via_menu(
             bot,
             index=index,
@@ -495,7 +495,7 @@ class SpawnWatchdog:
                 # Спавн мог уже начаться: меню вокзалов отвечено, сервер
                 # везёт нас кинематиком. Даём ему доехать, прежде чем
                 # лезть с RPC-хендшейком — иначе он уведёт на другой вокзал.
-                if menu_answer_recent():
+                if menu_answer_recent(self.bot):
                     ok, pos = wait_spawned(
                         self.bot, self.grace, stable_seconds=self.stable_seconds
                     )
@@ -517,13 +517,13 @@ class SpawnWatchdog:
                     #     >> request_class   — через 0.00с
                     #     >> spawn           — через 0.40с
                     # Сервер получает хендшейк при открытом меню и кикает.
-                    if menu_received_recent() and not menu_answer_recent():
+                    if menu_received_recent(self.bot) and not menu_answer_recent(self.bot):
                         # Штатный обработчик отвечает с человеческой паузой.
                         # Даём ему время, и только если он так и не ответил —
                         # отвечаем сами. Но ни в каком случае не хендшейком:
                         # RPC при открытом меню — это и есть кик.
                         if not wait_menu_answered(self.bot, self.menu_wait):
-                            select_spawn(self.bot, menu_choice())
+                            select_spawn(self.bot, menu_choice(bot=self.bot))
                             wait_menu_answered(self.bot, 5.0)
                         ok, pos = wait_spawned(
                             self.bot, self.grace, stable_seconds=self.stable_seconds
@@ -537,13 +537,13 @@ class SpawnWatchdog:
 
                     # Меню ещё в пути: даём ему шанс, иначе хендшейк выберет
                     # вокзал за нас и уведёт с того, что выбрал бы игрок.
-                    if not menu_received_recent() and not menu_answer_recent():
+                    if not menu_received_recent(self.bot) and not menu_answer_recent(self.bot):
                         # Ожидание меню не должно съедать бюджет попытки:
                         # если сервер молчит, хендшейк нужен прямо сейчас.
                         budget = min(self.menu_wait, self.attempt_timeout / 2.0)
                         items = wait_spawn_menu(self.bot, budget)
                         if items:
-                            select_spawn(self.bot, menu_choice(items))
+                            select_spawn(self.bot, menu_choice(items, self.bot))
                             ok, pos = wait_spawned(
                                 self.bot, self.grace, stable_seconds=self.stable_seconds
                             )
@@ -705,7 +705,56 @@ def spawn_name(index: int):
 
 PROBE_INDEXES: tuple[int, ...] = (DEFAULT_CLASS,)
 SPAWN_INDEX: dict = {}
-SPAWN_MENU: dict = {}
+
+
+class SpawnMenuState:
+    """Состояние меню вокзалов одного бота.
+
+    Раньше это были переменные модуля — одни на весь процесс. При одном
+    боте разницы нет. При многих это ломало вход, и именно отсюда рос кик
+    античита кодом 25:
+
+      * бот B, ещё не получив своего меню, видел «меню только что
+        приходило» от бота A и лез отвечать на чужое меню;
+      * если пункты у A и B совпадали, ключ уже отвеченного меню совпадал
+        тоже, ответ у B не уходил вовсе, и он навсегда оставался в зоне
+        авторизации;
+      * reset_menu() при входе любого бота стирал меню всем остальным.
+
+    Теперь состояние живёт на самом боте.
+    """
+
+    __slots__ = ("items", "received_at", "answered_at", "answered_key",
+                 "pending_key", "lock")
+
+    def __init__(self):
+        self.items: list = []
+        self.received_at = 0.0
+        self.answered_at = 0.0
+        self.answered_key = None
+        # Кто-то прямо сейчас готовит ответ на это меню. Нужен, чтобы
+        # сторож и обработчик меню не отправили ответ оба.
+        self.pending_key = None
+        self.lock = threading.Lock()
+
+
+# Запасное состояние для вызовов без бота (тесты, разовые скрипты).
+_DEFAULT_STATE = SpawnMenuState()
+
+
+def menu_state(bot=None) -> "SpawnMenuState":
+    """Состояние меню для конкретного бота."""
+    if bot is None:
+        return _DEFAULT_STATE
+    state = getattr(bot, "spawn_menu_state", None)
+    if isinstance(state, SpawnMenuState):
+        return state
+    state = SpawnMenuState()
+    try:
+        bot.spawn_menu_state = state
+    except Exception:
+        return _DEFAULT_STATE
+    return state
 
 
 def is_spawn_menu(payload) -> bool:
@@ -713,36 +762,36 @@ def is_spawn_menu(payload) -> bool:
     return isinstance(payload, dict) and isinstance(payload.get("m"), list) and bool(payload["m"])
 
 
-# Когда сервер последний раз присылал меню вокзалов.
-MENU_RECEIVED_AT = 0.0
-
-
-def remember_spawn_menu(payload) -> list:
+def remember_spawn_menu(payload, bot=None) -> list:
     """Запомнить список вокзалов от сервера и вернуть его."""
-    global MENU_RECEIVED_AT
-
     if not is_spawn_menu(payload):
         return []
     items = [item for item in payload["m"] if isinstance(item, int)]
     if not items:
         return []
-    SPAWN_MENU["items"] = items
-    MENU_RECEIVED_AT = time.monotonic()
+    state = menu_state(bot)
+    state.items = items
+    state.received_at = time.monotonic()
     return items
 
 
-def menu_received_recent(window: float = 40.0) -> bool:
-    return bool(MENU_RECEIVED_AT) and (time.monotonic() - MENU_RECEIVED_AT) < window
+def menu_received_recent(bot=None, window: float = 40.0) -> bool:
+    state = menu_state(bot)
+    return bool(state.received_at) and (time.monotonic() - state.received_at) < window
 
 
-def reset_menu() -> None:
-    """Сбросить состояние меню: новый сервер — новое меню."""
-    global MENU_RECEIVED_AT, MENU_ANSWERED_AT, ANSWERED_MENU_KEY
+def reset_menu(bot=None) -> None:
+    """Сбросить состояние меню: новый сервер — новое меню.
 
-    SPAWN_MENU.pop("items", None)
-    MENU_RECEIVED_AT = 0.0
-    MENU_ANSWERED_AT = 0.0
-    ANSWERED_MENU_KEY = None
+    Только для этого бота. Раньше сбрасывалось глобально, и вход одного
+    бота стирал меню всем остальным.
+    """
+    state = menu_state(bot)
+    state.items = []
+    state.received_at = 0.0
+    state.answered_at = 0.0
+    state.answered_key = None
+    state.pending_key = None
 
 
 def wait_menu_answered(bot, timeout: float = 8.0, *, poll: float = 0.15) -> bool:
@@ -754,53 +803,54 @@ def wait_menu_answered(bot, timeout: float = 8.0, *, poll: float = 0.15) -> bool
     """
     deadline = time.monotonic() + max(0.0, float(timeout))
     while time.monotonic() < deadline:
-        if menu_answer_recent():
+        if menu_answer_recent(bot):
             return True
         if not _connected(bot):
             return False
         time.sleep(poll)
-    return menu_answer_recent()
+    return menu_answer_recent(bot)
 
 
-def menu_choice(items=None) -> int:
+def menu_choice(items=None, bot=None) -> int:
     """Какой вокзал выбирать: первый из списка сервера.
 
     Индексы в меню — это id вокзалов, а не порядковые номера, поэтому берём
     именно первое значение, а не 1.
     """
-    items = items if items is not None else SPAWN_MENU.get("items") or []
+    if items is None:
+        items = menu_state(bot).items or []
     if items:
         return int(items[0])
     return 1
 
 
-def build_menu_answer(items=None) -> dict:
+def build_menu_answer(items=None, bot=None) -> dict:
     """Ответ на меню: {"t": 1, "s": <id первого вокзала>}."""
-    return {"t": 1, "s": menu_choice(items)}
+    return {"t": 1, "s": menu_choice(items, bot)}
 
 
-def available_spawns() -> list:
-    return list(SPAWN_MENU.get("items") or [])
+def available_spawns(bot=None) -> list:
+    return list(menu_state(bot).items or [])
 
 
 def build_spawn_payload(index: int, style: str | None = None) -> dict:
     return {"t": 1, "s": int(index)}
 
 
-# Когда последний раз отвечали на меню вокзалов. Нужно сторожу: после
-# ответа сервер везёт нас кинематиком, и лезть с хендшейком нельзя.
-MENU_ANSWERED_AT = 0.0
+def menu_answer_recent(bot=None, window: float = 25.0) -> bool:
+    """Отвечали ли мы на меню этого бота за последние window секунд.
+
+    Нужно сторожу: после ответа сервер везёт нас кинематиком, и лезть с
+    хендшейком нельзя.
+    """
+    state = menu_state(bot)
+    return bool(state.answered_at) and (time.monotonic() - state.answered_at) < window
 
 
-def menu_answer_recent(window: float = 25.0) -> bool:
-    return bool(MENU_ANSWERED_AT) and (time.monotonic() - MENU_ANSWERED_AT) < window
-
-
-# На какое меню мы уже ответили. Сервер присылает одно и то же меню
-# несколько раз (и сторож, и хендшейк зовут select_spawn), и раньше ответ
-# уходил по 15-18 раз за вход. Повторные ответы на одно меню — лишний шум
-# на входе, а вход античит и проверяет.
-ANSWERED_MENU_KEY = None
+# Ключ отвеченного меню живёт в SpawnMenuState.answered_key: сервер
+# присылает одно и то же меню несколько раз (и сторож, и хендшейк зовут
+# select_spawn), и раньше ответ уходил по 15-18 раз за вход. Повторные
+# ответы на одно меню — лишний шум на входе, а вход античит и проверяет.
 
 # Пауза перед ответом на меню вокзала.
 #
@@ -833,42 +883,69 @@ def select_spawn(bot, index: int | None = None, style: str | None = None,
     delay — пауза перед отправкой. По умолчанию человеческая (см.
     SPAWN_ANSWER_DELAY), 0 отключает её для тестов.
     """
-    global MENU_ANSWERED_AT, ANSWERED_MENU_KEY
+    state = menu_state(bot)
 
-    items = tuple(available_spawns() or [])
-    choice = menu_choice() if index is None else int(index)
+    items = tuple(state.items or [])
+    choice = menu_choice(bot=bot) if index is None else int(index)
     menu_key = (items, choice)
-    if ANSWERED_MENU_KEY == menu_key:
-        return True
+
+    # Захват ответа под замком.
+    #
+    # Пауза перед отправкой идёт ДО пакета, а дедуп раньше стоял до паузы.
+    # Из-за этого сторож и обработчик меню оба проходили проверку, оба
+    # спали свои 1.6-3.4с и оба отправляли SPAWN_SELECT. Два одинаковых
+    # ответа на одно меню античит видит как дубль и кикает кодом 25.
+    #
+    # Теперь право на ответ занимается атомарно, ещё до паузы.
+    with state.lock:
+        if state.answered_key == menu_key:
+            return True
+        if state.pending_key == menu_key:
+            # За это меню уже взялся другой поток — второй ответ не нужен.
+            return True
+        state.pending_key = menu_key
 
     session = getattr(bot, "session", None)
     if session is None or not _connected(bot):
+        with state.lock:
+            if state.pending_key == menu_key:
+                state.pending_key = None
         return False
 
-    pause = spawn_answer_delay() if delay is None else float(delay)
-    if pause > 0:
-        time.sleep(pause)
-
-    payload = build_spawn_payload(menu_choice() if index is None else int(index))
     try:
-        sent = bool(
-            session.send_json(
-                InterfaceID.SPAWN_SELECT, payload, packet_name="interface_spawn_select"
-            )
-        )
-    except Exception:
-        return False
-    if sent:
-        MENU_ANSWERED_AT = time.monotonic()
-        ANSWERED_MENU_KEY = menu_key
+        pause = spawn_answer_delay() if delay is None else float(delay)
+        if pause > 0:
+            time.sleep(pause)
+
+        payload = build_spawn_payload(choice)
         try:
-            bot.add_log(
-                f"[ВОКЗАЛ] ответ на меню через {pause:.1f}с: {payload} | "
-                f"пункты сервера: {available_spawns()}"
+            sent = bool(
+                session.send_json(
+                    InterfaceID.SPAWN_SELECT, payload,
+                    packet_name="interface_spawn_select"
+                )
             )
         except Exception:
-            pass
-    return sent
+            return False
+
+        if sent:
+            with state.lock:
+                state.answered_at = time.monotonic()
+                state.answered_key = menu_key
+            try:
+                bot.add_log(
+                    f"[ВОКЗАЛ] ответ на меню через {pause:.1f}с: {payload} | "
+                    f"пункты сервера: {list(items)}"
+                )
+            except Exception:
+                pass
+        return sent
+    finally:
+        # Освобождаем захват в любом случае: если отправка сорвалась,
+        # следующий заход должен иметь право попробовать снова.
+        with state.lock:
+            if state.pending_key == menu_key:
+                state.pending_key = None
 
 
 def answer_spawn_later(bot, choice: int | None = None) -> bool:

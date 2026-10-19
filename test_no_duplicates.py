@@ -5,6 +5,7 @@
 друг друга киком «уже в сети» (код 2).
 """
 
+import json
 import os
 import tempfile
 import unittest
@@ -62,3 +63,52 @@ class DuplicateTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class LoadTests(unittest.TestCase):
+    """Дубли в самом accounts.json тоже не должны становиться ботами."""
+
+    def setUp(self):
+        self._tmp = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False, encoding="utf-8"
+        )
+        payload = [
+            {"nickname": "Dubl_Load", "password": "55337q", "server": "TOLYATTI"},
+            {"nickname": "Dubl_Load", "password": "55337q", "server": "TOLYATTI"},
+            {"nickname": "dubl_load", "password": "55337q", "server": "TOLYATTI"},
+            # Битая запись: ключ есть, значение null. Раньше роняла весь файл.
+            {"nickname": None, "password": "pass_br_123", "server": "BELGOROD"},
+            "не словарь",
+            {"nickname": "Odinochnyj_Load", "password": "55337q", "server": "TOLYATTI"},
+        ]
+        json.dump(payload, self._tmp)
+        self._tmp.close()
+        self._patch = mock.patch.object(botmod, "ACCOUNTS_FILE", self._tmp.name)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        try:
+            os.unlink(self._tmp.name)
+        except OSError:
+            pass
+
+    def test_duplicates_in_file_loaded_once(self):
+        # BotManager сам грузит accounts.json в __init__ — второй вызов
+        # добавил бы записи повторно и тест ловил бы сам себя.
+        m = botmod.BotManager()
+        nicks = [b.nickname for b in m.bots.values()]
+        lowered = [n.lower() for n in nicks]
+        self.assertEqual(len(lowered), len(set(lowered)), f"дубли загрузились: {nicks}")
+        self.assertIn("Odinochnyj_Load", nicks)
+
+    def test_bad_entry_does_not_kill_the_rest(self):
+        """Запись с nickname=null не должна съедать весь файл.
+
+        Живой случай: одна такая запись на VPS роняла загрузку accounts.json,
+        и всё, что шло после неё, не загружалось вовсе.
+        """
+        m = botmod.BotManager()
+        nicks = [b.nickname for b in m.bots.values()]
+        self.assertIn("Dubl_Load", nicks, "записи до битой не загрузились")
+        self.assertIn("Odinochnyj_Load", nicks, "записи после битой не загрузились")

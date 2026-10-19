@@ -258,8 +258,11 @@ class WatchdogTests(unittest.TestCase):
 class MenuTests(unittest.TestCase):
     MENU = {"o": 1, "m": [1, 2]}
 
+    def setUp(self):
+        self.bot = FakeBot(pos=AUTH)
+
     def tearDown(self):
-        S.reset_menu()
+        S.reset_menu(self.bot)
 
     def test_menu_detected(self):
         self.assertTrue(S.is_spawn_menu(self.MENU))
@@ -268,10 +271,10 @@ class MenuTests(unittest.TestCase):
         self.assertFalse(S.is_spawn_menu({}))
 
     def test_remember_menu(self):
-        items = S.remember_spawn_menu(self.MENU)
+        items = S.remember_spawn_menu(self.MENU, self.bot)
         self.assertEqual(items, [1, 2])
-        self.assertEqual(S.available_spawns(), [1, 2])
-        self.assertTrue(S.menu_received_recent())
+        self.assertEqual(S.available_spawns(self.bot), [1, 2])
+        self.assertTrue(S.menu_received_recent(self.bot))
 
     def test_choice_is_first_id_not_index(self):
         # Индексы в меню — это id вокзалов. Берём первый, а не 1.
@@ -280,19 +283,96 @@ class MenuTests(unittest.TestCase):
         self.assertEqual(S.build_menu_answer([]), {"t": 1, "s": 1})
 
     def test_reset_menu(self):
-        S.remember_spawn_menu(self.MENU)
-        S.reset_menu()
-        self.assertEqual(S.available_spawns(), [])
-        self.assertFalse(S.menu_received_recent())
+        S.remember_spawn_menu(self.MENU, self.bot)
+        S.reset_menu(self.bot)
+        self.assertEqual(S.available_spawns(self.bot), [])
+        self.assertFalse(S.menu_received_recent(self.bot))
 
     def test_select_spawn_sends_first_choice(self):
         bot = FakeBot(pos=AUTH)
-        S.remember_spawn_menu(self.MENU)
+        S.remember_spawn_menu(self.MENU, bot)
         sent = []
         bot.session.send_json = lambda iid, payload, packet_name=None: sent.append((iid, payload)) or True
         self.assertTrue(S.select_spawn(bot))
         self.assertEqual(sent, [(50, {"t": 1, "s": 1})])
-        self.assertTrue(S.menu_answer_recent())
+        self.assertTrue(S.menu_answer_recent(bot))
+
+    def test_two_bots_do_not_share_menu(self):
+        """Меню одного бота не должно протекать к другому.
+
+        Именно на этом ломался вход при многих ботах: бот B видел «меню
+        только что приходило» от бота A и отвечал на чужое меню.
+        """
+        a = FakeBot(pos=AUTH)
+        b = FakeBot(pos=AUTH)
+        S.remember_spawn_menu({"o": 1, "m": [3, 4]}, a)
+
+        self.assertEqual(S.available_spawns(a), [3, 4])
+        self.assertEqual(S.available_spawns(b), [], "меню протекло к другому боту")
+        self.assertTrue(S.menu_received_recent(a))
+        self.assertFalse(S.menu_received_recent(b))
+
+        # Вход A не должен стирать меню B.
+        S.remember_spawn_menu({"o": 1, "m": [7, 8]}, b)
+        S.reset_menu(a)
+        self.assertEqual(S.available_spawns(b), [7, 8], "reset_menu(a) стёр меню b")
+
+    def test_concurrent_answer_sends_once(self):
+        """Сторож и обработчик меню не должны ответить дважды.
+
+        Пауза перед отправкой идёт до пакета, а дедуп раньше стоял до
+        паузы: оба потока проходили проверку и оба отправляли SPAWN_SELECT.
+        Два одинаковых ответа на одно меню античит кикает кодом 25.
+        """
+        import threading
+
+        bot = FakeBot(pos=AUTH)
+        S.remember_spawn_menu(self.MENU, bot)
+        sent = []
+        lock = threading.Lock()
+
+        def send_json(iid, payload, packet_name=None):
+            with lock:
+                sent.append((iid, payload))
+            return True
+
+        bot.session.send_json = send_json
+        threads = [
+            threading.Thread(target=lambda: S.select_spawn(bot, delay=0.2))
+            for _ in range(4)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
+
+        self.assertEqual(len(sent), 1, f"отправлено {len(sent)} ответов вместо одного")
+        self.assertEqual(sent[0], (50, {"t": 1, "s": 1}))
+
+    def test_answer_retried_after_send_failure(self):
+        """Сорвавшаяся отправка не должна блокировать следующий ответ."""
+        bot = FakeBot(pos=AUTH)
+        S.remember_spawn_menu(self.MENU, bot)
+        bot.session.send_json = lambda iid, payload, packet_name=None: False
+        self.assertFalse(S.select_spawn(bot, delay=0))
+        self.assertFalse(S.menu_answer_recent(bot))
+
+        sent = []
+        bot.session.send_json = lambda iid, payload, packet_name=None: sent.append(payload) or True
+        self.assertTrue(S.select_spawn(bot, delay=0))
+        self.assertEqual(sent, [{"t": 1, "s": 1}])
+
+    def test_two_bots_do_not_share_answer(self):
+        """Ответ одного бота не должен считаться ответом другого."""
+        a = FakeBot(pos=AUTH)
+        b = FakeBot(pos=AUTH)
+        for bot in (a, b):
+            S.remember_spawn_menu(self.MENU, bot)
+            bot.session.send_json = lambda iid, payload, packet_name=None: True
+
+        self.assertTrue(S.select_spawn(a, delay=0))
+        self.assertTrue(S.menu_answer_recent(a))
+        self.assertFalse(S.menu_answer_recent(b), "ответ протёк к другому боту")
 
 
 class TravelTests(unittest.TestCase):

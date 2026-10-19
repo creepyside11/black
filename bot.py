@@ -1124,10 +1124,12 @@ class BotManager:
         def _on_connected(bot_obj, *args, **kwargs):
             b = self._find_bot_by_session_or_api(bot_obj)
             if b:
-                # Новая сессия — старое меню вокзалов недействительно
+                # Новая сессия — старое меню вокзалов недействительно.
+                # Сбрасываем только своё: раньше сброс был глобальным и
+                # стирал меню всем остальным ботам в процессе.
                 from logic.spawn import reset_menu
 
-                reset_menu()
+                reset_menu(b)
                 # Вход разрешён — очередь сброшена
                 b.leave_queue()
                 b.status = "В игре (авторизован)"
@@ -1168,8 +1170,8 @@ class BotManager:
             payload = data if isinstance(data, dict) else {}
 
             if is_spawn_menu(payload):
-                items = remember_spawn_menu(payload)
-                choice = menu_choice(items)
+                items = remember_spawn_menu(payload, b)
+                choice = menu_choice(items, b)
                 b.add_log(f"[SPAWN] меню вокзалов {items}, выбираем {choice}")
                 # Отвечаем не в этом тике, а через человеческую паузу и в
                 # отдельном потоке: sleep здесь застопорил бы разбор пакетов,
@@ -1184,7 +1186,7 @@ class BotManager:
                 return
 
             pos = b.api.getbotposition() if b.api else None
-            if available_spawns() and in_auth_zone(pos):
+            if available_spawns(b) and in_auth_zone(pos):
                 if b.spawn_watchdog is None or not b.spawn_watchdog.running:
                     b.begin_spawn_watchdog()
 
@@ -1575,15 +1577,32 @@ class BotManager:
                 return
 
             loaded_count = 0
+            skipped_dupes = 0
+            skipped_bad = 0
+            seen_nicks = set()
             for item in data:
-                nick = item.get("nickname", "").strip()
-                pwd = item.get("password", "").strip()
-                srv_str = item.get("server", "").strip()
-                task = item.get("task", "lvl")
+                # Разбор каждой записи отдельно и без предположений о типах.
+                #
+                # Одна запись с "nickname": null роняла загрузку ВСЕГО файла:
+                # .get("nickname", "") возвращает None, если ключ есть и равен
+                # null, а не подставляет "", и .strip() падал. Исключение
+                # ловилось снаружи цикла, поэтому всё, что шло после битой
+                # записи, просто не загружалось.
+                if not isinstance(item, dict):
+                    skipped_bad += 1
+                    continue
+
+                nick = str(item.get("nickname") or "").strip()
+                pwd = str(item.get("password") or "").strip()
+                srv_str = str(item.get("server") or "").strip()
+                task = item.get("task") or "lvl"
                 is_banned = bool(item.get("is_banned", False))
-                proxy = item.get("proxy", "")
-                saved_lvl = item.get("lvl", "-")
-                saved_money = int(item.get("money", 0))
+                proxy = item.get("proxy") or ""
+                saved_lvl = item.get("lvl") or "-"
+                try:
+                    saved_money = int(item.get("money") or 0)
+                except (TypeError, ValueError):
+                    saved_money = 0
                 saved_target_lvl = item.get("target_lvl")
                 if saved_target_lvl is not None:
                     try:
@@ -1592,7 +1611,17 @@ class BotManager:
                         saved_target_lvl = None
 
                 if not nick or not pwd or not srv_str:
+                    skipped_bad += 1
                     continue
+
+                # Один ник — один бот, даже если в файле он записан
+                # несколько раз. Иначе все копии лезут в один аккаунт,
+                # выбивают друг друга киком «уже в сети» и мешают спавну.
+                nick_key = nick.lower()
+                if nick_key in seen_nicks:
+                    skipped_dupes += 1
+                    continue
+                seen_nicks.add(nick_key)
 
                 try:
                     srv = br_servers.find_server(srv_str)
@@ -1600,6 +1629,7 @@ class BotManager:
                     srv = None
 
                 if not srv:
+                    skipped_bad += 1
                     continue
 
                 clean_name = srv.get("firstname") or srv.get("name", "").replace("BLACK RUSSIA | ", "").strip()
@@ -1633,6 +1663,13 @@ class BotManager:
 
             if loaded_count > 0:
                 print(f"[+] Загружено {loaded_count} сохраненных аккаунтов из {os.path.basename(ACCOUNTS_FILE)}")
+            if skipped_dupes:
+                print(
+                    f"[!] Пропущено {skipped_dupes} повторных записей одного и того же "
+                    f"ника — в файле есть дубли"
+                )
+            if skipped_bad:
+                print(f"[!] Пропущено {skipped_bad} битых записей в accounts.json")
         except Exception as e:
             print(f"[!] Ошибка загрузки {ACCOUNTS_FILE}: {e}")
         finally:

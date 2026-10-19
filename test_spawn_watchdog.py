@@ -148,7 +148,7 @@ class WatchdogIntegrationTests(unittest.TestCase):
 
         bot.session.send_json = send_json
         # Меню приходит раньше, чем сторож успевает начать хендшейк.
-        S.remember_spawn_menu({"o": 1, "m": [1, 2]})
+        S.remember_spawn_menu({"o": 1, "m": [1, 2]}, bot)
         wd = S.SpawnWatchdog(
             bot, log=bot.log, attempt_timeout=2.0, stable_seconds=0.0, menu_wait=0.0
         )
@@ -162,7 +162,7 @@ class WatchdogIntegrationTests(unittest.TestCase):
             self.assertTrue(self._wait_for(lambda: bot.marked == [STATION]))
         finally:
             wd.stop()
-            S.reset_menu()
+            S.reset_menu(bot)
 
     def test_watchdog_does_nothing_when_already_spawned(self):
         bot = FakeBot(pos=STATION)
