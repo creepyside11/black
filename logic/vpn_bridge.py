@@ -529,6 +529,31 @@ class VpnBridge:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
         return os.path.join(self.state_dir, f"node-{digest}.json")
 
+    def _alloc_port(self, key: str) -> int:
+        """Свободный порт под узел.
+
+        Порт считается как хеш ключа, поэтому у двух узлов он может
+        совпасть. Тогда второй мост не мог занять порт, но socks_alive()
+        видел чужой слушающий сокет и рапортовал успех — узел «работал»
+        через туннель соседа. Держим карту занятых портов и на коллизии
+        сдвигаемся вверх.
+        """
+        known = self._ports.get(key)
+        if known:
+            return known
+
+        taken = {port for other, port in self._ports.items() if other != key}
+        port = port_for(key)
+        for _ in range(PORT_SPAN):
+            if port not in taken and not socks_alive(port):
+                self._ports[key] = port
+                return port
+            port += 1
+            if port >= PORT_BASE + PORT_SPAN:
+                port = PORT_BASE
+        # Все порты диапазона заняты — это уже аварийная ситуация.
+        raise RuntimeError("нет свободного порта под мост")
+
     # --- жизненный цикл ---
 
     def start(self, key: str, link: str) -> str | None:
@@ -541,12 +566,17 @@ class VpnBridge:
             return None
 
         with self._lock:
-            port = self._ports.get(key) or port_for(key)
-            url = f"socks5://127.0.0.1:{port}"
-
             proc = self._procs.get(key)
-            if proc is not None and proc.poll() is None and socks_alive(port):
-                return url
+            known = self._ports.get(key)
+            if proc is not None and proc.poll() is None and known and socks_alive(known):
+                return f"socks5://127.0.0.1:{known}"
+
+            try:
+                port = self._alloc_port(key)
+            except RuntimeError as exc:
+                self._note(f"[МОСТ] {exc}")
+                return None
+            url = f"socks5://127.0.0.1:{port}"
 
             os.makedirs(self.state_dir, exist_ok=True)
             cfg_path = self._config_path(key)
@@ -592,6 +622,10 @@ class VpnBridge:
 
     def _kill(self, key: str) -> None:
         proc = self._procs.pop(key, None)
+        # Порт освобождаем вместе с процессом: иначе упавший мост навсегда
+        # держит за собой номер, и следующий узел с той же коллизией уедет
+        # на соседний.
+        self._ports.pop(key, None)
         if proc is None:
             return
         try:

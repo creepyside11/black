@@ -97,6 +97,50 @@ class PortTests(unittest.TestCase):
             self.assertLess(port, B.PORT_BASE + B.PORT_SPAN)
 
 
+class PortAllocationTests(unittest.TestCase):
+    """Порт узла считается хешем ключа, поэтому у двух узлов он совпадает.
+
+    Второй мост не мог занять порт, но socks_alive() видел чужой
+    слушающий сокет и рапортовал успех — узел «работал» через туннель
+    соседа. На живом прогоне из 12 узлов три пары так и слиплись.
+    """
+
+    def setUp(self):
+        self.bridge = B.VpnBridge(binary="/bin/true")
+        # Ничего не слушает: тест про арифметику, а не про сеть.
+        self._orig_alive = B.socks_alive
+        B.socks_alive = lambda port, timeout=1.0: False
+
+    def tearDown(self):
+        B.socks_alive = self._orig_alive
+
+    def test_same_key_gets_same_port(self):
+        first = self.bridge._alloc_port("node-a")
+        self.assertEqual(self.bridge._alloc_port("node-a"), first)
+
+    def test_colliding_keys_get_different_ports(self):
+        a = self.bridge._alloc_port("node-a")
+        # Подсовываем ключ, чей хеш даёт тот же порт.
+        self.bridge._ports["node-b"] = a
+        b = self.bridge._alloc_port("node-c")
+        self.assertNotEqual(a, b)
+
+    def test_many_keys_all_unique(self):
+        ports = {self.bridge._alloc_port(f"node-{i}") for i in range(200)}
+        self.assertEqual(len(ports), 200, "порты повторились")
+
+    def test_busy_port_is_skipped(self):
+        base = B.port_for("node-x")
+        B.socks_alive = lambda port, timeout=1.0: port == base
+        port = self.bridge._alloc_port("node-x")
+        self.assertNotEqual(port, base)
+
+    def test_kill_frees_port(self):
+        port = self.bridge._alloc_port("node-a")
+        self.bridge._kill("node-a")
+        self.assertNotIn("node-a", self.bridge._ports)
+
+
 class ConfigTests(unittest.TestCase):
     def test_config_has_socks_inbound_and_outbound(self):
         out = B.parse_link(VLESS_REALITY)
