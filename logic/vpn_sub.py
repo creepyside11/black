@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import socket
 import urllib.parse
@@ -91,7 +92,17 @@ class VpnNode:
         """
         base = f"{self.protocol}://{self.address}:{self.port}"
         if self.login:
-            return f"{base}#{self.login}"
+            base = f"{base}#{self.login}"
+        # Логин тоже не всегда различает: подписка выдаёт всем узлам один
+        # и тот же UUID, а отличается SNI и ключ reality. Отпечаток
+        # конфига разводит их гарантированно.
+        #
+        # Только для узлов, которым нужен мост: у socks5/http адрес и порт
+        # уже уникальны, а отпечаток сделал бы ключ нечитаемым — по нему
+        # ищут узел и сверяют статусы.
+        if self.raw and not self.is_direct:
+            digest = hashlib.sha256(self.raw.encode("utf-8")).hexdigest()[:10]
+            base = f"{base}@{digest}"
         return base
 
     @property

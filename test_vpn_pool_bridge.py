@@ -261,9 +261,31 @@ class NodeKeyTests(unittest.TestCase):
         node = self._node("abc")
         self.assertTrue(node.key.startswith("vless://site.babay.su:443"))
 
+    def test_direct_node_key_stays_readable(self):
+        """По ключу ищут узел и сверяют статусы — отпечаток там мешает."""
+        node = VpnNode(name="HAPP", protocol="socks5", address="127.0.0.1",
+                       port=10808, raw="socks5://127.0.0.1:10808")
+        self.assertEqual(node.key, "socks5://127.0.0.1:10808")
+
     def test_node_without_login_still_has_key(self):
         node = VpnNode(name="x", protocol="vless", address="a.b", port=443)
         self.assertEqual(node.key, "vless://a.b:443")
+
+    def test_same_uuid_different_config_differ(self):
+        """Подписка выдаёт всем узлам один UUID, различает их только конфиг."""
+        a = VpnNode(name="DE", protocol="vless", address="site.babay.su",
+                    port=443, security="reality", login="same-uuid",
+                    raw='{"outbounds":[{"server":"site.babay.su","sni":"a"}]}')
+        b = VpnNode(name="Cheburnet", protocol="vless", address="site.babay.su",
+                    port=443, security="reality", login="same-uuid",
+                    raw='{"outbounds":[{"server":"site.babay.su","sni":"b"}]}')
+        self.assertNotEqual(a.key, b.key)
+
+    def test_identical_configs_share_key(self):
+        raw = '{"outbounds":[{"server":"x"}]}'
+        a = VpnNode(name="A", protocol="vless", address="x", port=443, raw=raw)
+        b = VpnNode(name="B", protocol="vless", address="x", port=443, raw=raw)
+        self.assertEqual(a.key, b.key)
 
     def test_find_node_still_matches_by_address(self):
         """Поиск по адресу не должен сломаться из-за UUID в ключе."""
