@@ -65,3 +65,4 @@ accounts.test.json.bak
 # установщик на сервер — не диагностика, должен ехать в репозитории
 !deploy/
 !deploy/install_singbox.sh
+!test_xray_config.py

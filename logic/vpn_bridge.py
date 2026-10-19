@@ -97,14 +97,193 @@ def _split_hostport(value: str) -> tuple[str, int]:
     return value, 443
 
 
-def parse_link(link: str) -> dict | None:
-    """Разобрать ссылку узла в outbound для sing-box.
+def parse_config(raw: str) -> dict | None:
+    """Конфиг Xray/V2Ray -> outbound sing-box.
 
-    Возвращает готовый словарь outbound или None, если протокол не поддержан.
+    Часть подписок отдаёт не ссылки, а готовые JSON-конфиги Xray: при
+    запросе с клиентским User-Agent сервер решает, что клиенту нужен
+    конфиг, и присылает его. Формат другой — protocol/settings/streamSettings
+    вместо type/server/uuid, — поэтому ссылочный разбор на нём просто
+    возвращал None, и все узлы такой подписки висели неприменимыми.
+    """
+    text = (raw or "").strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        cfg = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(cfg, dict):
+        return None
+
+    # Уже готовый outbound sing-box — отдаём как есть.
+    if "type" in cfg and "protocol" not in cfg:
+        return cfg if cfg.get("type") in _SINGBOX_TYPES else None
+
+    for item in cfg.get("outbounds") or []:
+        if not isinstance(item, dict):
+            continue
+        out = _xray_outbound(item)
+        if out:
+            return out
+    return None
+
+
+_SINGBOX_TYPES = ("vless", "vmess", "trojan", "shadowsocks", "socks", "http")
+
+_XRAY_PROTOCOLS = {
+    "vless": "vless",
+    "vmess": "vmess",
+    "trojan": "trojan",
+    "shadowsocks": "shadowsocks",
+    "ss": "shadowsocks",
+}
+
+
+def _xray_outbound(item: dict) -> dict | None:
+    """Один outbound Xray -> outbound sing-box."""
+    proto = (item.get("protocol") or "").lower()
+    kind = _XRAY_PROTOCOLS.get(proto)
+    if not kind:
+        return None
+
+    settings = item.get("settings") or {}
+    stream = item.get("streamSettings") or {}
+    out: dict = {"type": kind}
+
+    if kind in ("vless", "vmess"):
+        vnext = (settings.get("vnext") or [{}])[0]
+        server = vnext.get("address")
+        port = vnext.get("port")
+        user = (vnext.get("users") or [{}])[0]
+        if not server or not port or not user.get("id"):
+            return None
+        out["server"] = str(server)
+        out["server_port"] = int(port)
+        out["uuid"] = str(user["id"])
+        if kind == "vless":
+            flow = user.get("flow")
+            if flow:
+                out["flow"] = flow
+        else:
+            out["security"] = (user.get("security") or "auto").lower()
+            try:
+                out["alter_id"] = int(user.get("alterId") or 0)
+            except (TypeError, ValueError):
+                out["alter_id"] = 0
+    else:
+        servers = (settings.get("servers") or [{}])[0]
+        server = servers.get("address")
+        port = servers.get("port")
+        if not server or not port:
+            return None
+        out["server"] = str(server)
+        out["server_port"] = int(port)
+        if kind == "trojan":
+            if not servers.get("password"):
+                return None
+            out["password"] = str(servers["password"])
+        else:
+            if not servers.get("method") or not servers.get("password"):
+                return None
+            out["method"] = str(servers["method"])
+            out["password"] = str(servers["password"])
+
+    tls = _xray_tls(stream)
+    if tls:
+        out["tls"] = tls
+    elif (stream.get("security") or "").lower() in ("reality", "xtls"):
+        # reality без publicKey — узел не поднимется. Молча отдать его без
+        # tls значит получить «живой» прокси, который ничего не проксирует.
+        return None
+    transport = _xray_transport(stream)
+    if transport:
+        out["transport"] = transport
+    return out
+
+
+def _xray_tls(stream: dict) -> dict | None:
+    """security=tls|reality -> блок tls для sing-box."""
+    security = (stream.get("security") or "none").lower()
+    if security not in ("tls", "reality", "xtls"):
+        return None
+
+    tls_settings = stream.get("tlsSettings") or {}
+    reality = stream.get("realitySettings") or {}
+
+    server_name = (
+        reality.get("serverName")
+        or tls_settings.get("serverName")
+        or ""
+    )
+    tls: dict = {"enabled": True}
+    if server_name:
+        tls["server_name"] = str(server_name)
+
+    fingerprint = reality.get("fingerprint") or tls_settings.get("fingerprint")
+    if fingerprint:
+        tls["utls"] = {"enabled": True, "fingerprint": str(fingerprint)}
+
+    if security == "reality":
+        public_key = reality.get("publicKey")
+        if not public_key:
+            return None
+        tls["reality"] = {
+            "enabled": True,
+            "public_key": str(public_key),
+            "short_id": str(reality.get("shortId") or ""),
+        }
+    elif tls_settings.get("allowInsecure"):
+        tls["insecure"] = True
+    return tls
+
+
+def _xray_transport(stream: dict) -> dict | None:
+    """network=ws|grpc|http -> блок transport для sing-box."""
+    network = (stream.get("network") or "tcp").lower()
+    if network in ("tcp", "none", ""):
+        return None
+
+    if network in ("ws", "websocket"):
+        ws = stream.get("wsSettings") or {}
+        tr: dict = {"type": "ws", "path": str(ws.get("path") or "/")}
+        host = (ws.get("headers") or {}).get("Host")
+        if host:
+            tr["headers"] = {"Host": str(host)}
+        return tr
+
+    if network == "grpc":
+        grpc = stream.get("grpcSettings") or {}
+        tr = {"type": "grpc"}
+        if grpc.get("serviceName"):
+            tr["service_name"] = str(grpc["serviceName"])
+        return tr
+
+    if network in ("http", "h2"):
+        hs = stream.get("httpSettings") or {}
+        tr = {"type": "http"}
+        if hs.get("path"):
+            tr["path"] = str(hs["path"])
+        hosts = hs.get("host") or []
+        if hosts:
+            tr["host"] = [str(hosts[0])]
+        return tr
+
+    return None
+
+
+def parse_link(link: str) -> dict | None:
+    """Разобрать узел в outbound для sing-box.
+
+    Принимает и ссылку (vless://, vmess://, ...), и полный конфиг
+    Xray/V2Ray в JSON: подписки отдают то одно, то другое в зависимости
+    от User-Agent, которым их просят.
     """
     link = (link or "").strip()
     if not link:
         return None
+    if link.startswith("{"):
+        return parse_config(link)
     scheme = link.split("://", 1)[0].lower() if "://" in link else ""
 
     if scheme == "vless":
