@@ -565,3 +565,34 @@ class NoHandshakeTests(unittest.TestCase):
         bot.session.spawn_handshake_requested = False
         SP.request_class(bot, 0)
         self.assertFalse(bot.session.spawn_handshake_requested)
+
+
+class NoPermanentBanOnKick25Tests(unittest.TestCase):
+    """Кик кодом 25 не должен перманентно банить аккаунт.
+
+    Причина кика была наша: RPC-хендшейк спавна при открытом меню. Так
+    «отлетало» большинство аккаунтов, хотя на сервере они целы. Теперь
+    это пауза, а не бан.
+    """
+
+    def test_source_does_not_ban_on_anticheat_kick(self):
+        import os
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot.py")
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        # Ищем блок обработки кика античита и убеждаемся, что там нет бана.
+        start = src.find("kick_code = anticheat_kick(title, clean_info)")
+        self.assertGreater(start, 0, "обработчик кика античита пропал")
+        # Блок заканчивается на первом return после паузы — дальше идёт
+        # обработка обычных банов, её не трогаем.
+        pause = src.find("scheduled_reconnect_delay", start)
+        self.assertGreater(pause, start, "кик античита не уходит в паузу")
+        end = src.find("return", pause)
+        self.assertGreater(end, pause)
+        # Комментарии не в счёт: в них слово упомянуто как история.
+        code = "\n".join(
+            line for line in src[start:end].splitlines()
+            if not line.strip().startswith("#")
+        )
+        self.assertNotIn("mark_bot_banned", code,
+                         "кик античита снова перманентно банит аккаунт")
