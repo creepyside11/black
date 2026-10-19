@@ -229,6 +229,16 @@ class TelegramBotController:
                     lines.append(f"<i>…и ещё {len(statuses) - 12}</i>")
                 lines.append("")
                 lines.append("🟢 рабочий · 🟡 нужен клиент · 🔴 мёртвый")
+                # Без моста узлы vless/vmess/trojan/ss применить некуда:
+                # бот умеет только SOCKS5. Говорим прямо, что сделать.
+                bridge = getattr(pool, "bridge", None)
+                if bridge is None or not getattr(bridge, "available", lambda: False)():
+                    lines.append("")
+                    lines.append(
+                        "⚠️ <b>Мост sing-box не установлен.</b> Узлы 🟡 применить "
+                        "нельзя — бот ходит только через SOCKS5.\n"
+                        "На сервере: <code>bash _diag/vps/install_singbox.sh</code>"
+                    )
             else:
                 lines.append("<i>Узлов нет. Добавь подписку или локальный прокси.</i>")
 
@@ -237,8 +247,30 @@ class TelegramBotController:
 
             text = "\n".join(lines)
 
+            # Узлы кнопками: зелёная — рабочая, красная — мёртвая. По клику
+            # раздаётся всем ботам. Раньше узлы были только текстом, и
+            # выбрать конкретный сервер из Telegram было нельзя.
+            if statuses:
+                markup.add(types.InlineKeyboardButton(
+                    "— Раздать узел всем ботам —", callback_data="vpn_noop", style="primary"))
+                for res in statuses[:16]:
+                    node = res.node
+                    if res.usable:
+                        mark, style = "🟢", "success"
+                    elif res.alive:
+                        mark, style = "🟡", "primary"
+                    else:
+                        mark, style = "🔴", "danger"
+                    label = f"{mark} {node.name[:26]} · {node.protocol}"
+                    key = node.key
+                    markup.add(types.InlineKeyboardButton(
+                        label, callback_data=f"vpn_pick:{key}", style=style))
+
             if summary["usable"]:
-                markup.add(types.InlineKeyboardButton("⚡️ Раздать рабочие всем ботам", callback_data="vpn_apply_all", style="success"))
+                markup.add(types.InlineKeyboardButton(
+                    "⚡️ Раздать рабочие всем ботам", callback_data="vpn_apply_all", style="success"))
+                markup.add(types.InlineKeyboardButton(
+                    "🔀 Ротация по узлам (3 бота на узел)", callback_data="vpn_rotate", style="success"))
             markup.add(types.InlineKeyboardButton("🔄 Проверить сейчас", callback_data="vpn_refresh", style="success"))
 
         markup.add(types.InlineKeyboardButton("🔗 Добавить VPN-подписку", callback_data="vpn_add_sub", style="success"))
@@ -841,10 +873,12 @@ class TelegramBotController:
                 self.user_states[chat_id] = {"action": "add_vpn_sub"}
                 self.bot.send_message(
                     chat_id,
-                    "<b>🔗 Новая VPN-подписка</b>\n\n"
-                    "Пришли ссылку подписки:\n"
-                    "<code>https://panel.example/sub/xxxxx</code>\n\n"
-                    "Можно с именем через <code>|</code>:\n"
+                    "<b>🔗 Новая VPN-подписка или ключ</b>\n\n"
+                    "Можно прислать:\n"
+                    "• ссылку подписки — <code>https://panel.example/sub/xxxxx</code>\n"
+                    "• один ключ — <code>vless://uuid@host:443?...#Имя</code>\n"
+                    "• пачку ключей, по одному в строке\n\n"
+                    "С именем через <code>|</code>:\n"
                     "<code>Германия|https://panel.example/sub/xxxxx</code>\n\n"
                     "Для отмены: /cancel",
                 )
@@ -854,10 +888,12 @@ class TelegramBotController:
                 self.user_states[chat_id] = {"action": "add_vpn_local"}
                 self.bot.send_message(
                     chat_id,
-                    "<b>🔌 Локальный прокси</b>\n\n"
-                    "Пришли имя и адрес через <code>|</code>:\n"
+                    "<b>🔌 Локальный прокси или ключ</b>\n\n"
+                    "Адрес как есть или с именем через <code>|</code>:\n"
+                    "<code>socks5://127.0.0.1:10808</code>\n"
                     "<code>HAPP|socks5://127.0.0.1:10808</code>\n\n"
-                    "Бот умеет socks5 и http. Для RakNet нужен socks5 с UDP.",
+                    "Ключ <code>vless://</code> тоже принимается — он поднимется "
+                    "через мост sing-box, если тот стоит на сервере.",
                 )
                 self.bot.answer_callback_query(call.id)
 
@@ -877,6 +913,67 @@ class TelegramBotController:
                 self.bot.answer_callback_query(
                     call.id,
                     f"Роздано {len(working)} прокси на {len(targets)} ботов",
+                    show_alert=True,
+                )
+                self._render_vpn_menu(chat_id, message_id, call.id, quiet=True)
+
+            elif data == "vpn_noop":
+                self.bot.answer_callback_query(call.id)
+
+            elif data.startswith("vpn_pick:"):
+                pool = getattr(self.manager, "proxy_pool", None)
+                if pool is None:
+                    self.bot.answer_callback_query(call.id, "Пул прокси не запущен", show_alert=True)
+                    return
+                key = data.split(":", 1)[1]
+                node = pool.find_node(key)
+                if node is None:
+                    self.bot.answer_callback_query(call.id, "Узел не найден", show_alert=True)
+                    return
+                url = pool.socks_url_for(node)
+                if not url:
+                    self.bot.answer_callback_query(
+                        call.id,
+                        f"{node.name}: узел нерабочий или не поднялся мост",
+                        show_alert=True,
+                    )
+                    return
+                ok, reason = pool.verify_before_connect(url)
+                if not ok:
+                    self.bot.answer_callback_query(
+                        call.id, f"{node.name}: {reason}", show_alert=True
+                    )
+                    self._render_vpn_menu(chat_id, message_id, call.id, quiet=True)
+                    return
+                result = self.manager.apply_proxy_to_bots(url)
+                self.bot.answer_callback_query(
+                    call.id,
+                    f"{node.name}: роздано {len(result.get('applied', []))} ботам",
+                    show_alert=True,
+                )
+                self._render_vpn_menu(chat_id, message_id, call.id, quiet=True)
+
+            elif data == "vpn_rotate":
+                pool = getattr(self.manager, "proxy_pool", None)
+                if pool is None:
+                    self.bot.answer_callback_query(call.id, "Пул прокси не запущен", show_alert=True)
+                    return
+                with self.manager._lock:
+                    targets = list(self.manager.bots.values())
+                if not targets:
+                    self.bot.answer_callback_query(call.id, "Ботов нет", show_alert=True)
+                    return
+                plan = pool.rotate(len(targets), per_node=3)
+                used = 0
+                for item, proxy in zip(targets, plan):
+                    if proxy:
+                        item.proxy = proxy
+                        used += 1
+                self.manager.save_accounts()
+                nodes = len({p for p in plan if p})
+                self.bot.answer_callback_query(
+                    call.id,
+                    f"Ротация: {used} ботов на {nodes} узлов (по 3 на узел)",
                     show_alert=True,
                 )
                 self._render_vpn_menu(chat_id, message_id, call.id, quiet=True)
@@ -1090,9 +1187,9 @@ class TelegramBotController:
                 if pool is None:
                     self.bot.reply_to(message, "❌ Пул прокси не запущен.")
                     return
-                status = self.bot.reply_to(message, "⏳ Тяну подписку...")
+                status = self.bot.reply_to(message, "⏳ Принимаю...")
                 try:
-                    nodes = pool.add_subscription(sub_url, name=sub_name)
+                    nodes = pool.add_any(sub_url, name=sub_name)
                 except Exception as exc:
                     self.bot.edit_message_text(
                         f"❌ Не вышло: <code>{exc}</code>",
@@ -1101,7 +1198,7 @@ class TelegramBotController:
                     )
                     return
                 self.bot.edit_message_text(
-                    f"✅ Подписка принята, узлов: <b>{len(nodes)}</b>. Проверяю...",
+                    f"✅ Принято, узлов: <b>{len(nodes)}</b>. Проверяю...",
                     chat_id=message.chat.id,
                     message_id=status.message_id,
                 )
@@ -1112,24 +1209,40 @@ class TelegramBotController:
             elif action == "add_vpn_local":
                 del self.user_states[message.chat.id]
                 raw_val = message.text.strip()
-                if "|" not in raw_val:
-                    self.bot.reply_to(
-                        message, "❌ Нужно: <code>Имя|socks5://host:port</code>"
-                    )
-                    return
-                local_name, local_proxy = raw_val.split("|", 1)
+                # Имя необязательно: ключ vless:// или socks5:// принимается
+                # как есть, без префикса «Имя|».
+                if "|" in raw_val and not raw_val.lower().startswith(
+                    ("vless://", "vmess://", "trojan://", "ss://", "ssr://",
+                     "socks5://", "socks5h://", "socks4://")
+                ):
+                    local_name, local_proxy = raw_val.split("|", 1)
+                else:
+                    local_name, local_proxy = "", raw_val
                 pool = getattr(self.manager, "proxy_pool", None)
                 if pool is None:
                     self.bot.reply_to(message, "❌ Пул прокси не запущен.")
                     return
                 try:
-                    pool.add_manual(local_proxy.strip(), name=local_name.strip())
+                    node = pool.add_manual(local_proxy.strip(), name=local_name.strip())
                 except Exception as exc:
                     self.bot.reply_to(message, f"❌ Не вышло: <code>{exc}</code>")
                     return
-                ok, reason = pool.verify_before_connect(local_proxy.strip())
-                mark = "✅" if ok else "⚠️"
-                self.bot.reply_to(message, f"{mark} <b>{local_name.strip()}</b>: {reason or 'ок'}")
+                # Проверяем так, как бот реально пойдёт: для vless это мост
+                # sing-box и его SOCKS5-вход.
+                url = pool.socks_url_for(node)
+                if not url:
+                    self.bot.reply_to(
+                        message,
+                        f"⚠️ <b>{node.name}</b>: узел принят, но применить пока "
+                        f"нельзя — нужен мост sing-box на сервере "
+                        f"(<code>apt install sing-box</code>).",
+                    )
+                else:
+                    ok, reason = pool.verify_before_connect(url)
+                    mark = "✅" if ok else "⚠️"
+                    self.bot.reply_to(
+                        message, f"{mark} <b>{node.name}</b>: {reason or 'ок'}"
+                    )
                 self._render_vpn_menu(message.chat.id, None, None, quiet=True)
 
             elif action == "add_global_proxy":

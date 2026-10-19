@@ -379,12 +379,18 @@ class SampPacketHandler:
 
 
     def _handle_request_spawn(self, result: dict) -> None:
+        """Сервер ответил на RPC RequestClass (RPC 344).
+
+        Здесь только запоминаем ответ. Сам RPC Spawn отправляет
+        session._maybe_queue_rpc_spawn, и только если хендшейк начали мы:
+        раньше отправка шла отсюда напрямую, из-за чего на один ответ
+        уходило два RPC Spawn подряд (17.50 и 17.51 в трассе), а при
+        спонтанном 344 во время регистрации — вообще без запроса.
+        """
         parsed = result.get("parsed_payload") or {}
         spawn_resp = parsed.get("spawn_response")
         logger.info(f"Received request_spawn response: {spawn_resp}")
         self.session.server_info.spawn_response = bool(spawn_resp)
-        if spawn_resp:
-            self.session.send_rpc_spawn()
 
     def __init__(self, session):
         self.session = session

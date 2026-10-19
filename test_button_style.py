@@ -41,9 +41,37 @@ class ControllerTests(unittest.TestCase):
             self.src = fh.read()
 
     def test_every_button_is_styled(self):
-        total = len(re.findall(r"types\.InlineKeyboardButton\(", self.src))
-        styled = len(re.findall(r"style=(?:\"|btn_style)", self.src))
-        self.assertEqual(total, styled, f"без цвета осталось {total - styled}")
+        """У каждой кнопки есть style, чем бы он ни был задан.
+
+        Раньше тест считал вхождения `style="` и `style=btn_style`, то есть
+        смотрел на форму записи, а не на факт. Кнопка со style=<переменная>
+        считалась некрашеной, хотя цвет у неё был.
+        """
+        unstyled = []
+        src = self.src
+        marker = "types.InlineKeyboardButton("
+        index = 0
+        while True:
+            index = src.find(marker, index)
+            if index < 0:
+                break
+            start = index + len(marker) - 1
+            depth = 0
+            pos = start
+            while pos < len(src):
+                if src[pos] == "(":
+                    depth += 1
+                elif src[pos] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                pos += 1
+            block = src[start:pos + 1]
+            if "style=" not in block:
+                line = src[:index].count("\n") + 1
+                unstyled.append(line)
+            index = pos
+        self.assertEqual(unstyled, [], f"без цвета кнопки в строках: {unstyled}")
 
     def test_only_allowed_values(self):
         values = set(re.findall(r'style="(\w+)"', self.src))

@@ -172,7 +172,17 @@ def _send_rpc(bot, rpc_name: str, args=(), *, reliability, priority, log=None) -
 
 
 def request_class(bot, wclass: int = DEFAULT_CLASS, *, ordered: bool = False, log=None) -> bool:
-    """RPC RequestClass. ordered=False -> шаг 1, ordered=True -> шаг 3."""
+    """RPC RequestClass. ordered=False -> шаг 1, ordered=True -> шаг 3.
+
+    Неупорядоченный (шаг 1) заодно разрешает автоответ на RPC 344: только
+    после нашего запроса сервер имеет право прислать spawn_response, на
+    который сессия отвечает RPC Spawn. Без этого флага спонтанный 344
+    (например во время регистрации) приводил к RPC Spawn посреди
+    регистрации и кику античита кодом 25.
+    """
+    session = getattr(bot, "session", None)
+    if session is not None and not ordered:
+        session.spawn_handshake_requested = True
     if ordered:
         return _send_rpc(
             bot, "request_class", (int(wclass),),
@@ -189,20 +199,30 @@ def request_class(bot, wclass: int = DEFAULT_CLASS, *, ordered: bool = False, lo
 
 
 def send_spawn(bot, *, ordered: bool = False, log=None) -> bool:
-    """RPC Spawn. ordered=False -> шаг 2, ordered=True -> шаг 4."""
+    """RPC Spawn. ordered=False -> шаг 2, ordered=True -> шаг 4.
+
+    Помечаем сессию как «spawn уже отправлен», чтобы автоответ на RPC 344
+    не прислал второй такой же RPC следом.
+    """
     if ordered:
-        return _send_rpc(
+        sent = _send_rpc(
             bot, "spawn", (),
             reliability=PacketReliability.RELIABLE_ORDERED,
             priority=PacketPriority.MEDIUM_PRIORITY,
             log=log,
         )
-    return _send_rpc(
-        bot, "spawn", (),
-        reliability=PacketReliability.RELIABLE,
-        priority=PacketPriority.SYSTEM_PRIORITY,
-        log=log,
-    )
+    else:
+        sent = _send_rpc(
+            bot, "spawn", (),
+            reliability=PacketReliability.RELIABLE,
+            priority=PacketPriority.SYSTEM_PRIORITY,
+            log=log,
+        )
+    if sent:
+        session = getattr(bot, "session", None)
+        if session is not None:
+            session._rpc_spawn_queued = True
+    return sent
 
 
 def start_sync(bot) -> None:

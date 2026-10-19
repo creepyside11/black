@@ -287,10 +287,24 @@ class PoolTests(unittest.TestCase):
         pool.refresh(fetch=False)
         self.assertEqual(pool.usable_proxies(), ["socks5://127.0.0.1:10808"])
 
-    def test_manual_rejects_vless(self):
+    def test_manual_accepts_vless_as_bridge_node(self):
+        """Ключ vless принимается: его поднимает мост sing-box.
+
+        Раньше он отклонялся с «бот умеет только socks5», и добавить узел
+        из подписки вручную было нельзя вовсе.
+        """
         pool = PP.ProxyPool(self.path, loader=lambda u, **k: [], log=lambda _m: None)
-        with self.assertRaises(PP.ProxyPoolError):
-            pool.add_manual(VLESS_LINK)
+        node = pool.add_manual(VLESS_LINK, name="DE")
+        self.assertEqual(node.protocol, "vless")
+        self.assertEqual(node.name, "DE")
+        self.assertEqual([n.protocol for n in pool.nodes()], ["vless"])
+
+    def test_manual_vless_survives_reload(self):
+        pool = PP.ProxyPool(self.path, loader=lambda u, **k: [], log=lambda _m: None)
+        pool.add_manual(VLESS_LINK, name="DE")
+        again = PP.ProxyPool(self.path, loader=lambda u, **k: [], log=lambda _m: None)
+        names = [n.name for n in again.nodes()]
+        self.assertIn("DE", names)
 
     def test_manual_survives_reload(self):
         pool = PP.ProxyPool(self.path, loader=lambda u, **k: [], log=lambda _m: None)

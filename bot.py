@@ -2076,9 +2076,14 @@ class BotManager:
         node = pool.find_node(proxy_clean)
         if node is None:
             return proxy_clean
-        if not node.is_direct:
+        # Direct-узел отдаёт сам себя, узлу с внешним клиентом поднимается
+        # мост sing-box и отдаётся его SOCKS5-вход. Раньше такие узлы
+        # просто отбрасывались, и всё, что приходило из подписки, было
+        # применить нельзя.
+        url = pool.socks_url_for(node)
+        if not url:
             return ""
-        return node.proxy_url()
+        return url
 
     def set_bot_proxy(self, bot_id: int, proxy_str: str) -> bool:
         with self._lock:

@@ -117,6 +117,22 @@ class SampSession:
 
         self._spawn_lock = threading.Lock()
         self._rpc_spawn_queued = False
+        # Отвечать ли на RPC 344 (spawn_response) автоматическим spawn.
+        #
+        # Сервер шлёт 344 не только в ответ на наш request_class, но и сам —
+        # например во время регистрации, когда аккаунт только что создан.
+        # Автоответ уходил в этот момент, то есть RPC Spawn прилетал посреди
+        # регистрации, до interface_register_finish. В трассе живого входа
+        # это видно построчно:
+        #     17.16  >> interface_register_skin
+        #     17.50  >> spawn          <- до завершения регистрации
+        #     17.51  >> spawn          <- и второй раз, из обработчика 344
+        #     17.83  >> interface_register_finish
+        # Античит отвечает на это киком кодом 25.
+        #
+        # Теперь автоответ включается только тогда, когда хендшейк спавна
+        # начали мы сами (logic.spawn.request_class).
+        self.spawn_handshake_requested = False
 
         self._update_scores_pings_continuous = True
         self._update_scores_pings_interval = 15.0
@@ -605,6 +621,7 @@ class SampSession:
         self._handshake_stage = "open_connection_reply"
 
         self._rpc_spawn_queued = False
+        self.spawn_handshake_requested = False
 
         self.sync.reset()
 
@@ -646,6 +663,18 @@ class SampSession:
             return
 
         if self._rpc_spawn_queued:
+            return
+
+        # Спонтанный 344 от сервера (регистрация, повторная выдача класса)
+        # не повод слать RPC Spawn. Отвечаем только на свой запрос.
+        if not self.spawn_handshake_requested:
+            return
+
+        # Регистрация ещё идёт — спавн подождёт. Иначе RPC уходит между
+        # interface_register_skin и interface_register_finish.
+        reg = getattr(self, "registration", None)
+        reg_state = getattr(reg, "state", None) if reg is not None else None
+        if reg_state in ("registering", "submitted", "logging_in"):
             return
 
         spawn_response = getattr(

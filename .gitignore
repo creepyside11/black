@@ -45,3 +45,11 @@ _diag/
 !test_button_style.py
 !test_multi_admin.py
 !test_no_duplicates.py
+!test_vpn_bridge.py
+!logic/vpn_bridge.py
+!test_vpn_pool_bridge.py
+!test_vpn_bridge_integration.py
+
+# резервная копия, которую пишет save_accounts
+accounts.json.bak
+accounts.json.tmp

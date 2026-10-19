@@ -40,6 +40,7 @@ from .vpn_sub import (
     load_subscription,
     parse_link,
 )
+from .vpn_bridge import VpnBridge, bridge_available
 
 DEFAULT_INTERVAL = 300.0  # 5 минут
 DEFAULT_TIMEOUT = 6.0
@@ -50,6 +51,29 @@ MANUAL_PREFIX = "manual"
 
 class ProxyPoolError(Exception):
     """Пул не смог выполнить операцию."""
+
+
+# Схемы, которые означают «это отдельный ключ узла», а не URL подписки.
+NODE_KEY_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "ssr://",
+                    "hysteria://", "hysteria2://", "tuic://", "socks5://",
+                    "socks5h://", "socks4://", "http://", "https://")
+
+
+def _looks_like_node_key(line: str) -> bool:
+    """Отдельный ключ узла, а не URL подписки.
+
+    http/https сюда попадают только с явным путём на .txt/.json — иначе
+    это подписка. Проще: подписку почти всегда добавляют как https://...,
+    а ключ — как vless://...
+    """
+    low = (line or "").strip().lower()
+    if not low:
+        return False
+    if low.startswith(("vless://", "vmess://", "trojan://", "ss://", "ssr://",
+                       "hysteria://", "hysteria2://", "tuic://",
+                       "socks5://", "socks5h://", "socks4://")):
+        return True
+    return False
 
 
 def _now() -> float:
@@ -78,6 +102,7 @@ class ProxyPool:
         prober=None,
         loader=None,
         clock=_now,
+        bridge=None,
     ):
         self.path = path or os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -109,6 +134,11 @@ class ProxyPool:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self.running = False
+        # Мост VLESS/VMess/Trojan/SS -> SOCKS5. Без него такие узлы из
+        # подписки остаются жёлтыми: живой, но применить некуда.
+        if bridge is None and bridge_available():
+            bridge = VpnBridge(log=self.log)
+        self.bridge = bridge
 
         self.load()
         if not self.hwid:
@@ -157,6 +187,35 @@ class ProxyPool:
             self.log(f"[ПРОКСИ] не сохранил {self.path}: {exc}")
 
     # ---------- подписки ----------
+
+    def add_any(self, value: str, name: str = "", *, fetch: bool = True) -> list[VpnNode]:
+        """Принять что угодно: ссылку подписки, отдельный ключ узла или пачку ключей.
+
+        Раньше в «Добавить VPN-подписку» можно было вставить только URL.
+        Одиночный ключ вида vless://... уходил в загрузчик подписок и падал
+        с «не скачал подписку» — то есть новый ключ было не добавить вовсе.
+        Теперь одиночный ключ (или несколько, по строке на ключ) кладётся
+        как ручной узел.
+        """
+        value = (value or "").strip()
+        if not value:
+            raise ProxyPoolError("Пустое значение")
+
+        lines = [line.strip() for line in value.splitlines() if line.strip()]
+        keys = [line for line in lines if _looks_like_node_key(line)]
+        if keys:
+            nodes: list[VpnNode] = []
+            for index, key in enumerate(keys):
+                label = name if len(keys) == 1 else (name or f"ключ {index + 1}")
+                nodes.append(self.add_manual(key, name=label))
+            return nodes
+
+        if not value.lower().startswith(("http://", "https://")):
+            raise ProxyPoolError(
+                "не понял формат: нужен URL подписки или ключ "
+                "vless:// vmess:// trojan:// ss://"
+            )
+        return self.add_subscription(value, name=name, fetch=fetch)
 
     def add_subscription(self, url: str, name: str = "", *, fetch: bool = True) -> list[VpnNode]:
         """Добавить подписку. Сразу тянем узлы, чтобы отсеять битую ссылку."""
@@ -207,26 +266,35 @@ class ProxyPool:
         return removed
 
     def add_manual(self, proxy: str, name: str = "") -> VpnNode:
-        """Ручной прокси строкой: socks5://user:pass@host:port."""
+        """Ручной узел: socks5://user:pass@host:port или ключ vless://...
+
+        Ключи vless/vmess/trojan/ss тоже принимаются: их поднимает мост
+        sing-box, и бот получает локальный SOCKS5. Раньше такие ключи
+        отклонялись с «бот умеет только socks5», то есть добавить узел из
+        подписки вручную было нельзя.
+        """
         node = parse_link(proxy)
         if node is None:
             raise ProxyPoolError(f"не понял прокси: {proxy!r}")
-        if not node.is_direct:
-            raise ProxyPoolError(
-                f"{node.protocol} вручную не годится: бот умеет только "
-                "socks5/socks4/http"
-            )
+        if not node.is_direct and not node.needs_client:
+            raise ProxyPoolError(f"{node.protocol} не поддерживается")
+        # Для direct-узла храним готовую socks5-строку, для остальных —
+        # исходный ключ: из него мост собирает конфиг sing-box.
+        stored = node.proxy_url() or (proxy or "").strip()
+        label = (name or "").strip() or node.name
         with self._lock:
-            if not any(m.get("proxy") == node.proxy_url() for m in self.manual):
+            if not any(m.get("proxy") == stored for m in self.manual):
                 self.manual.append(
                     {
-                        "proxy": node.proxy_url(),
-                        "name": (name or "").strip() or node.name,
+                        "proxy": stored,
+                        "name": label,
                         "added_at": self._clock(),
                     }
                 )
         self.save()
-        self.log(f"[ПРОКСИ] добавлен вручную: {name or node.name} -> {node.proxy_url()}")
+        # Имя из аргумента важнее имени в ссылке: человек назвал узел сам.
+        node.name = label
+        self.log(f"[ПРОКСИ] добавлен вручную: {label} -> {stored}")
         return node
 
     def remove_manual(self, needle: str) -> bool:
@@ -332,8 +400,7 @@ class ProxyPool:
         for res in dead:
             self.log(f"    ❌ {res.node.name} ({res.node.address}:{res.node.port}) — {res.reason}")
 
-    def check_node(self, node: VpnNode) -> ProbeResult:
-        """Проверить один узел прямо сейчас, без ожидания таймера."""
+    def _probe(self, node: VpnNode) -> ProbeResult:
         kwargs = {"timeout": self.timeout, "target_port": self.target_port}
         if self.target_host:
             kwargs["target_host"] = self.target_host
@@ -341,17 +408,76 @@ class ProxyPool:
         # можно подменить в тестах и поведение не разъедется.
         try:
             results = self._prober([node], **kwargs)
-            result = results[0] if results else probe_node(node, **kwargs)
+            return results[0] if results else probe_node(node, **kwargs)
         except Exception as exc:
-            result = ProbeResult(
+            return ProbeResult(
                 node=node,
                 status=STATUS_DEAD,
                 reason=f"проверка упала: {exc}",
                 checked_at=self._clock(),
             )
+
+    def check_node(self, node: VpnNode) -> ProbeResult:
+        """Проверить один узел прямо сейчас, без ожидания таймера.
+
+        Узлы, которым нужен внешний клиент (vless/vmess/trojan/ss), сначала
+        поднимаются через мост sing-box, а потом проверяются как обычный
+        SOCKS5 — сквозным запросом до игрового сервера. Только так «живой по
+        TCP» превращается в «рабочий»: TCP-коннект до VPN-сервера ничего не
+        говорит о том, пускает ли он дальше.
+        """
+        result = self._probe(node)
+
+        if result.status == STATUS_NEEDS_CLIENT:
+            result = self._probe_via_bridge(node, result)
+
         with self._lock:
             self.results[node.key] = result
         return result
+
+    def _probe_via_bridge(self, node: VpnNode, base: ProbeResult) -> ProbeResult:
+        """Поднять мост под узел и проверить получившийся SOCKS5."""
+        bridge = self.bridge
+        if bridge is None or not getattr(bridge, "available", lambda: False)():
+            return base
+
+        try:
+            url = bridge.start(node.key, node.raw)
+        except Exception as exc:
+            base.reason = f"мост не поднялся: {exc}"
+            return base
+        if not url:
+            base.reason = f"{node.protocol.upper()} — мост не поднялся"
+            return base
+
+        port = bridge.port_of(node.key)
+        if port is None:
+            base.reason = f"{node.protocol.upper()} — мост без порта"
+            return base
+
+        # Проверяем уже SOCKS5-вход моста, тем же пробером, что и ручные
+        # socks5-прокси: TCP + UDP до игрового сервера.
+        socks_node = VpnNode(
+            name=node.name,
+            protocol="socks5",
+            address="127.0.0.1",
+            port=int(port),
+            source=node.source,
+        )
+        bridged = self._probe(socks_node)
+        bridged.node = node
+        bridged.socks_url = url
+        if bridged.usable:
+            bridged.status = STATUS_OK
+            latency = f"{bridged.latency_ms:.0f}мс" if bridged.latency_ms else "?"
+            bridged.reason = f"{node.protocol.upper()} через мост ({latency})"
+        else:
+            # Мост поднялся, но трафик не идёт — это мёртвый узел, а не
+            # «нужен клиент». Держим процесс, вдруг оживёт на следующей
+            # проверке.
+            bridged.status = STATUS_DEAD
+            bridged.reason = f"{node.protocol.upper()} через мост не пускает: {bridged.reason}"
+        return bridged
 
     def verify_before_connect(
         self, proxy: str, *, max_age: float = 20.0
@@ -407,7 +533,12 @@ class ProxyPool:
         return [res for res in self.statuses() if res.usable]
 
     def usable_proxies(self) -> list[str]:
-        return [res.node.proxy_url() for res in self.usable() if res.node.proxy_url()]
+        """Готовые строки прокси для ботов.
+
+        Для узлов через мост это socks5://127.0.0.1:<порт> — у самого узла
+        proxy_url пустой, он не direct.
+        """
+        return [res.proxy_url for res in self.usable() if res.proxy_url]
 
     def find_node(self, needle: str) -> VpnNode | None:
         """Найти узел среди настроенных, не требуя свежей проверки.
@@ -426,6 +557,42 @@ class ProxyPool:
             if needle in node.name.lower() or needle in node.address.lower():
                 return node
         return None
+
+    def socks_url_for(self, node: VpnNode) -> str:
+        """Прокси-строка для бота по узлу, поднимая мост при необходимости.
+
+        Direct-узел отдаёт сам себя. Узлу с внешним клиентом нужен мост:
+        без него применить его некуда.
+        """
+        if node.is_direct:
+            return node.proxy_url()
+
+        bridge = self.bridge
+        if bridge is None or not getattr(bridge, "available", lambda: False)():
+            return ""
+        try:
+            return bridge.start(node.key, node.raw) or ""
+        except Exception:
+            return ""
+
+    def rotate(self, bot_count: int, *, per_node: int = 3) -> list[str]:
+        """Раскладка прокси по ботам: несколько ботов на узел, по кругу.
+
+        Один туннель на всех — это один IP на все аккаунты, то есть ровно
+        то же самое, что заходить без прокси: сервер видит кучу аккаунтов
+        с одного адреса. Поэтому рабочие узлы раздаются группами.
+
+        Возвращает список прокси длиной bot_count. Пустая строка — своё IP.
+        """
+        usable = [res for res in self.usable() if res.proxy_url]
+        if not usable or bot_count <= 0:
+            return [""] * max(0, bot_count)
+
+        urls: list[str] = []
+        for res in usable:
+            for _ in range(max(1, int(per_node))):
+                urls.append(res.proxy_url)
+        return [urls[i % len(urls)] for i in range(bot_count)]
 
     def find(self, needle: str) -> ProbeResult | None:
         """Найти узел по ключу, имени или адресу."""

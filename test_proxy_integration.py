@@ -34,6 +34,10 @@ class FakePool:
                 return node
         return None
 
+    def socks_url_for(self, node):
+        """Как пул отдаёт прокси по узлу: direct — сам себя, остальные — мост."""
+        return node.proxy_url()
+
     def verify_before_connect(self, proxy, max_age=20.0):
         self.verified.append(proxy)
         if proxy in self._usable:
@@ -98,11 +102,20 @@ class ResolveProxyTests(unittest.TestCase):
         for value in ("none", "off", "direct", "-", "0", "no", ""):
             self.assertEqual(self.manager.resolve_proxy(value), "")
 
-    def test_vless_node_rejected(self):
+    def test_vless_without_bridge_rejected(self):
+        """Без моста vless применить некуда — пустая строка, а не мусор."""
         vless_node = VS.parse_link(VLESS)
         vless_node.name = "DE"
         self.pool._nodes.append(vless_node)
         self.assertEqual(self.manager.resolve_proxy("DE"), "")
+
+    def test_vless_with_bridge_resolves_to_socks(self):
+        """С мостом узел превращается в локальный SOCKS5 и применим."""
+        vless_node = VS.parse_link(VLESS)
+        vless_node.name = "DE"
+        self.pool._nodes.append(vless_node)
+        self.pool.socks_url_for = lambda n: "socks5://127.0.0.1:20001"
+        self.assertEqual(self.manager.resolve_proxy("DE"), "socks5://127.0.0.1:20001")
 
     def test_unknown_key_returned_as_is(self):
         self.assertEqual(self.manager.resolve_proxy("чужое"), "чужое")
@@ -128,12 +141,20 @@ class SetBotProxyTests(unittest.TestCase):
     def test_unknown_bot(self):
         self.assertFalse(self.manager.set_bot_proxy(999, SOCKS))
 
-    def test_vless_refused(self):
+    def test_vless_refused_without_bridge(self):
         vless_node = VS.parse_link(VLESS)
         vless_node.name = "DE"
         self.pool._nodes.append(vless_node)
         self.assertFalse(self.manager.set_bot_proxy(self.bot.bot_id, "DE"))
         self.assertEqual(self.bot.proxy, "")
+
+    def test_vless_accepted_with_bridge(self):
+        vless_node = VS.parse_link(VLESS)
+        vless_node.name = "DE"
+        self.pool._nodes.append(vless_node)
+        self.pool.socks_url_for = lambda n: "socks5://127.0.0.1:20002"
+        self.assertTrue(self.manager.set_bot_proxy(self.bot.bot_id, "DE"))
+        self.assertEqual(self.bot.proxy, "socks5://127.0.0.1:20002")
 
 
 class ApplyProxyTests(unittest.TestCase):

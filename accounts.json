@@ -902,39 +902,6 @@
     "target_lvl": null
   },
   {
-    "nickname": "Chess_Kerinmon",
-    "password": "55337q",
-    "server": "TOLYATTI",
-    "task": "stop",
-    "is_banned": false,
-    "proxy": "",
-    "lvl": "-",
-    "money": 200,
-    "target_lvl": null
-  },
-  {
-    "nickname": "Chess_Kerinmon",
-    "password": "55337q",
-    "server": "TOLYATTI",
-    "task": "stop",
-    "is_banned": true,
-    "proxy": "",
-    "lvl": "-",
-    "money": 200,
-    "target_lvl": null
-  },
-  {
-    "nickname": "Chess_Novikop",
-    "password": "55337q",
-    "server": "TOLYATTI",
-    "task": "stop",
-    "is_banned": false,
-    "proxy": "",
-    "lvl": "-",
-    "money": 200,
-    "target_lvl": null
-  },
-  {
     "nickname": "Wendel_Nezovibatko",
     "password": "55337q",
     "server": "TOLYATTI",
@@ -943,6 +910,28 @@
     "proxy": "",
     "lvl": "-",
     "money": 0,
+    "target_lvl": null
+  },
+  {
+    "nickname": "Sendy_Birilev",
+    "password": "55337q",
+    "server": "TOLYATTI",
+    "task": "stop",
+    "is_banned": false,
+    "proxy": "",
+    "lvl": "-",
+    "money": 200,
+    "target_lvl": null
+  },
+  {
+    "nickname": "Celia_Bespojasnyj",
+    "password": "55337q",
+    "server": "TOLYATTI",
+    "task": "stop",
+    "is_banned": false,
+    "proxy": "",
+    "lvl": "-",
+    "money": 200,
     "target_lvl": null
   }
 ]

@@ -64,6 +64,14 @@ class ProbeResult:
     latency_ms: float | None = None
     reason: str = ""
     checked_at: float = 0.0
+    # SOCKS5-адрес локального моста, если узел поднят через sing-box.
+    # Для direct-узлов пусто: там прокси — сам узел.
+    socks_url: str = ""
+
+    @property
+    def proxy_url(self) -> str:
+        """Готовая строка для bot.proxy."""
+        return self.socks_url or self.node.proxy_url()
 
     def to_dict(self) -> dict:
         data = asdict(self)
