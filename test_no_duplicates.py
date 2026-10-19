@@ -112,3 +112,46 @@ class LoadTests(unittest.TestCase):
         nicks = [b.nickname for b in m.bots.values()]
         self.assertIn("Dubl_Load", nicks, "записи до битой не загрузились")
         self.assertIn("Odinochnyj_Load", nicks, "записи после битой не загрузились")
+
+
+class SaveTests(unittest.TestCase):
+    """Запись accounts.json не должна терять данные молча."""
+
+    def setUp(self):
+        self._dir = tempfile.mkdtemp()
+        self._path = os.path.join(self._dir, "accounts.json")
+        self._patch = mock.patch.object(botmod, "ACCOUNTS_FILE", self._path)
+        self._patch.start()
+
+    def tearDown(self):
+        self._patch.stop()
+        for name in os.listdir(self._dir):
+            try:
+                os.unlink(os.path.join(self._dir, name))
+            except OSError:
+                pass
+        try:
+            os.rmdir(self._dir)
+        except OSError:
+            pass
+
+    def test_save_leaves_backup_of_previous_file(self):
+        m = botmod.BotManager()
+        m.add_bot("TOLYATTI", "Pervyj_Save", "55337q", default_task="stop")
+        m.save_accounts(force=True)
+        self.assertTrue(os.path.exists(self._path))
+
+        # add_bot сам сохраняет состояние, поэтому копия пишется здесь.
+        m.add_bot("TOLYATTI", "Vtoroj_Save", "55337q", default_task="stop")
+
+        bak = self._path + ".bak"
+        self.assertTrue(os.path.exists(bak), "резервная копия не создана")
+        with open(bak, encoding="utf-8") as f:
+            old = json.load(f)
+        self.assertEqual([x["nickname"] for x in old], ["Pervyj_Save"])
+
+    def test_no_temp_file_left_behind(self):
+        m = botmod.BotManager()
+        m.add_bot("TOLYATTI", "Tmp_Save", "55337q", default_task="stop")
+        m.save_accounts(force=True)
+        self.assertFalse(os.path.exists(self._path + ".tmp"))

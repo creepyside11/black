@@ -5,6 +5,7 @@
 
 import sys
 import os
+import shutil
 import time
 import random
 import threading
@@ -1715,11 +1716,36 @@ class BotManager:
                     "target_lvl": b.target_lvl,
                 })
 
+        self._write_accounts(data)
+
+    def _write_accounts(self, data: list) -> None:
+        """Записать accounts.json атомарно и оставить одну резервную копию.
+
+        Раньше файл писался поверх сразу, без копии. Один запуск с пустым
+        списком ботов (например, скрипт, который создал менеджер и упал на
+        загрузке) стирал весь список аккаунтов — восстановить было нечем.
+        Теперь запись идёт через временный файл и подмену, а предыдущая
+        версия остаётся в accounts.json.bak.
+        """
+        tmp = ACCOUNTS_FILE + ".tmp"
         try:
-            with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            if os.path.exists(ACCOUNTS_FILE):
+                try:
+                    shutil.copyfile(ACCOUNTS_FILE, ACCOUNTS_FILE + ".bak")
+                except OSError:
+                    pass
+            os.replace(tmp, ACCOUNTS_FILE)
         except Exception as e:
             print(f"[!] Ошибка сохранения {ACCOUNTS_FILE}: {e}")
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+            except OSError:
+                pass
 
     def flush_pending_save(self) -> None:
         """Дописывает accounts.json, если изменения были отложены дебаунсом."""
