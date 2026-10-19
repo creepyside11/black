@@ -5,6 +5,8 @@
 """
 
 import json
+import os
+import tempfile
 import unittest
 
 from logic import vpn_bridge as B
@@ -172,3 +174,38 @@ class NoBinaryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class OrphanTests(unittest.TestCase):
+    """Процессы от прошлых запусков надо гасить.
+
+    При перезапуске бота sing-box не умирают вместе с ним: старый
+    экземпляр о них уже не знает, новый их не видит. На сервере так
+    накопилось 45 висящих процессов при трёх рабочих портах.
+    """
+
+    def test_reap_targets_only_our_state_dir(self):
+        import subprocess as sp
+        from unittest import mock
+
+        tmp = os.path.join(tempfile.mkdtemp(), "_vpn_bridge")
+        os.makedirs(tmp)
+        out = (
+            "111 /usr/local/bin/sing-box run -c %s/node-a.json\n"
+            "222 /usr/local/bin/sing-box run -c /другое/место/node-b.json\n"
+            "333 /usr/local/bin/sing-box run -c %s/node-c.json\n"
+        ) % (tmp, tmp)
+        killed = []
+        bridge = B.VpnBridge(state_dir=tmp, binary="/bin/true")
+        with mock.patch.object(sp, "run", return_value=mock.Mock(stdout=out)), \
+             mock.patch.object(B.os, "kill", side_effect=lambda pid, sig: killed.append(pid)):
+            bridge._reap_orphans()
+        self.assertEqual(killed, [111, 333], "чужой процесс не трогаем")
+
+    def test_reap_is_safe_without_dir(self):
+        bridge = B.VpnBridge(state_dir="/нет/такой/папки", binary="/bin/true")
+        bridge._reap_orphans()  # не должно упасть
+
+    def test_reap_skips_when_no_binary(self):
+        bridge = B.VpnBridge(state_dir="/tmp", binary="/нет/бинаря")
+        bridge._reap_orphans()

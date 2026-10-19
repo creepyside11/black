@@ -512,6 +512,7 @@ class VpnBridge:
         self._procs: dict[str, subprocess.Popen] = {}
         self._ports: dict[str, int] = {}
         self._lock = threading.RLock()
+        self._reap_orphans()
 
     # --- служебное ---
 
@@ -520,6 +521,35 @@ class VpnBridge:
             try:
                 self.log(text)
             except Exception:
+                pass
+
+    def _reap_orphans(self) -> None:
+        """Погасить sing-box, оставшиеся от прошлых запусков.
+
+        Мост поднимает процессы, а при перезапуске бота они не умирают
+        вместе с ним: старый экземпляр о них уже не знает, новый их не
+        видит и поднимает свои. На живом сервере так накопилось 45
+        висящих процессов при трёх рабочих портах.
+        """
+        if not self.available() or not os.path.isdir(self.state_dir):
+            return
+        marker = os.path.basename(self.state_dir) + os.sep
+        try:
+            listing = subprocess.run(
+                ["pgrep", "-af", "sing-box run -c"],
+                capture_output=True, text=True, timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return
+        for line in (listing.stdout or "").splitlines():
+            if marker not in line:
+                continue
+            pid_text = line.split(None, 1)[0]
+            if not pid_text.isdigit():
+                continue
+            try:
+                os.kill(int(pid_text), 15)
+            except OSError:
                 pass
 
     def available(self) -> bool:
