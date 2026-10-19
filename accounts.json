@@ -867,5 +867,27 @@
     "lvl": "-",
     "money": 200,
     "target_lvl": null
+  },
+  {
+    "nickname": "Chess_Kerinmon",
+    "password": "55337q",
+    "server": "TOLYATTI",
+    "task": "stop",
+    "is_banned": false,
+    "proxy": "",
+    "lvl": "-",
+    "money": 200,
+    "target_lvl": null
+  },
+  {
+    "nickname": "Pupa_Berinstop",
+    "password": "55337q",
+    "server": "PSKOV",
+    "task": "stop",
+    "is_banned": false,
+    "proxy": "",
+    "lvl": "-",
+    "money": 200,
+    "target_lvl": null
   }
 ]

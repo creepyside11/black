@@ -756,12 +756,36 @@ def menu_answer_recent(window: float = 25.0) -> bool:
 # на входе, а вход античит и проверяет.
 ANSWERED_MENU_KEY = None
 
+# Пауза перед ответом на меню вокзала.
+#
+# Меню приходит на 15-й секунде входа, и мы отвечали в том же тике — за 0.0 с.
+# Живой человек столько не думает. Античит это и ловит: в логах оба кика
+# кодом 25 пришли через 0.1-0.3 с после мгновенного ответа, а вход, где меню
+# не пришло вовсе, прошёл спокойно.
+#
+# Отвечаем не сразу, а через паузу, похожую на человеческую. Границы взяты
+# с запасом: слишком короткая ничего не меняет, слишком длинная даёт шанс,
+# что меню истечёт и спавн не состоится.
+SPAWN_ANSWER_DELAY = (1.6, 3.4)
 
-def select_spawn(bot, index: int | None = None, style: str | None = None) -> bool:
+
+def spawn_answer_delay(rng=None) -> float:
+    """Сколько подождать перед ответом на меню вокзала."""
+    import random as _random
+
+    low, high = SPAWN_ANSWER_DELAY
+    return (rng or _random).uniform(low, high)
+
+
+def select_spawn(bot, index: int | None = None, style: str | None = None,
+                 *, delay: float | None = None) -> bool:
     """Ответить на меню вокзалов. Без индекса выбираем первый.
 
     На одно и то же меню отвечаем один раз. Повторный вызов с теми же
     пунктами ничего не отправляет и возвращает True.
+
+    delay — пауза перед отправкой. По умолчанию человеческая (см.
+    SPAWN_ANSWER_DELAY), 0 отключает её для тестов.
     """
     global MENU_ANSWERED_AT, ANSWERED_MENU_KEY
 
@@ -774,6 +798,11 @@ def select_spawn(bot, index: int | None = None, style: str | None = None) -> boo
     session = getattr(bot, "session", None)
     if session is None or not _connected(bot):
         return False
+
+    pause = spawn_answer_delay() if delay is None else float(delay)
+    if pause > 0:
+        time.sleep(pause)
+
     payload = build_spawn_payload(menu_choice() if index is None else int(index))
     try:
         sent = bool(
@@ -788,12 +817,52 @@ def select_spawn(bot, index: int | None = None, style: str | None = None) -> boo
         ANSWERED_MENU_KEY = menu_key
         try:
             bot.add_log(
-                f"[ВОКЗАЛ] ответ на меню: {payload} | пункты сервера: "
-                f"{available_spawns()}"
+                f"[ВОКЗАЛ] ответ на меню через {pause:.1f}с: {payload} | "
+                f"пункты сервера: {available_spawns()}"
             )
         except Exception:
             pass
     return sent
+
+
+def answer_spawn_later(bot, choice: int | None = None) -> bool:
+    """Ответить на меню вокзала отложенно, в отдельном потоке.
+
+    Пауза перед ответом обязательна: мгновенный ответ на меню — самый
+    явный признак бота, и античит кикает именно за него. Но спать в
+    обработчике пакетов нельзя, иначе на паузу встанет разбор всего
+    входящего потока — это заметнее, чем сам ответ.
+
+    Возвращает True, если поток запущен.
+    """
+    import threading
+
+    if getattr(bot, "spawn_answer_busy", False):
+        return False
+    bot.spawn_answer_busy = True
+
+    def _worker():
+        try:
+            if select_spawn(bot, choice):
+                try:
+                    bot.add_log(f"[SPAWN] отправлен выбор вокзала {choice}")
+                except Exception:
+                    pass
+                watchdog = getattr(bot, "spawn_watchdog", None)
+                if watchdog is None or not getattr(watchdog, "running", False):
+                    starter = getattr(bot, "begin_spawn_watchdog", None)
+                    if starter is not None:
+                        starter()
+        except Exception as exc:
+            try:
+                bot.add_log(f"[SPAWN] ошибка ответа: {exc!r}")
+            except Exception:
+                pass
+        finally:
+            bot.spawn_answer_busy = False
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return True
 
 
 def confirm_spawn(bot) -> None:

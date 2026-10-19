@@ -333,3 +333,31 @@ class EnsureSpawnTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SpawnAnswerDelayTests(unittest.TestCase):
+    """Ответ на меню вокзала не должен уходить мгновенно.
+
+    Живой случай: меню пришло на 15.3с, ответ ушёл на 15.3с, кик античита
+    кодом 25 на 15.6с. Тот вход, где меню не пришло вовсе, прошёл спокойно.
+    """
+
+    def test_delay_is_human_like(self):
+        from logic import spawn as sp
+        for _ in range(200):
+            pause = sp.spawn_answer_delay()
+            self.assertGreaterEqual(pause, sp.SPAWN_ANSWER_DELAY[0])
+            self.assertLessEqual(pause, sp.SPAWN_ANSWER_DELAY[1])
+
+    def test_delay_is_not_constant(self):
+        """Постоянная пауза — тоже признак: живой человек не робот."""
+        from logic import spawn as sp
+        values = {round(sp.spawn_answer_delay(), 3) for _ in range(50)}
+        self.assertGreater(len(values), 10)
+
+    def test_delay_bounds_sane(self):
+        """Меньше секунды смысла нет, больше пяти — меню истечёт."""
+        from logic import spawn as sp
+        low, high = sp.SPAWN_ANSWER_DELAY
+        self.assertGreaterEqual(low, 1.0)
+        self.assertLessEqual(high, 5.0)

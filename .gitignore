@@ -41,3 +41,4 @@ _diag/
 !test_farm_probe.py
 !test_reconnect.py
 !test_ban_detect.py
+!test_menuscan.py

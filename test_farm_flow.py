@@ -194,7 +194,7 @@ class FarmMenuFlowTests(unittest.TestCase):
         state, _ = runner.step()
         self.assertEqual(state, farm_mod.S_CAPTCHA)
 
-    def test_missing_job_menu_waits_then_retries(self):
+    def test_missing_job_menu_waits_first(self):
         bot = FakeBot()
         runner, _ = make_runner(bot)
         open_main_menu(runner)
@@ -202,10 +202,29 @@ class FarmMenuFlowTests(unittest.TestCase):
         state, _ = runner.step()
         # Сразу — ждём, сервер присылает второе меню с задержкой.
         self.assertEqual(state, farm_mod.S_PICK_JOB)
+
+    def test_missing_job_menu_means_work_started(self):
+        """Нет второго меню и нет капчи — работа уже начата, идём работать.
+
+        Раньше этот случай уводил в retry и заново дёргал
+        «Начать / Закончить», выключая только что начатую работу.
+        """
+        bot = FakeBot()
+        runner, _ = make_runner(bot)
+        open_main_menu(runner)
+        runner.step()
         runner._pick_job_at = time.time() - farm_mod.MENU_WAIT - 1
         state, _ = runner.step()
-        self.assertEqual(state, farm_mod.S_RETRY)
-        self.assertNotEqual(state, farm_mod.S_FAILED)
+        self.assertEqual(state, farm_mod.S_TO_WORK)
+
+    def test_captcha_without_job_menu_goes_to_captcha(self):
+        bot = FakeBot()
+        runner, _ = make_runner(bot)
+        open_main_menu(runner)
+        runner.step()
+        runner.on_dialog(0, 3, "ПРОВЕРКА", "tdHx", "Готово", "")
+        state, _ = runner.step()
+        self.assertEqual(state, farm_mod.S_CAPTCHA)
 
     def test_expired_menu_reopens_instead_of_failing(self):
         bot = FakeBot()

@@ -488,10 +488,17 @@ class FarmRunner:
     def _step_pick_job(self):
         entry = self._take_menu(MENU_JOB_HARVESTER, MENU_JOB_HARVESTER_ALT)
         if entry is None:
+            # Сервер не обязан присылать второе меню. После «Начать работу»
+            # он может сразу открыть проверку или вообще ничего не прислать
+            # (работа уже начата). Раньше любой из этих случаев уводил в
+            # retry и заново дёргал «Начать / Закончить», то есть выключал
+            # только что начатую работу.
+            if self._fresh_dialog(CAPTCHA_TITLE, window=CAPTCHA_WAIT) is not None:
+                self.state = S_CAPTCHA
+                return "второго меню нет, но пришла проверка"
             if time.time() - self._pick_job_at > MENU_WAIT:
-                self.state = S_RETRY
-                self._retry_at = time.time() + 5.0
-                return "меню 'Выбор работы' не пришло"
+                self.state = S_TO_WORK
+                return "второго меню не было — считаю, что работа начата"
             return "жду меню 'Выбор работы'"
         index = find_item(entry["items"], MENU_JOB_HARVESTER, MENU_JOB_HARVESTER_ALT)
         if index is None:

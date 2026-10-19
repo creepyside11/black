@@ -255,6 +255,11 @@ class BotInstance:
         self._quest_helpers = None
         self.target_achieved = False
         self.last_stats_check = 0.0
+        # Когда в следующий раз спрашивать /mm. Ноль означает «ещё не
+        # назначали» — тогда первый опрос ставится на вход в игру.
+        self.stats_next_at = 0.0
+        # Разброс, чтобы десяток ботов не опрашивал статистику синхронно.
+        self._stats_jitter = 0.0
         self.stats_pending = False
         self.stats_dialog_id = None
 
@@ -266,6 +271,10 @@ class BotInstance:
 
         # Спавн: watchdog выводит бота из зоны авторизации на вокзал
         self.spawn_watchdog = None
+        # Идёт отложенный ответ на меню вокзала. Сервер присылает меню
+        # несколько раз подряд, и без этого флага на каждое заводился бы
+        # свой поток с ответом.
+        self.spawn_answer_busy = False
         self.spawned_at = None
         self.spawn_point = None
         self.spawn_report = None
@@ -600,18 +609,52 @@ class BotInstance:
 
         return True
 
+    # Через сколько после входа первый опрос /mm и как часто дальше.
+    STATS_FIRST_DELAY = (120.0, 300.0)
+    STATS_INTERVAL = (1700.0, 1900.0)
+
+    def stats_interval(self) -> float:
+        """Период опроса статистики с разбросом."""
+        import random as _random
+
+        return _random.uniform(*self.STATS_INTERVAL)
+
+    def arm_stats(self) -> None:
+        """Назначить первый опрос /mm на потом, а не на сейчас.
+
+        Зовётся при входе в игру: до выбора вокзала бот не должен ничего
+        писать в чат.
+        """
+        import random as _random
+
+        self.stats_next_at = time.time() + _random.uniform(*self.STATS_FIRST_DELAY)
+
     def _stats_tick(self, now: float) -> None:
-        """Один тик проверки статистики (вызывается общим шедулером менеджера)."""
+        """Один тик проверки статистики (вызывается общим шедулером менеджера).
+
+        Счёт идёт от `stats_next_at`, а не от «прошло ли 1800 секунд с
+        нулевого времени». Раньше `last_stats_check` был 0.0, а сравнивался
+        с epoch — условие было истинно всегда, и бот отправлял /mm на первом
+        же тике после авторизации, ещё до выбора вокзала. Свежий игрок,
+        который первым делом лезет в настройки безопасности, — это и есть
+        тот признак, за который античит кикает кодом 25.
+        """
         if self.stopping or self.is_banned:
             return
         if not (self.session and self.session.connected):
             return
         if "В игре" not in self.status:
             return
-        if now - self.last_stats_check >= 1800:
-            self.stats_pending = True
-            self.send_chat("/mm")
-            self.last_stats_check = now
+        if not self.stats_next_at:
+            # Первый тик после входа: назначаем окно, ничего не отправляем.
+            self.arm_stats()
+            return
+        if now < self.stats_next_at:
+            return
+        self.stats_pending = True
+        self.send_chat("/mm")
+        self.last_stats_check = now
+        self.stats_next_at = now + self.stats_interval()
 
     def _run(self):
         try:
@@ -1054,6 +1097,10 @@ class BotManager:
                 b.leave_queue()
                 b.status = "В игре (авторизован)"
                 b.connected_time = time.time()
+                # Новый вход — новый отсчёт до /mm. Иначе после реконнекта
+                # бот сразу лезет в статистику, едва авторизовавшись.
+                b.stats_next_at = 0.0
+                b.stats_pending = False
                 b.add_log("Подключение установлено, мир загружен")
                 if b.default_task_name and not b.active_task:
                     b.set_task(b.default_task_name)
@@ -1076,11 +1123,11 @@ class BotManager:
 
             from logic.spawn import (
                 available_spawns,
+                answer_spawn_later,
                 in_auth_zone,
                 is_spawn_menu,
                 menu_choice,
                 remember_spawn_menu,
-                select_spawn,
             )
 
             payload = data if isinstance(data, dict) else {}
@@ -1089,13 +1136,10 @@ class BotManager:
                 items = remember_spawn_menu(payload)
                 choice = menu_choice(items)
                 b.add_log(f"[SPAWN] меню вокзалов {items}, выбираем {choice}")
-                # Отвечаем прямо здесь: меню живёт несколько секунд.
-                if select_spawn(b, choice):
-                    b.add_log(f"[SPAWN] отправлен выбор вокзала {choice}")
-                    # Сторож нужен только если спавн не состоится: он сам
-                    # выждет меню-паузу и не полезет с хендшейком раньше.
-                    if b.spawn_watchdog is None or not b.spawn_watchdog.running:
-                        b.begin_spawn_watchdog()
+                # Отвечаем не в этом тике, а через человеческую паузу и в
+                # отдельном потоке: sleep здесь застопорил бы разбор пакетов,
+                # а мгновенный ответ выдаёт бота — античит кикает кодом 25.
+                answer_spawn_later(b, choice)
                 return
 
             # {'s': N} — либо приглашение, либо подтверждение выбора.
@@ -1257,6 +1301,7 @@ class BotManager:
                         else:
                             b.level_str = f"{found_lvl} lvl"
                         b.last_stats_check = time.time()
+                        b.stats_next_at = b.last_stats_check + b.stats_interval()
                         b.stats_pending = False
                         b.add_log(f"[СТАТИСТИКА] Обновлен уровень: {b.level_str}, баланс: {b.get_balance_str()}")
                         self.save_accounts()
