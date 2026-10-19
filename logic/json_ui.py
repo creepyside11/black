@@ -64,6 +64,12 @@ class JsonUI:
             emit('CaseRewardOpen', result['prize_ids'])
         elif state == 'spawn_select':
             emit('onSpawnSelect', result['json'])
+        elif state == 'dialog_menu':
+            # Меню фермы, ларька, палитры — всё приходит этим интерфейсом.
+            # Отдельное событие нужно, чтобы логика меню не путала их с
+            # SA-MP диалогами (это разные транспорты).
+            emit('onDialogMenu', result['dialog_menu_items'],
+                 result['dialog_menu_closed'], result['json'])
         elif state == 'cinematic_started':
             name = result['cinematic_name']
             emit('onCinematic', name)

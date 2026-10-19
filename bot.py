@@ -601,15 +601,20 @@ class BotInstance:
                 self.add_log(f"Критическая ошибка сессии: {e}")
                 self.schedule_reconnect(delay=10.0)
 
-    def schedule_reconnect(self, delay: float = 10.0):
+    def schedule_reconnect(self, delay: float = 10.0, force: bool = False):
         if self.stopping or self.is_banned:
             return
 
         # Кик и дисконнект на один обрыв приходят парой, плюс _run может
         # успеть следом. Флаг ставим синхронно под локом — поток мог ещё
         # не стартовать, и is_alive() тут не спасёт.
+        #
+        # force — перебить уже поставленный таймер. Нужен, когда сервер
+        # сказал «аккаунт в сети»: обычная пауза 8-20с короче, чем сервер
+        # держит призрачную сессию, и вход в неё превращается в двойную
+        # сессию. За это античит кикает с кодом 25.
         with self._sched_lock:
-            if self._reconnect_pending:
+            if self._reconnect_pending and not force:
                 return
             self._reconnect_pending = True
             self._sched_generation += 1
@@ -1328,7 +1333,7 @@ class BotManager:
                         f"[РЕКОННЕКТ] Аккаунт уже в сети. Ждём {int(wait)}с, "
                         f"пока сервер отпустит старую сессию."
                     )
-                    b.schedule_reconnect(delay=wait)
+                    b.schedule_reconnect(delay=wait, force=True)
                     return
                 # 4 = нет свободных слотов -> встаём в очередь и заходим сами
                 if reason_code == 4:

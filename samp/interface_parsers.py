@@ -7,6 +7,35 @@ class InterfaceParser:
         return {'type': 'interface_sync', 'state': 'spawn_select', 'spawn_available': list(data.get('m')) if isinstance(data.get('m'), list) else [], 'json': data}
 
     @staticmethod
+    def dialog_menu(data):
+        """Меню диалога (iid 10): список пунктов и признак закрытия.
+
+        Сервер присылает либо {"o":1,"m":[...]} при открытии, либо {"c":1}
+        при закрытии, либо {"t":...} при обновлении. Пункты бывают и
+        строками, и объектами — отдаём как есть, разбирать будет тот, кто
+        знает, что именно он открыл.
+        """
+        if not isinstance(data, dict):
+            if isinstance(data, list):
+                data = {'m': data}
+            else:
+                return None
+        items = data.get('m')
+        if isinstance(items, list):
+            items = list(items)
+        elif items is None:
+            items = []
+        else:
+            items = [items]
+        return {
+            'type': 'interface_sync',
+            'state': 'dialog_menu',
+            'dialog_menu_items': items,
+            'dialog_menu_closed': data.get('c') == 1,
+            'json': data,
+        }
+
+    @staticmethod
     def donat_menu(data: dict | list | str | int | float | bool | None) -> dict | None:
         if not isinstance(data, dict):
             return None

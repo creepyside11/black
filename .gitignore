@@ -37,3 +37,6 @@ _diag/
 !test_proxy_pool.py
 !test_proxy_integration.py
 !test_spawn_status.py
+!logic/farm_probe.py
+!test_farm_probe.py
+!test_reconnect.py

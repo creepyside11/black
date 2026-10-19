@@ -81,10 +81,20 @@ class JsonAPI:
         self._case_reward_cache = []
         return True
 
-    def SendDialogResponse(self, selected_item: str | int, next_items_count: int=0, r: int=1) -> None:
+    def SendDialogResponse(self, selected_item: str | int, next_items_count: int=0, r: int=1) -> bool:
+        """Ответ на меню iid=10. Возвращает, ушёл ли пакет.
+
+        Раньше возвращала None, и вызывающий код не мог отличить успешную
+        отправку от разрыва соединения.
+        """
         if not self.session.connected:
-            return
-        self._send_interface_packet(PacketBuilder.interface_dialog_menu_select(selected_item, next_items_count, r), packet_name='interface_dialog_menu_select')
+            return False
+        return bool(
+            self._send_interface_packet(
+                PacketBuilder.interface_dialog_menu_select(selected_item, next_items_count, r),
+                packet_name='interface_dialog_menu_select',
+            )
+        )
 
     def send_call_notification_response(self, notification_type: int=2, button: int=1) -> bool:
         if not self.session.connected:

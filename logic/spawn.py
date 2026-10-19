@@ -708,11 +708,12 @@ def menu_received_recent(window: float = 40.0) -> bool:
 
 def reset_menu() -> None:
     """Сбросить состояние меню: новый сервер — новое меню."""
-    global MENU_RECEIVED_AT, MENU_ANSWERED_AT
+    global MENU_RECEIVED_AT, MENU_ANSWERED_AT, ANSWERED_MENU_KEY
 
     SPAWN_MENU.pop("items", None)
     MENU_RECEIVED_AT = 0.0
     MENU_ANSWERED_AT = 0.0
+    ANSWERED_MENU_KEY = None
 
 
 def menu_choice(items=None) -> int:
@@ -749,9 +750,26 @@ def menu_answer_recent(window: float = 25.0) -> bool:
     return bool(MENU_ANSWERED_AT) and (time.monotonic() - MENU_ANSWERED_AT) < window
 
 
+# На какое меню мы уже ответили. Сервер присылает одно и то же меню
+# несколько раз (и сторож, и хендшейк зовут select_spawn), и раньше ответ
+# уходил по 15-18 раз за вход. Повторные ответы на одно меню — лишний шум
+# на входе, а вход античит и проверяет.
+ANSWERED_MENU_KEY = None
+
+
 def select_spawn(bot, index: int | None = None, style: str | None = None) -> bool:
-    """Ответить на меню вокзалов. Без индекса выбираем первый."""
-    global MENU_ANSWERED_AT
+    """Ответить на меню вокзалов. Без индекса выбираем первый.
+
+    На одно и то же меню отвечаем один раз. Повторный вызов с теми же
+    пунктами ничего не отправляет и возвращает True.
+    """
+    global MENU_ANSWERED_AT, ANSWERED_MENU_KEY
+
+    items = tuple(available_spawns() or [])
+    choice = menu_choice() if index is None else int(index)
+    menu_key = (items, choice)
+    if ANSWERED_MENU_KEY == menu_key:
+        return True
 
     session = getattr(bot, "session", None)
     if session is None or not _connected(bot):
@@ -767,6 +785,7 @@ def select_spawn(bot, index: int | None = None, style: str | None = None) -> boo
         return False
     if sent:
         MENU_ANSWERED_AT = time.monotonic()
+        ANSWERED_MENU_KEY = menu_key
         try:
             bot.add_log(
                 f"[ВОКЗАЛ] ответ на меню: {payload} | пункты сервера: "

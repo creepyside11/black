@@ -1,0 +1,18 @@
+{
+  "subscriptions": [
+    {
+      "url": "https://green.babay.su/AAP2f6Q_NrS_QuB5",
+      "name": "babay",
+      "added_at": 1792358745.6561825,
+      "nodes": 8
+    }
+  ],
+  "manual": [
+    {
+      "proxy": "socks5://127.0.0.1:10808",
+      "name": "HAPP локальный",
+      "added_at": 1792358670.3640776
+    }
+  ],
+  "hwid": "5bfa8336123d479287ea16482eaca71a"
+}

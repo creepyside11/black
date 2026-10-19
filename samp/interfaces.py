@@ -24,6 +24,7 @@ class InterfaceID:
 
 INTERFACE_PARSERS = {
     InterfaceID.SPAWN_SELECT: InterfaceParser.spawn_select,
+    InterfaceID.DIALOG_MENU: InterfaceParser.dialog_menu,
     InterfaceID.NOTIFICATION: InterfaceParser.notification,
     InterfaceID.DONATE_MENU: InterfaceParser.donat_menu,
     InterfaceID.CASES: InterfaceParser.cases,
@@ -59,6 +60,10 @@ def parse_json_payload(data: bytes) -> dict | None:
         value = json.loads(data[6:6 + size].decode('utf-8'), parse_constant=_reject_constant)
     except (UnicodeError, ValueError, RecursionError):
         return None
+    if isinstance(value, list):
+        # Меню иногда приходит голым массивом пунктов. Раньше такой пакет
+        # молча отбрасывался, и меню «не приходило».
+        value = {'m': value}
     if not isinstance(value, dict):
         return None
     action = 'open' if value.get('o') == 1 else 'close' if value.get('c') == 1 else 'update'

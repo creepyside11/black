@@ -100,6 +100,14 @@ def looks_like_captcha_title(title):
     return any(word in text for word in CAPTCHA_TITLES)
 
 
+def _safe_int(value):
+    """id диалога/интерфейса может прийти None — int(None) ронял шаг."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def from_dialog(dialog_id, title, info, button1="", button2=""):
     """Капча, пришедшая обычным SA-MP диалогом.
 
@@ -121,14 +129,14 @@ def from_dialog(dialog_id, title, info, button1="", button2=""):
                 KIND_PACKET_TEXT,
                 text=cleaned,
                 source=f"dialog.{field}",
-                dialog_id=int(dialog_id),
+                dialog_id=_safe_int(dialog_id),
                 raw={"title": title, "info": info, "button1": button1, "button2": button2},
             )
 
     return CaptchaChallenge(
         KIND_MANUAL,
         source="dialog.unknown",
-        dialog_id=int(dialog_id),
+        dialog_id=_safe_int(dialog_id),
         raw={"title": title, "info": info, "button1": button1, "button2": button2},
     )
 
@@ -142,14 +150,16 @@ def from_interface(interface_id, payload):
     if not isinstance(payload, dict):
         return None
 
-    for field in ("t", "i", "d", "text", "code", "captcha"):
+    # 't' НЕ проверяем: в Black Russia это тип сообщения, а не текст ответа.
+    # Раньше {'t':100} превращалось в капчу с ответом "100".
+    for field in ("i", "d", "text", "code", "captcha"):
         value = payload.get(field)
-        if looks_like_answer(value):
+        if isinstance(value, str) and looks_like_answer(value):
             return CaptchaChallenge(
                 KIND_PACKET_TEXT,
                 text=clean_text(value),
                 source=f"interface.{field}",
-                interface_id=int(interface_id),
+                interface_id=_safe_int(interface_id),
                 raw=dict(payload),
             )
 
@@ -158,7 +168,7 @@ def from_interface(interface_id, payload):
         return CaptchaChallenge(
             KIND_TEXTURE,
             source="interface.model",
-            interface_id=int(interface_id),
+            interface_id=_safe_int(interface_id),
             raw=dict(payload),
         )
 
@@ -194,14 +204,22 @@ class SolverChain:
         self.solvers.append(solver)
 
     def solve(self, challenge):
+        if challenge is None:
+            return None
+        errors = []
         for solver in self.solvers:
             try:
                 answer = solver.solve(challenge)
-            except Exception:
+            except Exception as exc:
+                errors.append(f"{getattr(solver, 'name', '?')}: {exc!r}")
                 continue
             if answer and looks_like_answer(answer):
                 challenge.solved(answer, getattr(solver, "name", solver.__class__.__name__))
                 return answer
+        if errors:
+            # Молчание решателей раньше выглядело как «капча не решена», хотя
+            # на деле они падали.
+            challenge.error = "; ".join(errors)
         return None
 
 
