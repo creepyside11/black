@@ -51,3 +51,56 @@ class FreqBanTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class AntiCheatKickTests(unittest.TestCase):
+    """Кик античита должен помечать аккаунт, а не гонять перезаходы.
+
+    Живой случай: сервер пишет «Вы были кикнуты по подозрению использования
+    постороннего ПО», а в триггерах стояло «постороннее по» — падеж не
+    совпадал, строка не ловилась. Аккаунт оставался «живым», и бот заходил
+    по кругу: кик, 18 секунд, снова кик.
+    """
+
+    BODY = (
+        "{FFFFFF}Вы были кикнуты по подозрению использования постороннего ПО\n"
+        "Если Вы были кикнуты - без причины, пожалуйста обратитесь на форум в "
+        "технический раздел.\n\nКод: {FFFF00}25{FFFFFF}\n"
+        "PacketLoss: {FFFF00}0.535947{FFFFFF}\nPing: {FFFF00}173"
+    )
+
+    def test_live_message_is_detected(self):
+        self.assertEqual(
+            botmod.anticheat_kick("{FF0000}Anti-Cheat", self.BODY), 25
+        )
+
+    def test_code_is_extracted(self):
+        body = "Вы были кикнуты по подозрению использования постороннего ПО\nКод: 2"
+        self.assertEqual(botmod.anticheat_kick("Anti-Cheat", body), 2)
+
+    def test_code_absent_is_zero(self):
+        body = "Вы были кикнуты по подозрению использования постороннего ПО"
+        self.assertEqual(botmod.anticheat_kick("Anti-Cheat", body), 0)
+
+    def test_other_titles_ignored(self):
+        self.assertIsNone(botmod.anticheat_kick("Основное меню", self.BODY))
+
+    def test_normal_dialog_ignored(self):
+        self.assertIsNone(
+            botmod.anticheat_kick(
+                "{E0584B}BLACK RUSSIA {FFFFFF}| Основное меню",
+                "#1 Информация о работах",
+            )
+        )
+
+    def test_case_insensitive(self):
+        self.assertEqual(
+            botmod.anticheat_kick("ANTI-CHEAT", "вы были КИКНУТЫ за постороннее ПО"),
+            0,
+        )
+
+    def test_title_variants(self):
+        for title in ("Anti-Cheat", "ANTI CHEAT", "anticheat", "{FF0000}Anti-Cheat"):
+            self.assertIsNotNone(
+                botmod.anticheat_kick(title, "постороннего ПО"), title
+            )

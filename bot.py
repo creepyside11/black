@@ -102,6 +102,41 @@ FREQ_BAN_NEUTRAL = (
 )
 
 
+# Диалог античита при кике.
+#
+# Сервер пишет «Вы были кикнуты по подозрению использования постороннего ПО»,
+# а в списке триггеров стояло «постороннее по» — падеж не совпадал, и строка
+# не ловилась вообще. Аккаунт не помечался баном, перезаход шёл по кругу:
+# кик, 18 секунд ожидания, снова вход, снова кик.
+#
+# Поэтому ловим по устойчивым кускам, а не по целой фразе в именительном
+# падеже: корень «посторонн» и слово «кикнут» покрывают все формулировки.
+ANTICHEAT_TITLE = re.compile(r"anti[-\s]?cheat", re.IGNORECASE)
+ANTICHEAT_BODY = re.compile(
+    r"посторонн|кикнут|kick|чит[-\s]?программ|сторонн(?:ее|его)\s+по",
+    re.IGNORECASE,
+)
+
+# Код кика из тела диалога: «Код: 25».
+ANTICHEAT_CODE = re.compile(r"код\s*[:\-]?\s*(\d{1,3})", re.IGNORECASE)
+
+
+def anticheat_kick(title: str, body: str) -> int | None:
+    """Это кик античита? Возвращает код кика или None.
+
+    Код нужен в причине бана: по нему видно, за что именно выкинуло.
+    25 — подозрение на постороннее ПО, 2 — частые входы, и так далее.
+    """
+    head = re.sub(r"\{[0-9a-fA-F]{6}\}", "", str(title or ""))
+    text = re.sub(r"\{[0-9a-fA-F]{6}\}", "", str(body or ""))
+    if not ANTICHEAT_TITLE.search(head):
+        return None
+    if not ANTICHEAT_BODY.search(text):
+        return None
+    found = ANTICHEAT_CODE.search(text)
+    return int(found.group(1)) if found else 0
+
+
 def is_freq_ban_text(text: str) -> bool:
     """Это сообщение об ограничении входа, а не обычная рассылка?
 
@@ -1347,6 +1382,18 @@ class BotManager:
                     re.compile(r"\bбот(?:ы|а|ов|ом|е)?\b", re.IGNORECASE),
                     re.compile(r"\bчит(?:ы|ов|ами|ер)?\b", re.IGNORECASE),
                 ]
+                # Кик античита — отдельный случай: это не бан аккаунта на
+                # сервере, а запрет заходить с этого клиента. Перезаход тут
+                # бесполезен и только усугубляет, поэтому помечаем аккаунт
+                # и останавливаем его.
+                kick_code = anticheat_kick(title, clean_info)
+                if kick_code is not None:
+                    b.add_log(
+                        f"[АНТИЧИТ] кик кодом {kick_code}: {clean_info[:80]}"
+                    )
+                    self.mark_bot_banned(b, reason=f"Античит, код {kick_code}")
+                    return
+
                 # Исключаем временный бан за частые входы из перманентного бана
                 is_freq_ban = is_freq_ban_text(dialog_text)
                 if is_freq_ban:

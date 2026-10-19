@@ -42,3 +42,4 @@ _diag/
 !test_reconnect.py
 !test_ban_detect.py
 !test_menuscan.py
+!test_button_style.py

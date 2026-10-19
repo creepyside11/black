@@ -130,34 +130,34 @@ class TelegramBotController:
         nav_buttons = []
         if page > 1:
             if page > 3:
-                nav_buttons.append(types.InlineKeyboardButton("⏪ -3", callback_data=f"page:{max(1, page-3)}"))
-            nav_buttons.append(types.InlineKeyboardButton("⬅️", callback_data=f"page:{page-1}"))
+                nav_buttons.append(types.InlineKeyboardButton("⏪ -3", callback_data=f"page:{max(1, page-3)}", style="primary"))
+            nav_buttons.append(types.InlineKeyboardButton("⬅️", callback_data=f"page:{page-1}", style="primary"))
 
-        nav_buttons.append(types.InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data=f"refresh:{page}"))
+        nav_buttons.append(types.InlineKeyboardButton(f"📄 {page}/{total_pages}", callback_data=f"refresh:{page}", style="primary"))
 
         if page < total_pages:
-            nav_buttons.append(types.InlineKeyboardButton("➡️", callback_data=f"page:{page+1}"))
+            nav_buttons.append(types.InlineKeyboardButton("➡️", callback_data=f"page:{page+1}", style="primary"))
             if page + 3 <= total_pages:
-                nav_buttons.append(types.InlineKeyboardButton("+3 ⏩", callback_data=f"page:{min(total_pages, page+3)}"))
+                nav_buttons.append(types.InlineKeyboardButton("+3 ⏩", callback_data=f"page:{min(total_pages, page+3)}", style="primary"))
 
         markup.row(*nav_buttons)
 
         # Быстрые глобальные действия
         markup.row(
-            types.InlineKeyboardButton("▶️ Запустить выбранных", callback_data=f"act_start_some:{page}"),
-            types.InlineKeyboardButton("▶️ Всех", callback_data="act_startall"),
-            types.InlineKeyboardButton("⏹ Всех", callback_data="act_stopall")
+            types.InlineKeyboardButton("▶️ Запустить выбранных", callback_data=f"act_start_some:{page}", style="success"),
+            types.InlineKeyboardButton("▶️ Всех", callback_data="act_startall", style="success"),
+            types.InlineKeyboardButton("⏹ Всех", callback_data="act_stopall", style="danger")
         )
         markup.row(
-            types.InlineKeyboardButton("🧠 ИИ Командир", callback_data="ai_menu"),
-            types.InlineKeyboardButton("🛡 Проверить баны", callback_data="act_check_bans")
+            types.InlineKeyboardButton("🧠 ИИ Командир", callback_data="ai_menu", style="primary"),
+            types.InlineKeyboardButton("🛡 Проверить баны", callback_data="act_check_bans", style="primary")
         )
         markup.row(
-            types.InlineKeyboardButton("➕ Массовое создание", callback_data="act_batch"),
-            types.InlineKeyboardButton("🌐 Прокси и VPN", callback_data="vpn_menu")
+            types.InlineKeyboardButton("➕ Массовое создание", callback_data="act_batch", style="success"),
+            types.InlineKeyboardButton("🌐 Прокси и VPN", callback_data="vpn_menu", style="primary")
         )
         markup.row(
-            types.InlineKeyboardButton("🔄 Обновить список", callback_data=f"page:{page}")
+            types.InlineKeyboardButton("🔄 Обновить список", callback_data=f"page:{page}", style="primary")
         )
         return markup, total_bots, total_pages
 
@@ -210,17 +210,12 @@ class TelegramBotController:
             text = "\n".join(lines)
 
             if summary["usable"]:
-                markup.add(types.InlineKeyboardButton(
-                    "⚡️ Раздать рабочие всем ботам", callback_data="vpn_apply_all"))
-            markup.add(types.InlineKeyboardButton(
-                "🔄 Проверить сейчас", callback_data="vpn_refresh"))
+                markup.add(types.InlineKeyboardButton("⚡️ Раздать рабочие всем ботам", callback_data="vpn_apply_all", style="success"))
+            markup.add(types.InlineKeyboardButton("🔄 Проверить сейчас", callback_data="vpn_refresh", style="success"))
 
-        markup.add(types.InlineKeyboardButton(
-            "🔗 Добавить VPN-подписку", callback_data="vpn_add_sub"))
-        markup.add(types.InlineKeyboardButton(
-            "🔌 Добавить локальный прокси", callback_data="vpn_add_local"))
-        markup.add(types.InlineKeyboardButton(
-            "⬅️ Назад в меню", callback_data="page:1"))
+        markup.add(types.InlineKeyboardButton("🔗 Добавить VPN-подписку", callback_data="vpn_add_sub", style="success"))
+        markup.add(types.InlineKeyboardButton("🔌 Добавить локальный прокси", callback_data="vpn_add_local", style="success"))
+        markup.add(types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="page:1", style="primary"))
 
         if message_id is None:
             self.bot.send_message(chat_id, text, reply_markup=markup)
@@ -392,24 +387,24 @@ class TelegramBotController:
                         style="success",
                     )
 
-                markup.row(btn_start_stop, types.InlineKeyboardButton("📜 Логи", callback_data=f"bot_logs:{bid}:{page}"))
+                markup.row(btn_start_stop, types.InlineKeyboardButton("📜 Логи", callback_data=f"bot_logs:{bid}:{page}", style="primary"))
                 markup.row(
-                    types.InlineKeyboardButton("🔄 Обновить статы (/mm)", callback_data=f"bot_check_stats:{bid}:{page}"),
-                    types.InlineKeyboardButton("🎯 Задать задачу", callback_data=f"bot_tasks:{bid}:{page}")
+                    types.InlineKeyboardButton("🔄 Обновить статы (/mm)", callback_data=f"bot_check_stats:{bid}:{page}", style="success"),
+                    types.InlineKeyboardButton("🎯 Задать задачу", callback_data=f"bot_tasks:{bid}:{page}", style="primary")
                 )
                 markup.row(
-                    types.InlineKeyboardButton("🏆 Задать цель (LVL)", callback_data=f"bot_set_goal:{bid}:{page}"),
-                    types.InlineKeyboardButton("💬 Чат / Команда", callback_data=f"bot_chat:{bid}:{page}")
+                    types.InlineKeyboardButton("🏆 Задать цель (LVL)", callback_data=f"bot_set_goal:{bid}:{page}", style="primary"),
+                    types.InlineKeyboardButton("💬 Чат / Команда", callback_data=f"bot_chat:{bid}:{page}", style="primary")
                 )
                 markup.row(
-                    types.InlineKeyboardButton("🌐 Прокси", callback_data=f"bot_proxy_menu:{bid}:{page}"),
-                    types.InlineKeyboardButton("❌ Удалить бота", callback_data=f"bot_del:{bid}:{page}")
+                    types.InlineKeyboardButton("🌐 Прокси", callback_data=f"bot_proxy_menu:{bid}:{page}", style="primary"),
+                    types.InlineKeyboardButton("❌ Удалить бота", callback_data=f"bot_del:{bid}:{page}", style="danger")
                 )
 
                 if b.is_banned:
-                    markup.row(types.InlineKeyboardButton("🔓 Снять бан", callback_data=f"bot_unban:{bid}:{page}"))
+                    markup.row(types.InlineKeyboardButton("🔓 Снять бан", callback_data=f"bot_unban:{bid}:{page}", style="success"))
 
-                markup.row(types.InlineKeyboardButton("⬅️ Назад к списку", callback_data=f"page:{page}"))
+                markup.row(types.InlineKeyboardButton("⬅️ Назад к списку", callback_data=f"page:{page}", style="primary"))
 
                 try:
                     self.bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=markup)
@@ -523,8 +518,8 @@ class TelegramBotController:
                 text = f"<b>📜 Последние логи #{b.bot_id} [{b.nickname}]:</b>\n\n<code>{log_text}</code>"
                 markup = types.InlineKeyboardMarkup(row_width=2)
                 markup.row(
-                    types.InlineKeyboardButton("🔄 Обновить логи", callback_data=f"bot_logs:{bid}:{page}"),
-                    types.InlineKeyboardButton("⬅️ Назад к боту", callback_data=f"bot_view:{bid}:{page}")
+                    types.InlineKeyboardButton("🔄 Обновить логи", callback_data=f"bot_logs:{bid}:{page}", style="primary"),
+                    types.InlineKeyboardButton("⬅️ Назад к боту", callback_data=f"bot_view:{bid}:{page}", style="primary")
                 )
                 try:
                     self.bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=markup)
@@ -538,18 +533,18 @@ class TelegramBotController:
                 page = int(page_s)
                 markup = types.InlineKeyboardMarkup(row_width=2)
                 markup.row(
-                    types.InlineKeyboardButton("Качать LVL (АФК)", callback_data=f"set_task:{bid}:{page}:lvl"),
-                    types.InlineKeyboardButton("Квесты", callback_data=f"set_task:{bid}:{page}:quest")
+                    types.InlineKeyboardButton("Качать LVL (АФК)", callback_data=f"set_task:{bid}:{page}:lvl", style="success"),
+                    types.InlineKeyboardButton("Квесты", callback_data=f"set_task:{bid}:{page}:quest", style="success")
                 )
                 markup.row(
-                    types.InlineKeyboardButton("Шахта (Miner)", callback_data=f"set_task:{bid}:{page}:mine"),
-                    types.InlineKeyboardButton("Завод (Factory)", callback_data=f"set_task:{bid}:{page}:factory")
+                    types.InlineKeyboardButton("Шахта (Miner)", callback_data=f"set_task:{bid}:{page}:mine", style="success"),
+                    types.InlineKeyboardButton("Завод (Factory)", callback_data=f"set_task:{bid}:{page}:factory", style="success")
                 )
                 markup.row(
-                    types.InlineKeyboardButton("Автобусник", callback_data=f"set_task:{bid}:{page}:bus"),
-                    types.InlineKeyboardButton("⏹ Снять задачу", callback_data=f"set_task:{bid}:{page}:stop")
+                    types.InlineKeyboardButton("Автобусник", callback_data=f"set_task:{bid}:{page}:bus", style="success"),
+                    types.InlineKeyboardButton("⏹ Снять задачу", callback_data=f"set_task:{bid}:{page}:stop", style="danger")
                 )
-                markup.row(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"bot_view:{bid}:{page}"))
+                markup.row(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"bot_view:{bid}:{page}", style="primary"))
                 self.bot.edit_message_text(f"Выберите задачу для бота #{bid}:", chat_id=chat_id, message_id=message_id, reply_markup=markup)
                 self.bot.answer_callback_query(call.id)
 
@@ -594,7 +589,7 @@ class TelegramBotController:
                 markup = types.InlineKeyboardMarkup(row_width=1)
                 saved_proxies = load_proxy_list()
                 for name, px_val in saved_proxies[:6]:
-                    markup.add(types.InlineKeyboardButton(f"⚡️ {name}", callback_data=f"apply_px:{bid}:{page}:{name}"))
+                    markup.add(types.InlineKeyboardButton(f"⚡️ {name}", callback_data=f"apply_px:{bid}:{page}:{name}", style="success"))
 
                 # Узлы из пула: зелёные рабочие, жёлтые живые без клиента,
                 # красные мёртвые. Нажать можно только зелёный.
@@ -614,19 +609,22 @@ class TelegramBotController:
                             markup.add(types.InlineKeyboardButton(
                                 label,
                                 callback_data=f"pool_px:{bid}:{page}:{node.key}",
+                                style="success",
                             ))
                         else:
                             markup.add(types.InlineKeyboardButton(
                                 f"{label} (нужен клиент)",
                                 callback_data=f"pool_dead:{bid}:{page}",
+                                style="danger",
                             ))
                     markup.add(types.InlineKeyboardButton(
-                        "🔄 Проверить прокси", callback_data=f"pool_refresh:{bid}:{page}"
+                        "🔄 Проверить прокси", callback_data=f"pool_refresh:{bid}:{page}",
+                        style="success",
                     ))
 
-                markup.add(types.InlineKeyboardButton("✏️ Ввести прокси вручную", callback_data=f"bot_proxy_custom:{bid}:{page}"))
-                markup.add(types.InlineKeyboardButton("🚫 Сбросить прокси (Свой IP)", callback_data=f"bot_proxy_reset:{bid}:{page}"))
-                markup.add(types.InlineKeyboardButton("⬅️ Назад к боту", callback_data=f"bot_view:{bid}:{page}"))
+                markup.add(types.InlineKeyboardButton("✏️ Ввести прокси вручную", callback_data=f"bot_proxy_custom:{bid}:{page}", style="primary"))
+                markup.add(types.InlineKeyboardButton("🚫 Сбросить прокси (Свой IP)", callback_data=f"bot_proxy_reset:{bid}:{page}", style="danger"))
+                markup.add(types.InlineKeyboardButton("⬅️ Назад к боту", callback_data=f"bot_view:{bid}:{page}", style="primary"))
 
                 try:
                     self.bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=markup)
@@ -733,11 +731,11 @@ class TelegramBotController:
                 )
 
                 markup = types.InlineKeyboardMarkup(row_width=1)
-                markup.add(types.InlineKeyboardButton("💬 Дать задачу ИИ (текстом)", callback_data="ai_prompt_task"))
-                markup.add(types.InlineKeyboardButton("🌐 Изменить Base URL", callback_data="ai_change_base_url"))
-                markup.add(types.InlineKeyboardButton("🔑 Изменить API Token", callback_data="ai_change_api_key"))
-                markup.add(types.InlineKeyboardButton("🤖 Изменить ID Модели", callback_data="ai_change_model"))
-                markup.add(types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="page:1"))
+                markup.add(types.InlineKeyboardButton("💬 Дать задачу ИИ (текстом)", callback_data="ai_prompt_task", style="primary"))
+                markup.add(types.InlineKeyboardButton("🌐 Изменить Base URL", callback_data="ai_change_base_url", style="primary"))
+                markup.add(types.InlineKeyboardButton("🔑 Изменить API Token", callback_data="ai_change_api_key", style="primary"))
+                markup.add(types.InlineKeyboardButton("🤖 Изменить ID Модели", callback_data="ai_change_model", style="primary"))
+                markup.add(types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="page:1", style="primary"))
 
                 try:
                     self.bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=markup)
@@ -793,7 +791,7 @@ class TelegramBotController:
                         report += f"\n<i>...и еще {banned_count - 25} аккаунтов</i>"
 
                 markup = types.InlineKeyboardMarkup(row_width=1)
-                markup.add(types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="page:1"))
+                markup.add(types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="page:1", style="primary"))
                 try:
                     self.bot.edit_message_text(report, chat_id=chat_id, message_id=message_id, reply_markup=markup)
                 except Exception:
