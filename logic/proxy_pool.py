@@ -20,6 +20,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import threading
@@ -382,12 +383,50 @@ class ProxyPool:
             self.log(f"[ПРОКСИ] проверка упала: {exc}")
             return []
 
+        # Узлы, которым нужен внешний клиент, проверяются только через мост.
+        # Раньше это делал check_node, но плановая проверка идёт пачкой и
+        # check_node обходила — то есть весь путь через мост в бою не
+        # работал, и подписка оставалась жёлтой при живом sing-box.
+        results = self._probe_needs_client(results)
+
         with self._lock:
             self.results = {res.node.key: res for res in results}
             self.last_refresh = self._clock()
             self.last_error = ""
         self._report(results)
         return results
+
+    def _probe_needs_client(self, results: list[ProbeResult]) -> list[ProbeResult]:
+        """Догнать узлы «нужен клиент» проверкой через мост.
+
+        Параллельно: каждый мост поднимается до 8 секунд, а узлов в
+        подписке полсотни — последовательно это минуты на цикл.
+        """
+        bridge = self.bridge
+        if bridge is None or not getattr(bridge, "available", lambda: False)():
+            return results
+
+        pending = [r for r in results if r.status == STATUS_NEEDS_CLIENT]
+        if not pending:
+            return results
+
+        done: dict[str, ProbeResult] = {}
+        workers = max(1, min(6, len(pending)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(self._probe_via_bridge, res.node, res): res.node.key
+                for res in pending
+            }
+            for future in concurrent.futures.as_completed(futures):
+                key = futures[future]
+                try:
+                    done[key] = future.result()
+                except Exception as exc:
+                    self.log(f"[ПРОКСИ] мост упал на {key[:40]}: {exc}")
+
+        if not done:
+            return results
+        return [done.get(res.node.key, res) for res in results]
 
     def _report(self, results: list[ProbeResult]) -> None:
         alive = [r for r in results if r.alive]

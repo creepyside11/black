@@ -291,3 +291,100 @@ class NodeKeyTests(unittest.TestCase):
         """Поиск по адресу не должен сломаться из-за UUID в ключе."""
         node = self._node("11111111-1111-1111-1111-111111111111")
         self.assertIn("site.babay.su", node.key)
+
+
+class RefreshBridgeTests(unittest.TestCase):
+    """Плановая проверка обязана доводить узлы до моста.
+
+    refresh() гонял пробник одной пачкой и check_node не вызывал — весь
+    путь через мост существовал только на бумаге. С установленным
+    sing-box подписка всё равно оставалась жёлтой.
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        self._tmp.close()
+        self.path = self._tmp.name
+
+    def tearDown(self):
+        import os
+        for suffix in ("", ".bak", ".tmp"):
+            try:
+                os.unlink(self.path + suffix)
+            except OSError:
+                pass
+
+    def _pool(self, nodes, bridge):
+        pool = P.ProxyPool(self.path, loader=lambda u, **k: [], log=lambda _m: None)
+        pool.bridge = bridge
+        # nodes() собирает из кэша подписок, а не из поля _nodes.
+        pool._cached_nodes = list(nodes)
+        return pool
+
+    def _node(self, name, uuid):
+        return VpnNode(name=name, protocol="vless", address="%s.example.com" % name,
+                       port=443, security="reality", login=uuid,
+                       raw='{"outbounds":[{"server":"%s"}]}' % name)
+
+    def test_needs_client_nodes_go_through_bridge(self):
+        node = self._node("de", "u1")
+
+        class Bridge:
+            def available(self):
+                return True
+
+            def start(self, key, link):
+                return "socks5://127.0.0.1:20001"
+
+            def port_of(self, key):
+                return 20001
+
+        pool = self._pool([node], Bridge())
+        # Пробник: до моста узел «живой без клиента», после — рабочий.
+        def prober(nodes, **kwargs):
+            out = []
+            for n in nodes:
+                r = ProbeResult(node=n, alive=True, usable=n.port == 20001)
+                r.status = STATUS_OK if r.usable else STATUS_NEEDS_CLIENT
+                out.append(r)
+            return out
+
+        pool._prober = prober
+        results = pool.refresh(fetch=False)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].status, STATUS_OK)
+        self.assertEqual(results[0].socks_url, "socks5://127.0.0.1:20001")
+
+    def test_no_bridge_leaves_them_needs_client(self):
+        node = self._node("de", "u1")
+        pool = self._pool([node], None)
+        pool._prober = lambda nodes, **k: [
+            ProbeResult(node=n, alive=True, usable=False, status=STATUS_NEEDS_CLIENT)
+            for n in nodes
+        ]
+        results = pool.refresh(fetch=False)
+        self.assertEqual(results[0].status, STATUS_NEEDS_CLIENT)
+
+    def test_dead_nodes_are_not_probed_via_bridge(self):
+        node = self._node("de", "u1")
+        started = []
+
+        class Bridge:
+            def available(self):
+                return True
+
+            def start(self, key, link):
+                started.append(key)
+                return "socks5://127.0.0.1:20002"
+
+            def port_of(self, key):
+                return 20002
+
+        pool = self._pool([node], Bridge())
+        pool._prober = lambda nodes, **k: [
+            ProbeResult(node=n, alive=False, usable=False, status=STATUS_DEAD)
+            for n in nodes
+        ]
+        pool.refresh(fetch=False)
+        self.assertEqual(started, [], "мёртвый узел незачем поднимать мостом")
