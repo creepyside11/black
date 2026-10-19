@@ -6,6 +6,7 @@
 
 import math
 import time
+import unittest
 
 from logic.delta_teleport import (
     DeltaTeleport,
@@ -60,9 +61,16 @@ class Recorder:
 
 
 def check(name, condition, detail=""):
-    status = "OK  " if condition else "FAIL"
-    print(f"[{status}] {name}" + (f" | {detail}" if detail else ""))
-    return bool(condition)
+    """Проверка с падением на месте.
+
+    Раньше функция печатала FAIL и возвращала False, а итог считался
+    флагом. Под unittest это означало, что упавший случай всё равно
+    проходил тест — поэтому здесь сразу исключение.
+    """
+    if not condition:
+        raise AssertionError(f"{name}" + (f" | {detail}" if detail else ""))
+    print(f"[OK  ] {name}" + (f" | {detail}" if detail else ""))
+    return True
 
 
 def run_case(name, start, target, step, interval, velocity_mode="consistent", jitter=0.0):
@@ -208,5 +216,10 @@ def main():
     return 0 if ok else 1
 
 
+class DeltaTeleportTests(unittest.TestCase):
+    def test_all_cases(self):
+        self.assertEqual(main(), 0)
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    unittest.main(verbosity=2)

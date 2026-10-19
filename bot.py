@@ -904,6 +904,22 @@ class BotManager:
         logger.set_log_interceptor(self._handle_global_log)
         self._setup_event_hooks()
 
+        # Путь к реестру — поле экземпляра, а не глобальная константа.
+        # Иначе тест, подменивший bot.ACCOUNTS_FILE на время, оставлял после
+        # себя живые фоновые нити, которые дописывали файл уже после снятия
+        # подмены — и стирали настоящий accounts.json двумя тестовыми ботами.
+        # Переменная читается здесь, а не при импорте модуля: иначе тест не
+        # может подставить свой файл, и менеджер успевает загрузить боевой
+        # реестр до подмены.
+        self.accounts_file = os.environ.get("BR_ACCOUNTS_FILE") or ACCOUNTS_FILE
+        # Предохранитель: под unittest настоящий реестр не трогаем никогда,
+        # даже если тест забыл подставить свой путь.
+        if os.environ.get("BR_TEST_MODE") and self.accounts_file == ACCOUNTS_FILE:
+            self.accounts_file = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "accounts.test.json",
+            )
+
         # Пул прокси: подписки, ручные прокси и их проверка по таймеру.
         # Проверка идёт в фоне раз в 5 минут, чтобы к моменту запуска бота
         # уже было известно, какой прокси живой.
@@ -919,6 +935,16 @@ class BotManager:
         except Exception as exc:
             self.proxy_pool = None
             print(f"[-] Пул прокси не поднялся: {exc}")
+
+        # Настройки: базовый пароль для новых аккаунтов и задача по
+        # умолчанию. Нужны до load_accounts и до любой регистрации.
+        try:
+            from logic.settings import get_settings
+
+            self.settings = get_settings(log=lambda msg: print(msg, flush=True))
+        except Exception as exc:
+            self.settings = None
+            print(f"[-] Настройки не поднялись: {exc}")
 
         # Загружаем сохраненные аккаунты из accounts.json
         self.load_accounts()
@@ -1080,13 +1106,21 @@ class BotManager:
             def _create_replacement():
                 time.sleep(random.uniform(5.0, 10.0))
                 print(f"[*] Создаем новый аккаунт взамен забаненного бота на сервере {bot.server_name}...")
+                # Пароль берём базовый из настроек: он одинаков для всех
+                # новых аккаунтов, и в реестре не плодятся разные пароли.
+                # Если настройки пусты — пароль забаненного.
+                settings = getattr(self, "settings", None)
+                pwd = settings.password_or(bot.password) if settings else bot.password
+                task = bot.default_task_name
+                if not task and settings is not None:
+                    task = settings.default_task
                 new_bot = self.add_bot(
                     target_server=bot.server_name,
                     nickname=None,  # None -> сгенерировать реалистичный ник
-                    password=bot.password,
+                    password=pwd,
                     auto_regen_nick=True,
                     proxy=bot.proxy,
-                    default_task=bot.default_task_name,
+                    default_task=task,
                 )
                 if new_bot:
                     notice = (
@@ -1568,11 +1602,11 @@ class BotManager:
                 b.active_task.on_rewards(rewards)
 
     def load_accounts(self):
-        if not os.path.exists(ACCOUNTS_FILE):
+        if not os.path.exists(self.accounts_file):
             return
 
         try:
-            with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+            with open(self.accounts_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if not isinstance(data, list):
                 return
@@ -1663,7 +1697,7 @@ class BotManager:
                 loaded_count += 1
 
             if loaded_count > 0:
-                print(f"[+] Загружено {loaded_count} сохраненных аккаунтов из {os.path.basename(ACCOUNTS_FILE)}")
+                print(f"[+] Загружено {loaded_count} сохраненных аккаунтов из {os.path.basename(self.accounts_file)}")
             if skipped_dupes:
                 print(
                     f"[!] Пропущено {skipped_dupes} повторных записей одного и того же "
@@ -1672,7 +1706,7 @@ class BotManager:
             if skipped_bad:
                 print(f"[!] Пропущено {skipped_bad} битых записей в accounts.json")
         except Exception as e:
-            print(f"[!] Ошибка загрузки {ACCOUNTS_FILE}: {e}")
+            print(f"[!] Ошибка загрузки {self.accounts_file}: {e}")
         finally:
             self._rebuild_nick_index()
 
@@ -1727,20 +1761,21 @@ class BotManager:
         Теперь запись идёт через временный файл и подмену, а предыдущая
         версия остаётся в accounts.json.bak.
         """
-        tmp = ACCOUNTS_FILE + ".tmp"
+        path = getattr(self, "accounts_file", ACCOUNTS_FILE)
+        tmp = path + ".tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
                 f.flush()
                 os.fsync(f.fileno())
-            if os.path.exists(ACCOUNTS_FILE):
+            if os.path.exists(path):
                 try:
-                    shutil.copyfile(ACCOUNTS_FILE, ACCOUNTS_FILE + ".bak")
+                    shutil.copyfile(path, path + ".bak")
                 except OSError:
                     pass
-            os.replace(tmp, ACCOUNTS_FILE)
+            os.replace(tmp, path)
         except Exception as e:
-            print(f"[!] Ошибка сохранения {ACCOUNTS_FILE}: {e}")
+            print(f"[!] Ошибка сохранения {path}: {e}")
             try:
                 if os.path.exists(tmp):
                     os.unlink(tmp)
@@ -1770,9 +1805,25 @@ class BotManager:
         default_task: str = "lvl",
         proxy: str = "",
     ) -> BotInstance | None:
-        if not password or not password.strip():
-            print("[-] Ошибка: Пароль обязателен для каждого аккаунта!")
-            return None
+        # Ник может прийти None — так его передаёт автозамена забаненного
+        # аккаунта, рассчитывая на генерацию. Раньше генерации не было, и в
+        # accounts.json уезжало "nickname": null: запись есть, а бота за ней
+        # нет, и загрузить её потом нельзя. Генерируем здесь же.
+        if nickname is None or not str(nickname).strip():
+            nickname = self.generate_random_nickname()
+            print(f"[*] Ник не задан — сгенерирован: {nickname}")
+        else:
+            nickname = str(nickname).strip()
+
+        if not password or not str(password).strip():
+            # Пароль по умолчанию из настроек: без него аккаунт не создать,
+            # а при автозамене и массовой регистрации спрашивать его каждый
+            # раз незачем.
+            settings = getattr(self, "settings", None)
+            password = settings.password_or() if settings is not None else ""
+            if not password:
+                print("[-] Ошибка: Пароль обязателен для каждого аккаунта!")
+                return None
 
         # Ключ из пула («HAPP») превращаем в socks5://... до создания бота,
         # иначе в accounts.json уедет имя вместо адреса.
@@ -1931,8 +1982,12 @@ class BotManager:
         proxies: list[str] | None = None,
     ):
         if not password or not password.strip():
-            print("[-] Ошибка: Пароль обязателен для создания ботов!")
-            return []
+            settings = getattr(self, "settings", None)
+            password = settings.password_or() if settings else ""
+            if not password:
+                print("[-] Ошибка: Пароль обязателен для создания ботов!")
+                return []
+            print(f"[*] Пароль не задан — беру базовый из настроек")
 
         password = password.strip()
         created = []

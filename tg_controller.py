@@ -53,6 +53,10 @@ class TelegramBotController:
         self.active_chats = set(self.admin_ids)
         self.thread = None
         self.running = False
+        # Живые окна: (chat_id, message_id) -> что показываем и как выглядело.
+        self._live_views = {}
+        self._views_lock = threading.RLock()
+        self._live_thread = None
         self._setup_handlers()
 
     @staticmethod
@@ -185,9 +189,475 @@ class TelegramBotController:
             types.InlineKeyboardButton("🌐 Прокси и VPN", callback_data="vpn_menu", style="primary")
         )
         markup.row(
+            types.InlineKeyboardButton("⚙️ Настройки", callback_data="settings_menu", style="primary")
+        )
+        markup.row(
             types.InlineKeyboardButton("🔄 Обновить список", callback_data=f"page:{page}", style="primary")
         )
         return markup, total_bots, total_pages
+
+    # ---------- настройки ----------
+
+    def _render_settings(self, chat_id, message_id=None, callback_id=None):
+        settings = getattr(self.manager, "settings", None)
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        if settings is None:
+            text = "<b>⚙️ Настройки</b>\n\n<i>Хранилище настроек не поднялось.</i>"
+        else:
+            pwd = settings.base_password or "<i>не задан</i>"
+            text = (
+                f"<b>⚙️ Настройки бота</b>\n\n"
+                f"🔑 Базовый пароль: <code>{pwd}</code>\n"
+                f"<i>Его получают все новые аккаунты: при массовой регистрации "
+                f"и при автозамене забаненных.</i>\n\n"
+                f"🎯 Задача по умолчанию: <code>{settings.default_task}</code>\n"
+                f"📦 Лимит партии: <b>{settings.batch_limit}</b>"
+            )
+            markup.add(types.InlineKeyboardButton(
+                "🔑 Изменить базовый пароль",
+                callback_data="set_base_password", style="success"))
+            markup.add(types.InlineKeyboardButton(
+                f"🎯 Задача по умолчанию: {settings.default_task}",
+                callback_data="set_default_task", style="primary"))
+            markup.add(types.InlineKeyboardButton(
+                f"📦 Лимит партии: {settings.batch_limit}",
+                callback_data="set_batch_limit", style="primary"))
+        markup.add(types.InlineKeyboardButton(
+            "⬅️ Назад в меню", callback_data="page:1", style="primary"))
+
+        if message_id is None:
+            self.bot.send_message(chat_id, text, reply_markup=markup)
+        else:
+            try:
+                self.bot.edit_message_text(
+                    text, chat_id=chat_id, message_id=message_id, reply_markup=markup)
+            except Exception:
+                self.bot.send_message(chat_id, text, reply_markup=markup)
+        if callback_id:
+            try:
+                self.bot.answer_callback_query(callback_id)
+            except Exception:
+                pass
+
+    # ---------- мастер массовой регистрации ----------
+    #
+    # Раньше всё вводилось одной строкой: «TVER 5 пароль lvl». С телефона
+    # это мучение — надо помнить порядок, знать точное имя сервера и не
+    # ошибиться в пароле. Теперь шаги: сервер (кнопками, с пагинацией) ->
+    # количество -> пароль -> задача.
+
+    SERVERS_PER_PAGE = 12
+
+    def _batch_servers(self):
+        try:
+            import br_servers
+
+            items = br_servers.get_servers()
+        except Exception:
+            return []
+        result = []
+        for srv in items:
+            name = (srv.get("firstname") or srv.get("name") or "").strip()
+            if not name:
+                continue
+            try:
+                online = int(srv.get("online") or 0)
+                maxonline = int(srv.get("maxonline") or 0)
+            except (TypeError, ValueError):
+                online = maxonline = 0
+            result.append((name.upper(), online, maxonline))
+        return result
+
+    def _render_batch_servers(self, chat_id, page=1, message_id=None, callback_id=None):
+        servers = self._batch_servers()
+        per = self.SERVERS_PER_PAGE
+        total_pages = max(1, math.ceil(len(servers) / per))
+        page = max(1, min(int(page), total_pages))
+        start = (page - 1) * per
+        chunk = servers[start:start + per]
+
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        buttons = []
+        for name, online, maxonline in chunk:
+            # Цвет по загруженности: свободно — зелёная, полный — красная.
+            if maxonline and online >= maxonline * 0.95:
+                style, mark = "danger", "🔴"
+            elif maxonline and online >= maxonline * 0.75:
+                style, mark = "primary", "🟡"
+            else:
+                style, mark = "success", "🟢"
+            load = f"{online}/{maxonline}" if maxonline else "?"
+            buttons.append(types.InlineKeyboardButton(
+                f"{mark} {name} · {load}",
+                callback_data=f"batch_srv:{name}",
+                style=style,
+            ))
+        for i in range(0, len(buttons), 2):
+            if i + 1 < len(buttons):
+                markup.row(buttons[i], buttons[i + 1])
+            else:
+                markup.row(buttons[i])
+
+        nav = []
+        if page > 1:
+            nav.append(types.InlineKeyboardButton(
+                "⬅️", callback_data=f"batch_page:{page - 1}", style="primary"))
+        nav.append(types.InlineKeyboardButton(
+            f"📄 {page}/{total_pages}", callback_data=f"batch_page:{page}", style="primary"))
+        if page < total_pages:
+            nav.append(types.InlineKeyboardButton(
+                "➡️", callback_data=f"batch_page:{page + 1}", style="primary"))
+        markup.row(*nav)
+        markup.row(types.InlineKeyboardButton(
+            "✖️ Отмена", callback_data="batch_cancel", style="danger"))
+
+        text = (
+            f"<b>➕ Массовая регистрация — шаг 1 из 4</b>\n\n"
+            f"Выбери сервер. Всего серверов: <b>{len(servers)}</b>, "
+            f"страница <b>{page}</b> из <b>{total_pages}</b>.\n\n"
+            f"🟢 свободно · 🟡 загружен · 🔴 почти полный"
+        )
+        if message_id is None:
+            self.bot.send_message(chat_id, text, reply_markup=markup)
+        else:
+            try:
+                self.bot.edit_message_text(
+                    text, chat_id=chat_id, message_id=message_id, reply_markup=markup)
+            except Exception:
+                self.bot.send_message(chat_id, text, reply_markup=markup)
+        if callback_id:
+            try:
+                self.bot.answer_callback_query(callback_id)
+            except Exception:
+                pass
+
+    def _ask_batch_count(self, chat_id, server):
+        settings = getattr(self.manager, "settings", None)
+        limit = settings.batch_limit if settings else 50
+        self.user_states[chat_id] = {
+            "action": "batch_count",
+            "server": server,
+            "message_id": None,
+        }
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(types.InlineKeyboardButton(
+            "✖️ Отмена", callback_data="batch_cancel", style="danger"))
+        sent = self.bot.send_message(
+            chat_id,
+            f"<b>➕ Массовая регистрация — шаг 2 из 4</b>\n\n"
+            f"Сервер: <b>{server}</b>\n\n"
+            f"Сколько аккаунтов создать? Пришли числом от 1 до {limit}.\n"
+            f"<i>Например: 5</i>",
+            reply_markup=markup,
+        )
+        self.user_states[chat_id]["message_id"] = getattr(sent, "message_id", None)
+
+    def _ask_batch_password(self, chat_id, server, count):
+        settings = getattr(self.manager, "settings", None)
+        base = settings.base_password if settings else ""
+        self.user_states[chat_id] = {
+            "action": "batch_password",
+            "server": server,
+            "count": count,
+        }
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        if base:
+            markup.add(types.InlineKeyboardButton(
+                f"🔑 Базовый пароль ({base})",
+                callback_data="batch_pwd_base", style="success"))
+        markup.add(types.InlineKeyboardButton(
+            "✖️ Отмена", callback_data="batch_cancel", style="danger"))
+        hint = (
+            f"Можно ничего не вводить и нажать кнопку с базовым паролем."
+            if base else
+            "Базовый пароль не задан — введи его здесь или задай в ⚙️ Настройках."
+        )
+        self.bot.send_message(
+            chat_id,
+            f"<b>➕ Массовая регистрация — шаг 3 из 4</b>\n\n"
+            f"Сервер: <b>{server}</b> · аккаунтов: <b>{count}</b>\n\n"
+            f"Какой пароль поставить новым аккаунтам?\n{hint}",
+            reply_markup=markup,
+        )
+
+    def _ask_batch_task(self, chat_id, server, count, password):
+        settings = getattr(self.manager, "settings", None)
+        default = settings.default_task if settings else "lvl"
+        self.user_states[chat_id] = {
+            "action": "batch_task",
+            "server": server,
+            "count": count,
+            "password": password,
+        }
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        labels = {
+            "lvl": "📈 Прокачка",
+            "quest": "📜 Квесты",
+            "mine": "⛏ Шахта",
+            "factory": "🏭 Завод",
+            "bus": "🚌 Автобус",
+            "farm": "🍎 Ферма",
+            "stop": "⏸ Без задачи",
+        }
+        buttons = []
+        for task, label in labels.items():
+            style = "success" if task == default else "primary"
+            buttons.append(types.InlineKeyboardButton(
+                label, callback_data=f"batch_task:{task}", style=style))
+        for i in range(0, len(buttons), 2):
+            if i + 1 < len(buttons):
+                markup.row(buttons[i], buttons[i + 1])
+            else:
+                markup.row(buttons[i])
+        markup.row(types.InlineKeyboardButton(
+            "✖️ Отмена", callback_data="batch_cancel", style="danger"))
+        self.bot.send_message(
+            chat_id,
+            f"<b>➕ Массовая регистрация — шаг 4 из 4</b>\n\n"
+            f"Сервер: <b>{server}</b> · аккаунтов: <b>{count}</b> · "
+            f"пароль: <code>{password}</code>\n\n"
+            f"Что делают аккаунты после входа?",
+            reply_markup=markup,
+        )
+
+    def _run_batch(self, chat_id, server, count, password, task):
+        settings = getattr(self.manager, "settings", None)
+        limit = settings.batch_limit if settings else 50
+        if count > limit:
+            self.bot.send_message(
+                chat_id,
+                f"⚠️ Лимит партии — {limit}. Уменьши количество или подними "
+                f"лимит в ⚙️ Настройках.")
+            return
+        status = self.bot.send_message(
+            chat_id,
+            f"⏳ Создаю <b>{count}</b> аккаунтов на <b>{server}</b> "
+            f"(задача <code>{task}</code>)...\n"
+            f"Это займёт примерно {count * 2} секунд."
+        )
+
+        def _worker():
+            try:
+                created = self.manager.add_bots_batch(
+                    server, count, password=password, default_task=task)
+            except Exception as exc:
+                self.bot.send_message(chat_id, f"❌ Ошибка: <code>{exc}</code>")
+                return
+            ok = [b for b in created if getattr(b, "nickname", None)]
+            names = ", ".join(b.nickname for b in ok[:12])
+            tail = f" и ещё {len(ok) - 12}" if len(ok) > 12 else ""
+            self.bot.send_message(
+                chat_id,
+                f"✅ Создано <b>{len(ok)}</b> из {count} на <b>{server}</b> "
+                f"с задачей <code>{task}</code>.\n"
+                f"{names}{tail}\n\n"
+                f"Список и статусы — /start."
+            )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    # ---------- живые окна ----------
+    #
+    # Раньше статус в Telegram обновлялся только по нажатию кнопки. Запустил
+    # бота — и смотришь на «Ожидание», пока сам не вспомнишь про «Обновить».
+    # Теперь окна запоминаются, а фоновая нить раз в пару секунд проверяет,
+    # изменилось ли содержимое, и перерисовывает только изменившиеся.
+
+    def _remember_view(self, chat_id, message_id, kind, *, bid=None, page=1):
+        if not message_id:
+            return
+        with self._views_lock:
+            self._live_views[(chat_id, message_id)] = {
+                "kind": kind,
+                "bid": bid,
+                "page": page,
+                "sig": self._view_signature(kind, bid, page),
+            }
+
+    def _forget_view(self, chat_id, message_id=None):
+        with self._views_lock:
+            if message_id is None:
+                for key in [k for k in self._live_views if k[0] == chat_id]:
+                    self._live_views.pop(key, None)
+            else:
+                self._live_views.pop((chat_id, message_id), None)
+
+    def _view_signature(self, kind, bid, page):
+        """Короткая подпись содержимого окна: меняется — перерисовываем."""
+        if kind == "card":
+            with self.manager._lock:
+                b = self.manager.bots.get(bid)
+            if b is None:
+                return None
+            return (
+                b.status,
+                str(b.get_level()),
+                str(b.get_balance_str()),
+                b.active_task.name if b.active_task else None,
+                b.default_task_name,
+                self.manager._get_bot_location_name(b),
+                b.proxy,
+                b.is_banned,
+            )
+        # Список: статусы всех ботов страницы плюс их состав.
+        with self.manager._lock:
+            items = sorted(self.manager.bots.items(), key=lambda x: x[0])
+        total = len(items)
+        total_pages = max(1, math.ceil(total / BOTS_PER_PAGE))
+        page = max(1, min(page, total_pages))
+        start = (page - 1) * BOTS_PER_PAGE
+        chunk = items[start:start + BOTS_PER_PAGE]
+        return (total, tuple((bid, b.status, b.nickname) for bid, b in chunk))
+
+    def _bot_card(self, b, page):
+        """Текст и кнопки карточки бота. Общие для показа и автообновления."""
+        loc = self.manager._get_bot_location_name(b)
+        loc_str = f"\n📍 Локация: <code>{loc}</code>" if loc else ""
+        proxy_str = f"\n🌐 Прокси: <code>{b.proxy}</code>" if b.proxy else ""
+        task_str = b.active_task.name if b.active_task else (b.default_task_name or "нет")
+        goal_str = (
+            f"\n🎯 Цель: <b>{b.target_lvl} lvl</b>" if b.target_lvl
+            else "\n🎯 Цель: <i>не задана</i>"
+        )
+        bid = b.bot_id
+
+        text = (
+            f"<b>👤 Информация о боте #{bid}</b>\n"
+            f"Никнейм: <b>{b.nickname}</b>\n"
+            f"Сервер: <b>{b.server_name}</b> ({b.host}:{b.port})\n"
+            f"Статус: <b>{self._format_status_badge(b.status)}</b>\n"
+            f"Уровень: <b>{b.get_level()}</b>\n"
+            f"Баланс: <b>{b.get_balance_str()}</b>\n"
+            f"Задача: <code>{task_str}</code>{goal_str}{loc_str}{proxy_str}\n"
+            f"Пароль: <code>{b.password}</code>"
+        )
+
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        s_lower = b.status.lower()
+        is_active = (
+            "в игре" in s_lower
+            or "подключение" in s_lower
+            or "очеред" in s_lower
+            or "ожидани" in s_lower
+            or "сессия занята" in s_lower
+            or "повтор" in s_lower
+            or b.queue_mode
+            or getattr(b, "_reconnect_pending", False)
+        )
+        if is_active:
+            btn = types.InlineKeyboardButton(
+                "⏹ Остановить", callback_data=f"bot_stop:{bid}:{page}", style="danger")
+        else:
+            btn = types.InlineKeyboardButton(
+                "▶️ Запустить", callback_data=f"bot_start:{bid}:{page}", style="success")
+
+        markup.row(btn, types.InlineKeyboardButton(
+            "📜 Логи", callback_data=f"bot_logs:{bid}:{page}", style="primary"))
+        markup.row(
+            types.InlineKeyboardButton("🔄 Обновить статы (/mm)",
+                                       callback_data=f"bot_check_stats:{bid}:{page}", style="success"),
+            types.InlineKeyboardButton("🎯 Задать задачу",
+                                       callback_data=f"bot_tasks:{bid}:{page}", style="primary")
+        )
+        markup.row(
+            types.InlineKeyboardButton("🏆 Задать цель (LVL)",
+                                       callback_data=f"bot_set_goal:{bid}:{page}", style="primary"),
+            types.InlineKeyboardButton("💬 Чат / Команда",
+                                       callback_data=f"bot_chat:{bid}:{page}", style="primary")
+        )
+        markup.row(
+            types.InlineKeyboardButton("🌐 Прокси",
+                                       callback_data=f"bot_proxy_menu:{bid}:{page}", style="primary"),
+            types.InlineKeyboardButton("❌ Удалить бота",
+                                       callback_data=f"bot_del:{bid}:{page}", style="danger")
+        )
+        if b.is_banned:
+            markup.row(types.InlineKeyboardButton(
+                "🔓 Снять бан", callback_data=f"bot_unban:{bid}:{page}", style="success"))
+        markup.row(types.InlineKeyboardButton(
+            "⬅️ Назад к списку", callback_data=f"page:{page}", style="primary"))
+        return text, markup
+
+    def _refresh_live_views(self):
+        """Перерисовать окна, содержимое которых изменилось."""
+        with self._views_lock:
+            snapshot = list(self._live_views.items())
+
+        for (chat_id, message_id), info in snapshot:
+            kind = info["kind"]
+            bid = info["bid"]
+            page = info["page"]
+            try:
+                sig = self._view_signature(kind, bid, page)
+            except Exception:
+                continue
+            if sig is None:
+                # Бота удалили — окно больше не о чем показывать.
+                self._forget_view(chat_id, message_id)
+                continue
+            if sig == info["sig"]:
+                continue
+
+            try:
+                if kind == "card":
+                    with self.manager._lock:
+                        b = self.manager.bots.get(bid)
+                    if b is None:
+                        self._forget_view(chat_id, message_id)
+                        continue
+                    text, markup = self._bot_card(b, page)
+                else:
+                    text, markup = self._list_text(page)
+                self.bot.edit_message_text(
+                    text, chat_id=chat_id, message_id=message_id, reply_markup=markup
+                )
+                with self._views_lock:
+                    if (chat_id, message_id) in self._live_views:
+                        self._live_views[(chat_id, message_id)]["sig"] = sig
+            except Exception as exc:
+                # «message is not modified» — норма, остальное значит, что
+                # окно умерло (удалено, слишком старое). Не копим мусор.
+                if "not modified" not in str(exc).lower():
+                    self._forget_view(chat_id, message_id)
+
+    def _list_text(self, page: int):
+        """Текст и клавиатура страницы списка ботов."""
+        markup, total, total_pages = self._build_pagination_keyboard(page)
+        page = max(1, min(page, total_pages))
+        with self.manager._lock:
+            items = sorted(self.manager.bots.items(), key=lambda x: x[0])
+        start = (page - 1) * BOTS_PER_PAGE
+        chunk = items[start:start + BOTS_PER_PAGE]
+
+        online = sum(1 for _, b in items if self._format_status_badge(b.status) == "🟢 Онлайн")
+        banned = sum(1 for _, b in items if b.is_banned)
+
+        lines = [
+            f"<b>🤖 Панель управления ботами</b>",
+            "",
+            f"Всего: <b>{total}</b> · Онлайн: <b>{online}</b> · Бан: <b>{banned}</b>",
+            f"Страница <b>{page}</b> из <b>{total_pages}</b>",
+        ]
+        return "\n".join(lines), markup
+
+    def _start_live_refresh(self):
+        """Фоновая нить автообновления окон."""
+        if getattr(self, "_live_thread", None) is not None:
+            return
+        interval = float(os.environ.get("BR_LIVE_REFRESH", "3.0"))
+
+        def _loop():
+            while self.running:
+                time.sleep(interval)
+                if not self.running:
+                    break
+                try:
+                    self._refresh_live_views()
+                except Exception:
+                    pass
+
+        self._live_thread = threading.Thread(target=_loop, daemon=True)
+        self._live_thread.start()
 
     def _render_vpn_menu(self, chat_id, message_id=None, callback_id=None, quiet=False):
         """Раздел «Прокси и VPN»: узлы цветом, добавление, проверка, раздача."""
@@ -301,24 +771,10 @@ class TelegramBotController:
                 return
 
             self.active_chats.add(message.chat.id)
-            markup, total_bots, total_pages = self._build_pagination_keyboard(1)
-            
-            # Считаем количество ботов по статусам
-            online = 0
-            banned = 0
-            with self.manager._lock:
-                for b in self.manager.bots.values():
-                    if "в игре" in b.status.lower() or "заспавнен" in b.status.lower():
-                        online += 1
-                    elif b.is_banned:
-                        banned += 1
-
-            text = (
-                f"<b>🤖 Black Russia Bot Manager</b>\n"
-                f"Всего ботов: <b>{total_bots}</b> | Онлайн: <b>{online}</b> | Забанено: <b>{banned}</b>\n\n"
-                f"Выберите бота для детальной инфы, логов и управления:"
-            )
-            self.bot.send_message(message.chat.id, text, reply_markup=markup)
+            text, markup = self._list_text(1)
+            sent = self.bot.send_message(message.chat.id, text, reply_markup=markup)
+            # Главное окно тоже живое: статусы обновляются без /start.
+            self._remember_view(message.chat.id, getattr(sent, "message_id", None), "list", page=1)
 
         @self.bot.callback_query_handler(func=lambda call: True)
         def handle_callbacks(call):
@@ -332,25 +788,23 @@ class TelegramBotController:
 
             if data.startswith("page:"):
                 page = int(data.split(":")[1])
-                markup, total_bots, total_pages = self._build_pagination_keyboard(page)
-                text = (
-                    f"<b>🤖 Список ботов (Страница {page}/{total_pages})</b>\n"
-                    f"Всего аккаунтов в системе: <b>{total_bots}</b>\n\n"
-                    f"Нажмите на нужного бота для логов и управления:"
-                )
+                text, markup = self._list_text(page)
                 try:
                     self.bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=markup)
                 except Exception:
                     pass
+                # Запоминаем окно: дальше оно обновляется само.
+                self._remember_view(chat_id, message_id, "list", page=page)
                 self.bot.answer_callback_query(call.id)
 
             elif data.startswith("refresh:"):
                 page = int(data.split(":")[1])
-                markup, total_bots, total_pages = self._build_pagination_keyboard(page)
+                text, markup = self._list_text(page)
                 try:
-                    self.bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=markup)
+                    self.bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=markup)
                 except Exception:
                     pass
+                self._remember_view(chat_id, message_id, "list", page=page)
                 self.bot.answer_callback_query(call.id, "Обновлено!")
 
             elif data.startswith("act_start_some:"):
@@ -380,17 +834,126 @@ class TelegramBotController:
 
             elif data == "act_batch":
                 self.bot.answer_callback_query(call.id)
-                self.user_states[chat_id] = {"action": "batch_create"}
-                help_msg = (
-                    "<b>➕ Массовое создание ботов</b>\n\n"
-                    "Отправьте параметры одной строкой через пробел:\n"
-                    "<code>[сервер] [кол-во] [пароль] [задача]</code>\n\n"
-                    "Пример:\n"
-                    "<code>TVER 5 mypass123 lvl</code>\n"
-                    "Задачи на выбор: <code>lvl</code>, <code>quest</code>, <code>mine</code>, <code>factory</code>, <code>bus</code>\n\n"
-                    "Для отмены отправьте /cancel"
+                self._render_batch_servers(chat_id, 1)
+
+            elif data.startswith("batch_page:"):
+                page = int(data.split(":", 1)[1])
+                self._render_batch_servers(chat_id, page, message_id, call.id)
+
+            elif data.startswith("batch_srv:"):
+                server = data.split(":", 1)[1]
+                self.bot.answer_callback_query(call.id, f"Сервер {server}")
+                self._ask_batch_count(chat_id, server)
+
+            elif data == "batch_pwd_base":
+                state = self.user_states.get(chat_id) or {}
+                if state.get("action") != "batch_password":
+                    self.bot.answer_callback_query(call.id, "Шаг устарел, начни заново")
+                    return
+                settings = getattr(self.manager, "settings", None)
+                password = settings.base_password if settings else ""
+                if not password:
+                    self.bot.answer_callback_query(
+                        call.id, "Базовый пароль не задан", show_alert=True)
+                    return
+                self.bot.answer_callback_query(call.id, "Беру базовый пароль")
+                self._ask_batch_task(
+                    chat_id, state["server"], state["count"], password)
+
+            elif data.startswith("batch_task:"):
+                task = data.split(":", 1)[1]
+                state = self.user_states.get(chat_id) or {}
+                if state.get("action") != "batch_task":
+                    self.bot.answer_callback_query(call.id, "Шаг устарел, начни заново")
+                    return
+                del self.user_states[chat_id]
+                self.bot.answer_callback_query(call.id, f"Задача {task}")
+                self._run_batch(
+                    chat_id, state["server"], state["count"],
+                    state["password"], task)
+
+            elif data == "batch_cancel":
+                self.user_states.pop(chat_id, None)
+                self.bot.answer_callback_query(call.id, "Отменено")
+                try:
+                    self.bot.delete_message(chat_id, message_id)
+                except Exception:
+                    pass
+                text, markup = self._list_text(1)
+                sent = self.bot.send_message(chat_id, text, reply_markup=markup)
+                self._remember_view(
+                    chat_id, getattr(sent, "message_id", None), "list", page=1)
+
+            elif data == "settings_menu":
+                self._render_settings(chat_id, message_id, call.id)
+
+            elif data == "set_base_password":
+                self.user_states[chat_id] = {"action": "set_base_password"}
+                self.bot.send_message(
+                    chat_id,
+                    "<b>🔑 Базовый пароль</b>\n\n"
+                    "Пришли пароль, который будут получать новые аккаунты.\n"
+                    "Минимум 5 символов.\n\n"
+                    "Для отмены: /cancel",
                 )
-                self.bot.send_message(chat_id, help_msg)
+                self.bot.answer_callback_query(call.id)
+
+            elif data == "set_default_task":
+                settings = getattr(self.manager, "settings", None)
+                if settings is None:
+                    self.bot.answer_callback_query(call.id, "Настройки недоступны")
+                    return
+                self.user_states.pop(chat_id, None)
+                markup = types.InlineKeyboardMarkup(row_width=2)
+                labels = {
+                    "lvl": "📈 Прокачка", "quest": "📜 Квесты",
+                    "mine": "⛏ Шахта", "factory": "🏭 Завод",
+                    "bus": "🚌 Автобус", "farm": "🍎 Ферма",
+                    "stop": "⏸ Без задачи",
+                }
+                buttons = [
+                    types.InlineKeyboardButton(
+                        label,
+                        callback_data=f"pick_default_task:{task}",
+                        style="success" if task == settings.default_task else "primary",
+                    )
+                    for task, label in labels.items()
+                ]
+                for i in range(0, len(buttons), 2):
+                    if i + 1 < len(buttons):
+                        markup.row(buttons[i], buttons[i + 1])
+                    else:
+                        markup.row(buttons[i])
+                self.bot.send_message(
+                    chat_id,
+                    f"<b>🎯 Задача по умолчанию</b>\n\n"
+                    f"Сейчас: <code>{settings.default_task}</code>.\n"
+                    f"Её получат новые аккаунты, если не выбрать другую.",
+                    reply_markup=markup,
+                )
+                self.bot.answer_callback_query(call.id)
+
+            elif data.startswith("pick_default_task:"):
+                task = data.split(":", 1)[1]
+                settings = getattr(self.manager, "settings", None)
+                if settings is None:
+                    self.bot.answer_callback_query(call.id, "Настройки недоступны")
+                    return
+                settings.default_task = task
+                self.user_states.pop(chat_id, None)
+                self.bot.answer_callback_query(call.id, f"Задача: {task}")
+                self._render_settings(chat_id, message_id, call.id)
+
+            elif data == "set_batch_limit":
+                self.user_states[chat_id] = {"action": "set_batch_limit"}
+                self.bot.send_message(
+                    chat_id,
+                    "<b>📦 Лимит партии</b>\n\n"
+                    "Сколько аккаунтов разрешено создавать за один заход?\n"
+                    "Пришли число от 1 до 500.\n\n"
+                    "Для отмены: /cancel",
+                )
+                self.bot.answer_callback_query(call.id)
 
             elif data.startswith("bot_view:"):
                 _, bid_s, page_s = data.split(":")
@@ -403,73 +966,14 @@ class TelegramBotController:
                     self.bot.answer_callback_query(call.id, "Бот не найден!", show_alert=True)
                     return
 
-                loc = self.manager._get_bot_location_name(b)
-                loc_str = f"\n📍 Локация: <code>{loc}</code>" if loc else ""
-                proxy_str = f"\n🌐 Прокси: <code>{b.proxy}</code>" if b.proxy else ""
-                task_str = b.active_task.name if b.active_task else (b.default_task_name or "нет")
-
-                goal_str = f"\n🎯 Цель: <b>{b.target_lvl} lvl</b>" if b.target_lvl else "\n🎯 Цель: <i>не задана</i>"
-
-                text = (
-                    f"<b>👤 Информация о боте #{b.bot_id}</b>\n"
-                    f"Никнейм: <b>{b.nickname}</b>\n"
-                    f"Сервер: <b>{b.server_name}</b> ({b.host}:{b.port})\n"
-                    f"Статус: <b>{self._format_status_badge(b.status)}</b>\n"
-                    f"Уровень: <b>{b.get_level()}</b>\n"
-                    f"Баланс: <b>{b.get_balance_str()}</b>\n"
-                    f"Задача: <code>{task_str}</code>{goal_str}{loc_str}{proxy_str}\n"
-                    f"Пароль: <code>{b.password}</code>"
-                )
-
-                markup = types.InlineKeyboardMarkup(row_width=2)
-                # Кнопки действий
-                s_lower = b.status.lower()
-                is_active = (
-                    "в игре" in s_lower
-                    or "подключение" in s_lower
-                    or "очеред" in s_lower
-                    or "ожидани" in s_lower
-                    or "сессия занята" in s_lower
-                    or "повтор" in s_lower
-                    or b.queue_mode
-                    or getattr(b, "_reconnect_pending", False)
-                )
-                if is_active:
-                    btn_start_stop = types.InlineKeyboardButton(
-                        "⏹ Остановить",
-                        callback_data=f"bot_stop:{bid}:{page}",
-                        style="danger",
-                    )
-                else:
-                    btn_start_stop = types.InlineKeyboardButton(
-                        "▶️ Запустить",
-                        callback_data=f"bot_start:{bid}:{page}",
-                        style="success",
-                    )
-
-                markup.row(btn_start_stop, types.InlineKeyboardButton("📜 Логи", callback_data=f"bot_logs:{bid}:{page}", style="primary"))
-                markup.row(
-                    types.InlineKeyboardButton("🔄 Обновить статы (/mm)", callback_data=f"bot_check_stats:{bid}:{page}", style="success"),
-                    types.InlineKeyboardButton("🎯 Задать задачу", callback_data=f"bot_tasks:{bid}:{page}", style="primary")
-                )
-                markup.row(
-                    types.InlineKeyboardButton("🏆 Задать цель (LVL)", callback_data=f"bot_set_goal:{bid}:{page}", style="primary"),
-                    types.InlineKeyboardButton("💬 Чат / Команда", callback_data=f"bot_chat:{bid}:{page}", style="primary")
-                )
-                markup.row(
-                    types.InlineKeyboardButton("🌐 Прокси", callback_data=f"bot_proxy_menu:{bid}:{page}", style="primary"),
-                    types.InlineKeyboardButton("❌ Удалить бота", callback_data=f"bot_del:{bid}:{page}", style="danger")
-                )
-
-                if b.is_banned:
-                    markup.row(types.InlineKeyboardButton("🔓 Снять бан", callback_data=f"bot_unban:{bid}:{page}", style="success"))
-
-                markup.row(types.InlineKeyboardButton("⬅️ Назад к списку", callback_data=f"page:{page}", style="primary"))
-
+                text, markup = self._bot_card(b, page)
                 try:
-                    self.bot.edit_message_text(text, chat_id=chat_id, message_id=message_id, reply_markup=markup)
+                    self.bot.edit_message_text(
+                        text, chat_id=chat_id, message_id=message_id, reply_markup=markup
+                    )
                 except Exception:
                     pass
+                self._remember_view(chat_id, message_id, "card", bid=bid, page=page)
                 self.bot.answer_callback_query(call.id)
 
             elif data.startswith("bot_start:"):
@@ -1005,36 +1509,69 @@ class TelegramBotController:
                 return
 
             action = state.get("action")
-            if action == "batch_create":
+            if action == "batch_count":
+                # Шаг 2: количество. Старую однострочную форму убрали —
+                # с телефона помнить порядок полей и точное имя сервера
+                # было мучением.
+                raw = message.text.strip()
+                settings = getattr(self.manager, "settings", None)
+                limit = settings.batch_limit if settings else 50
+                if not raw.isdigit():
+                    self.bot.reply_to(message, "❌ Нужно число. Например: <code>5</code>")
+                    return
+                count = int(raw)
+                if count < 1:
+                    self.bot.reply_to(message, "❌ Минимум 1 аккаунт.")
+                    return
+                if count > limit:
+                    self.bot.reply_to(
+                        message, f"⚠️ Лимит партии — {limit}. Уменьши количество.")
+                    return
+                state = self.user_states.get(message.chat.id) or {}
+                self._ask_batch_password(message.chat.id, state.get("server", ""), count)
+
+            elif action == "batch_password":
+                state = self.user_states.get(message.chat.id) or {}
+                password = message.text.strip()
+                if len(password) < 5:
+                    self.bot.reply_to(
+                        message, "❌ Пароль короче 5 символов сервер не примет.")
+                    return
+                self._ask_batch_task(
+                    message.chat.id, state.get("server", ""),
+                    state.get("count", 1), password)
+
+            elif action == "set_base_password":
                 del self.user_states[message.chat.id]
-                parts = message.text.strip().split()
-                if len(parts) < 3:
-                    self.bot.reply_to(message, "❌ Неверный формат! Нужно: <code>СЕРВЕР КОЛИЧЕСТВО ПАРОЛЬ [ЗАДАЧА]</code>")
+                settings = getattr(self.manager, "settings", None)
+                if settings is None:
+                    self.bot.reply_to(message, "❌ Настройки недоступны.")
                     return
-
-                srv = parts[0].upper()
-                if not parts[1].isdigit():
-                    self.bot.reply_to(message, "❌ Количество должно быть числом!")
+                password = message.text.strip()
+                if len(password) < 5:
+                    self.bot.reply_to(message, "❌ Пароль короче 5 символов.")
                     return
+                settings.base_password = password
+                self.bot.reply_to(
+                    message,
+                    f"✅ Базовый пароль сохранён: <code>{password}</code>\n"
+                    f"Его получат все новые аккаунты.")
+                self._render_settings(message.chat.id)
 
-                count = int(parts[1])
-                pwd = parts[2]
-                task = parts[3].lower() if len(parts) >= 4 else "lvl"
-
-                if count > 50:
-                    self.bot.reply_to(message, "⚠️ Максимальное количество для одной партии - 50 ботов.")
+            elif action == "set_batch_limit":
+                del self.user_states[message.chat.id]
+                settings = getattr(self.manager, "settings", None)
+                if settings is None:
+                    self.bot.reply_to(message, "❌ Настройки недоступны.")
                     return
-
-                status_msg = self.bot.send_message(message.chat.id, f"⏳ Запущен процесс генерации и подключения {count} ботов на сервер {srv}...")
-
-                def _batch_worker():
-                    created = self.manager.add_bots_batch(srv, count, password=pwd, default_task=task)
-                    self.bot.send_message(
-                        message.chat.id,
-                        f"✅ Успешно создано {len(created)} ботов на сервере <b>{srv}</b> с задачей <code>{task}</code>!\nОткройте /start для просмотра списка."
-                    )
-
-                threading.Thread(target=_batch_worker, daemon=True).start()
+                raw = message.text.strip()
+                if not raw.isdigit():
+                    self.bot.reply_to(message, "❌ Нужно число от 1 до 500.")
+                    return
+                settings.batch_limit = int(raw)
+                self.bot.reply_to(
+                    message, f"✅ Лимит партии: <b>{settings.batch_limit}</b>")
+                self._render_settings(message.chat.id)
 
             elif action == "start_selected_bots":
                 page = state.get("page", 1)
@@ -1271,6 +1808,9 @@ class TelegramBotController:
 
         self.thread = threading.Thread(target=_poll, daemon=True, name="TelegramBotPoll")
         self.thread.start()
+        # Автообновление открытых окон: статус меняется сам, перезаходить в
+        # меню не нужно.
+        self._start_live_refresh()
         print("[+] Telegram бот управления успешно запущен!")
 
     def stop(self):

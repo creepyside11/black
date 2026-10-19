@@ -53,3 +53,11 @@ _diag/
 # резервная копия, которую пишет save_accounts
 accounts.json.bak
 accounts.json.tmp
+!test_settings.py
+!logic/settings.py
+bot_settings.json
+!test_batch_wizard.py
+!test_live_view.py
+!run_tests.py
+accounts.test.json
+accounts.test.json.bak

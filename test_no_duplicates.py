@@ -83,11 +83,16 @@ class LoadTests(unittest.TestCase):
         ]
         json.dump(payload, self._tmp)
         self._tmp.close()
-        self._patch = mock.patch.object(botmod, "ACCOUNTS_FILE", self._tmp.name)
-        self._patch.start()
+        # Путь через переменную окружения: она читается в __init__, поэтому
+        # менеджер сразу грузит тестовый файл, а не боевой реестр.
+        self._old_env = os.environ.get("BR_ACCOUNTS_FILE")
+        os.environ["BR_ACCOUNTS_FILE"] = self._tmp.name
 
     def tearDown(self):
-        self._patch.stop()
+        if self._old_env is None:
+            os.environ.pop("BR_ACCOUNTS_FILE", None)
+        else:
+            os.environ["BR_ACCOUNTS_FILE"] = self._old_env
         try:
             os.unlink(self._tmp.name)
         except OSError:
@@ -120,11 +125,18 @@ class SaveTests(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.mkdtemp()
         self._path = os.path.join(self._dir, "accounts.json")
-        self._patch = mock.patch.object(botmod, "ACCOUNTS_FILE", self._path)
-        self._patch.start()
+        # Через переменную окружения, а не патчем модуля: менеджер поднимает
+        # фоновые нити, они переживают tearDown, и с патчем модуля успевали
+        # записать тестовых ботов в настоящий accounts.json. Плюс путь нужен
+        # ещё до load_accounts — иначе в менеджер попадают боевые аккаунты.
+        self._old_env = os.environ.get("BR_ACCOUNTS_FILE")
+        os.environ["BR_ACCOUNTS_FILE"] = self._path
 
     def tearDown(self):
-        self._patch.stop()
+        if self._old_env is None:
+            os.environ.pop("BR_ACCOUNTS_FILE", None)
+        else:
+            os.environ["BR_ACCOUNTS_FILE"] = self._old_env
         for name in os.listdir(self._dir):
             try:
                 os.unlink(os.path.join(self._dir, name))
