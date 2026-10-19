@@ -2,12 +2,15 @@
 
 Запуск: python3 -m unittest test_spawn_unit -v
 """
+import time
 import unittest
+from unittest import mock
 
 from samp.constants import PacketPriority, PacketReliability
 from samp.packets import PacketBuilder
 
 from logic import spawn as S
+from logic import spawn as SP
 
 RC_PKT = PacketBuilder.rpc_build("request_class", 0)
 SP_PKT = PacketBuilder.rpc_build("spawn")
@@ -68,9 +71,19 @@ class FakeSession:
         self.connected = True
         self.protocol = protocol
         self.sync = FakeSync()
+        # JSON-пакеты (меню вокзалов) — отдельно от RPC.
+        self.json_sent = []
+        # Что сервер делает в ответ на выбор вокзала.
+        self.on_spawn_select = None
 
     def send_rpc_update_scores_and_pings(self):
         pass
+
+    def send_json(self, iid, payload, packet_name=None):
+        self.json_sent.append((iid, payload))
+        if self.on_spawn_select is not None:
+            self.on_spawn_select(iid, payload)
+        return True
 
 
 class FakeBot:
@@ -143,6 +156,20 @@ class GeometryTests(unittest.TestCase):
 
 
 class HandshakeTests(unittest.TestCase):
+    """Механика самого хендшейка: reliability, приоритеты, шаги.
+
+    В проде хендшейк выключен (ALLOW_RPC_SPAWN_HANDSHAKE = False) — он и
+    давал кик кодом 25. Здесь включаем его на время теста, иначе проверять
+    нечего: функции остались, просто их никто не зовёт.
+    """
+
+    def setUp(self):
+        self._orig = S.ALLOW_RPC_SPAWN_HANDSHAKE
+        S.ALLOW_RPC_SPAWN_HANDSHAKE = True
+
+    def tearDown(self):
+        S.ALLOW_RPC_SPAWN_HANDSHAKE = self._orig
+
     def test_delivery_params(self):
         bot = FakeBot()
         S.request_class(bot, 0, ordered=False)
@@ -229,12 +256,22 @@ class WaitSpawnedTests(unittest.TestCase):
 
 
 class WatchdogTests(unittest.TestCase):
-    def test_watchdog_spawns_and_marks(self):
+    def test_force_spawn_puts_bot_on_station(self):
+        """Сам force_spawn рабочий — просто в проде его больше никто не зовёт.
+
+        Тест держит механику живой: если однажды понадобится аварийный
+        путь, он не окажется сломанным. Хендшейк включаем только здесь.
+        """
         bot = FakeBot()
         wd = S.SpawnWatchdog(bot, log=bot.log, attempt_timeout=1.0, stable_seconds=0.0)
         wd.attempt_timeout = 1.0
-        S.force_spawn(bot, step_delay=0.0, timeout=1.0, stable_seconds=0.0)
-        # после хендшейка сторож просто фиксирует факт
+        orig = S.ALLOW_RPC_SPAWN_HANDSHAKE
+        S.ALLOW_RPC_SPAWN_HANDSHAKE = True
+        try:
+            report = S.force_spawn(bot, step_delay=0.0, timeout=1.0, stable_seconds=0.0)
+        finally:
+            S.ALLOW_RPC_SPAWN_HANDSHAKE = orig
+        self.assertIn(report.get("status"), ("spawned", "already_spawned"))
         self.assertTrue(S.is_spawned_position(bot.api.pos))
         self.assertFalse(wd.running)
 
@@ -395,24 +432,69 @@ class TravelTests(unittest.TestCase):
 
 
 class EnsureSpawnTests(unittest.TestCase):
-    def test_ensure_spawn_ok(self):
+    """ensure_spawn ходит только через меню: RPC-хендшейк — кик кодом 25."""
+
+    def setUp(self):
+        # Человеческая пауза перед ответом на меню проверяется отдельно;
+        # здесь она только замедляет тест.
+        patcher = mock.patch.object(S, "spawn_answer_delay", lambda rng=None: 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _bot_with_menu(self, items=(1, 2)):
         bot = FakeBot()
+        S.remember_spawn_menu({"o": 1, "m": list(items)}, bot)
+        bot.session.on_spawn_select = lambda iid, payload: setattr(bot.api, "pos", STATION)
+        self.addCleanup(S.reset_menu, bot)
+        return bot
+
+    def test_ensure_spawn_ok(self):
+        bot = self._bot_with_menu()
         seen = []
         report = S.ensure_spawn(
-            bot, timeout=3.0, log=bot.log, on_success=seen.append
+            bot, timeout=3.0, log=bot.log, on_success=seen.append, stable_seconds=0.0
         )
-        self.assertIn(report["status"], ("spawned", "already_spawned"))
+        self.assertEqual(report["status"], "spawned")
+        self.assertEqual(report["position"], STATION)
+        self.assertEqual(report["station"], "Южный")
         self.assertEqual(len(seen), 1)
+        # Ответ на меню — ровно один SPAWN_SELECT.
+        self.assertEqual(bot.session.json_sent, [(50, {"t": 1, "s": 1})])
+        # И ни одного RPC: force_spawn в этом пути не участвует.
+        self.assertEqual(bot.protocol.sent, [], "ensure_spawn отправил RPC-хендшейк")
+        self.assertTrue(bot.session.sync.enabled)
+
+    def test_ensure_spawn_never_calls_force_spawn(self):
+        bot = self._bot_with_menu()
+        with mock.patch.object(S, "force_spawn") as force_mock:
+            report = S.ensure_spawn(
+                bot, timeout=3.0, log=bot.log, stable_seconds=0.0
+            )
+        self.assertEqual(report["status"], "spawned")
+        self.assertEqual(force_mock.call_count, 0, "ensure_spawn позвал force_spawn")
+
+    def test_ensure_spawn_no_menu(self):
+        """Меню не будет — сразу no_menu, без хендшейка и без ожидания таймаута."""
+        bot = FakeBot()
+        seen = []
+        started = time.monotonic()
+        with mock.patch.object(S, "force_spawn") as force_mock, \
+                mock.patch.object(S, "wait_spawn_menu", lambda b, t, **kw: []):
+            report = S.ensure_spawn(
+                bot, timeout=3.0, log=bot.log, on_success=seen.append
+            )
+        self.assertEqual(report["status"], "no_menu")
+        self.assertEqual(seen, [], "on_success позвали без спавна")
+        self.assertEqual(force_mock.call_count, 0)
+        self.assertEqual(bot.protocol.sent, [])
+        self.assertEqual(bot.session.json_sent, [])
+        self.assertLess(time.monotonic() - started, 3.0, "ждали полный таймаут впустую")
 
     def test_ensure_spawn_no_session(self):
         bot = FakeBot()
         bot.session.connected = False
         report = S.ensure_spawn(bot, timeout=1.0)
         self.assertEqual(report["status"], "no_session")
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class SpawnAnswerDelayTests(unittest.TestCase):
@@ -441,3 +523,45 @@ class SpawnAnswerDelayTests(unittest.TestCase):
         low, high = sp.SPAWN_ANSWER_DELAY
         self.assertGreaterEqual(low, 1.0)
         self.assertLessEqual(high, 5.0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class NoHandshakeTests(unittest.TestCase):
+    """RPC-хендшейк спавна выключен наглухо.
+
+    Именно он давал кик античитом кодом 25 «постороннее ПО»: сервер
+    видит подтверждение класса и спавн от клиента, который ещё не прошёл
+    меню вокзалов. Спавн должен идти одним путём — ответом на меню.
+    """
+
+    def test_flag_is_off(self):
+        self.assertFalse(SP.ALLOW_RPC_SPAWN_HANDSHAKE)
+
+    def test_request_class_sends_nothing(self):
+        bot = mock.Mock()
+        sent = []
+        bot.session = mock.Mock()
+        bot.session._sender = mock.Mock()
+        bot.session._sender.send = lambda *a, **k: sent.append(a)
+        self.assertFalse(SP.request_class(bot, 0))
+        self.assertEqual(sent, [], "request_class всё-таки отправился")
+
+    def test_send_spawn_sends_nothing(self):
+        bot = mock.Mock()
+        sent = []
+        bot.session = mock.Mock()
+        bot.session._sender = mock.Mock()
+        bot.session._sender.send = lambda *a, **k: sent.append(a)
+        self.assertFalse(SP.send_spawn(bot))
+        self.assertEqual(sent, [], "RPC spawn всё-таки отправился")
+
+    def test_flag_does_not_touch_session(self):
+        """Флаг сессии не должен включаться: иначе оживёт автоответ на 344."""
+        bot = mock.Mock()
+        bot.session = mock.Mock()
+        bot.session.spawn_handshake_requested = False
+        SP.request_class(bot, 0)
+        self.assertFalse(bot.session.spawn_handshake_requested)

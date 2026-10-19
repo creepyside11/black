@@ -517,14 +517,34 @@ class BotInstance:
             self.spawn_watchdog.stop()
 
     def request_spawn(self, index=None):
-        """Ручной выбор вокзала: индекс или дефолтный для этого бота."""
-        from logic.spawn import force_spawn, spawn_index_for
+        """Ручной выбор вокзала: индекс или дефолтный для этого бота.
+
+        Только через меню. RPC-хендшейк (request_class + spawn) больше не
+        шлём: сервер отвечает на него киком античита кодом 25. Если меню
+        не пришло — возвращаем отчёт с позицией, ничего не ломая.
+        """
+        from logic.spawn import (
+            menu_choice, select_spawn, spawn_index_for, wait_spawn_menu,
+        )
 
         idx = spawn_index_for(self.bot_id) if index is None else int(index)
-        report = force_spawn(self, index=idx, log=self.add_log)
+        items = wait_spawn_menu(self, 30.0)
+        if not items:
+            report = {
+                "status": "no_menu",
+                "position": self.api.getbotposition() if self.api else None,
+                "reason": "меню вокзалов не пришло за 30с",
+            }
+            self.add_log("[SPAWN] меню не пришло, хендшейк не трогаю")
+            self.spawn_report = report
+            return report
+
+        select_spawn(self, menu_choice(items, self))
+        report = {
+            "status": "menu_sent",
+            "position": self.api.getbotposition() if self.api else None,
+        }
         self.spawn_report = report
-        if report["status"] in ("spawned", "already_spawned"):
-            self.mark_spawned(report.get("position"))
         return report
 
     def setup_session(self):

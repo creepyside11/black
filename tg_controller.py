@@ -57,6 +57,8 @@ class TelegramBotController:
         self._live_views = {}
         self._views_lock = threading.RLock()
         self._live_thread = None
+        # Короткий номер -> ключ узла для кнопок «Прокси и VPN».
+        self._vpn_picks = {}
         self._setup_handlers()
 
     @staticmethod
@@ -723,7 +725,13 @@ class TelegramBotController:
             if statuses:
                 markup.add(types.InlineKeyboardButton(
                     "— Раздать узел всем ботам —", callback_data="vpn_noop", style="primary"))
-                for res in statuses[:16]:
+                # callback_data ограничен 64 байтами. Ключ узла теперь
+                # содержит UUID и отпечаток конфига — он длиннее лимита, и
+                # Telegram отвергал всю клавиатуру с BUTTON_DATA_INVALID:
+                # кнопка «Прокси и VPN» просто не открывалась.
+                # В кнопку кладём короткий номер, а ключ держим рядом.
+                self._vpn_picks = {}
+                for index, res in enumerate(statuses[:16]):
                     node = res.node
                     if res.usable:
                         mark, style = "🟢", "success"
@@ -732,9 +740,10 @@ class TelegramBotController:
                     else:
                         mark, style = "🔴", "danger"
                     label = f"{mark} {node.name[:26]} · {node.protocol}"
-                    key = node.key
+                    token = str(index)
+                    self._vpn_picks[token] = node.key
                     markup.add(types.InlineKeyboardButton(
-                        label, callback_data=f"vpn_pick:{key}", style=style))
+                        label, callback_data=f"vpn_pick:{token}", style=style))
 
             if summary["usable"]:
                 markup.add(types.InlineKeyboardButton(
@@ -1429,10 +1438,15 @@ class TelegramBotController:
                 if pool is None:
                     self.bot.answer_callback_query(call.id, "Пул прокси не запущен", show_alert=True)
                     return
-                key = data.split(":", 1)[1]
+                token = data.split(":", 1)[1]
+                # В кнопке короткий номер: полный ключ узла не влезает в
+                # callback_data (лимит 64 байта).
+                picks = getattr(self, "_vpn_picks", None) or {}
+                key = picks.get(token, token)
                 node = pool.find_node(key)
                 if node is None:
-                    self.bot.answer_callback_query(call.id, "Узел не найден", show_alert=True)
+                    self.bot.answer_callback_query(
+                        call.id, "Меню устарело, открой заново", show_alert=True)
                     return
                 url = pool.socks_url_for(node)
                 if not url:

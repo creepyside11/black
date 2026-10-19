@@ -171,15 +171,25 @@ def _send_rpc(bot, rpc_name: str, args=(), *, reliability, priority, log=None) -
     return True
 
 
-def request_class(bot, wclass: int = DEFAULT_CLASS, *, ordered: bool = False, log=None) -> bool:
-    """RPC RequestClass. ordered=False -> шаг 1, ordered=True -> шаг 3.
+# RPC-хендшейк спавна (request_class + spawn) выключен наглухо.
+#
+# Именно он приводил к кику античитом кодом 25 «постороннее ПО»: сервер
+# видит подтверждение класса и спавн от клиента, который ещё не прошёл
+# меню вокзалов, и выкидывает. Спавн теперь один — ответ на меню.
+#
+# Флаг не настройка, а предохранитель: чтобы вернуть хендшейк, надо
+# осознанно поменять константу, а не случайно вызвать функцию.
+ALLOW_RPC_SPAWN_HANDSHAKE = False
 
-    Неупорядоченный (шаг 1) заодно разрешает автоответ на RPC 344: только
-    после нашего запроса сервер имеет право прислать spawn_response, на
-    который сессия отвечает RPC Spawn. Без этого флага спонтанный 344
-    (например во время регистрации) приводил к RPC Spawn посреди
-    регистрации и кику античита кодом 25.
-    """
+
+def request_class(bot, wclass: int = DEFAULT_CLASS, *, ordered: bool = False, log=None) -> bool:
+    """RPC RequestClass. Выключен: см. ALLOW_RPC_SPAWN_HANDSHAKE."""
+    if not ALLOW_RPC_SPAWN_HANDSHAKE:
+        if log:
+            log("[SPAWN] request_class заблокирован: хендшейк выключен "
+                "(кик античитом кодом 25). Спавн только через меню.")
+        return False
+
     session = getattr(bot, "session", None)
     if session is not None and not ordered:
         session.spawn_handshake_requested = True
@@ -199,6 +209,12 @@ def request_class(bot, wclass: int = DEFAULT_CLASS, *, ordered: bool = False, lo
 
 
 def send_spawn(bot, *, ordered: bool = False, log=None) -> bool:
+    if not ALLOW_RPC_SPAWN_HANDSHAKE:
+        if log:
+            log("[SPAWN] RPC spawn заблокирован: хендшейк выключен "
+                "(кик античитом кодом 25).")
+        return False
+
     """RPC Spawn. ordered=False -> шаг 2, ordered=True -> шаг 4.
 
     Помечаем сессию как «spawn уже отправлен», чтобы автоответ на RPC 344
@@ -462,7 +478,9 @@ class SpawnWatchdog:
     SPAWN_GRACE = 14.0
 
     # Сколько ждать меню вокзалов, прежде чем решать за сервер.
-    MENU_WAIT = 6.0
+    # Сколько ждём меню вокзалов. Сервер присылает его не всегда и не
+    # сразу; 30 секунд — это «точно дождались или точно не будет».
+    MENU_WAIT = 30.0
 
     def __init__(self, bot, *, log=None, attempt_timeout=None, stable_seconds: float = 2.0,
                  grace: float | None = None, menu_wait: float | None = None):
@@ -555,13 +573,13 @@ class SpawnWatchdog:
                         self._stop.wait(0.5)
                         continue
 
-                    # Меню ещё в пути: даём ему шанс, иначе хендшейк выберет
-                    # вокзал за нас и уведёт с того, что выбрал бы игрок.
+                    # Только меню. RPC-хендшейк (request_class + spawn)
+                    # больше не зовём: именно он и есть причина кика
+                    # античитом кодом 25. Ждём меню до MENU_WAIT секунд,
+                    # отвечаем — и всё. Не пришло — сообщаем, где стоим,
+                    # и на этом останавливаемся.
                     if not menu_received_recent(self.bot) and not menu_answer_recent(self.bot):
-                        # Ожидание меню не должно съедать бюджет попытки:
-                        # если сервер молчит, хендшейк нужен прямо сейчас.
-                        budget = min(self.menu_wait, self.attempt_timeout / 2.0)
-                        items = wait_spawn_menu(self.bot, budget)
+                        items = wait_spawn_menu(self.bot, self.menu_wait)
                         if items:
                             select_spawn(self.bot, menu_choice(items, self.bot))
                             ok, pos = wait_spawned(
@@ -572,15 +590,17 @@ class SpawnWatchdog:
                                 self._mark_spawned(pos)
                                 return
 
-                    self.report = force_spawn(
-                        self.bot,
-                        log=self.log,
-                        timeout=self.attempt_timeout,
-                        stable_seconds=self.stable_seconds,
+                    pos = _getpos(self.bot)
+                    self.report = {
+                        "status": "no_menu",
+                        "position": pos,
+                        "reason": "меню вокзалов не пришло",
+                    }
+                    self._log(
+                        f"[SPAWN] меню не пришло за {self.menu_wait:.0f}с, "
+                        f"хендшейк не трогаю. Стою: {pos}"
                     )
-                    if self.report.get("status") in ("spawned", "already_spawned"):
-                        self._mark_spawned(self.report.get("position"))
-                        return
+                    return
 
                 self._stop.wait(2.0)
         finally:
@@ -613,14 +633,18 @@ def ensure_spawn(bot, *, timeout: float = 60.0, log=None, on_success=None,
             break
 
         remaining = deadline - time.monotonic()
-        report = force_spawn(
+        # Только меню: RPC-хендшейк — причина кика античитом кодом 25.
+        report = spawn_via_menu(
             bot,
             log=log,
+            menu_timeout=min(30.0, max(4.0, remaining)),
             timeout=min(SPAWN_TIMEOUT, max(4.0, remaining / 2.0)),
             stable_seconds=stable_seconds,
-            attempts=1,
         )
         if report.get("status") in ("spawned", "already_spawned"):
+            break
+        if report.get("status") == "no_menu":
+            # Меню не будет — дальше ждать нечего, сообщаем где стоим.
             break
         time.sleep(0.5)
 

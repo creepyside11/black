@@ -66,3 +66,4 @@ accounts.test.json.bak
 !deploy/
 !deploy/install_singbox.sh
 !test_xray_config.py
+!test_callback_limit.py

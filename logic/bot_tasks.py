@@ -238,29 +238,34 @@ class LevelGrinderTask(BaseTask):
             threading.Thread(target=_reply, daemon=True).start()
 
     def _ensure_spawn_in_real_world(self):
-        """Гарантирует, что бот находится на реальном вокзале с другими игроками, а не под текстурами"""
+        """Ждём меню вокзалов. Никаких RPC-хендшейков.
+
+        Раньше здесь слался сырой RPC spawn и JSON SPAWN_SELECT сразу
+        после входа. Именно это и есть кик античитом кодом 25: сервер
+        видит подтверждение спавна от клиента, который ещё не прошёл
+        меню, и выкидывает как «постороннее ПО». На старых версиях этого
+        блока не было — и киков не было.
+
+        Теперь: если бот не на вокзале, просто ждём меню до 30 секунд и
+        отвечаем на него. Не пришло — пишем в лог, где стоим, и живём
+        дальше. Задача сама подхватит, когда сервер высадит на вокзал.
+        """
         pos = self.api.getbotposition()
-        if not pos or (pos[0] == 0.0 and pos[1] == 0.0) or pos[2] < -5.0:
-            self.bot.add_log("[LVL-BOT] Бот обнаружен в спект-зоне/под текстурами. Инициализируем спавн на вокзале...")
-            from samp.interfaces import InterfaceID
-            from samp.packets import PacketBuilder
-            # Отправляем подтверждение спавна
-            try:
-                self.session.send_json(InterfaceID.SPAWN_SELECT, {"t": 1, "s": 0})
-                self.session.send_json(InterfaceID.SPAWN_SELECT, {"s": 0})
-            except Exception:
-                pass
-            time.sleep(0.5)
-            # Отправляем RPC spawn
-            try:
-                self.session._sender.send(PacketBuilder.rpc_build("spawn"), rpc_name="spawn")
-            except Exception:
-                pass
-            time.sleep(1.0)
-            # Прыжок для прогрузки стрима
-            self.api.SetKey(keys=32)
-            time.sleep(0.2)
-            self.api.SetKey(keys=0)
+        if pos and not (pos[0] == 0.0 and pos[1] == 0.0) and pos[2] >= -5.0:
+            return
+        self.bot.add_log(
+            "[LVL-BOT] Бот не на вокзале — жду меню спавна, хендшейк не трогаю."
+        )
+        try:
+            from logic.spawn import wait_spawn_menu, menu_choice, select_spawn
+        except Exception:
+            return
+        items = wait_spawn_menu(self.bot, 30.0)
+        if items:
+            select_spawn(self.bot, menu_choice(items, self.bot))
+            self.bot.add_log("[LVL-BOT] Меню пришло, вокзал выбран.")
+            return
+        self.bot.add_log(f"[LVL-BOT] Меню не пришло за 30с. Стою: {pos}")
 
     def _run_loop(self):
         self.bot.add_log("[LVL-BOT] Режим качки уровня активирован. Поддержание активности 24/7.")
