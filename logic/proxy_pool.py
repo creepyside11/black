@@ -426,7 +426,20 @@ class ProxyPool:
 
         if not done:
             return results
-        return [done.get(res.node.key, res) for res in results]
+
+        merged = [done.get(res.node.key, res) for res in results]
+
+        # Гасим мосты, которые не пустили трафик. На 956 МБ сервера 67
+        # висящих sing-box съедали под гигабайт RSS: живые нужны боту,
+        # мёртвые — просто память.
+        keep = {res.node.key for res in merged if res.usable}
+        for key in getattr(bridge, "running", lambda: [])():
+            if key not in keep:
+                try:
+                    bridge.stop(key)
+                except Exception:
+                    pass
+        return merged
 
     def _report(self, results: list[ProbeResult]) -> None:
         alive = [r for r in results if r.alive]

@@ -388,3 +388,67 @@ class RefreshBridgeTests(unittest.TestCase):
         ]
         pool.refresh(fetch=False)
         self.assertEqual(started, [], "мёртвый узел незачем поднимать мостом")
+
+
+class BridgeMemoryTests(unittest.TestCase):
+    """Мосты мёртвых узлов надо гасить.
+
+    67 висящих sing-box на 956 МБ сервера давали 1745 МБ RSS в сумме.
+    Живые мосты нужны боту, мёртвые — просто память.
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        self._tmp.close()
+        self.path = self._tmp.name
+
+    def tearDown(self):
+        import os
+        for suffix in ("", ".bak", ".tmp"):
+            try:
+                os.unlink(self.path + suffix)
+            except OSError:
+                pass
+
+    def test_dead_bridges_are_stopped(self):
+        nodes = [
+            VpnNode(name="good", protocol="vless", address="good.example.com",
+                    port=443, login="u1", raw='{"outbounds":[{"server":"good"}]}'),
+            VpnNode(name="bad", protocol="vless", address="bad.example.com",
+                    port=443, login="u2", raw='{"outbounds":[{"server":"bad"}]}'),
+        ]
+        stopped = []
+
+        class Bridge:
+            def available(self):
+                return True
+
+            def start(self, key, link):
+                return "socks5://127.0.0.1:%d" % (20001 if "good" in key else 20002)
+
+            def port_of(self, key):
+                return 20001 if "good" in key else 20002
+
+            def running(self):
+                return [n.key for n in nodes]
+
+            def stop(self, key):
+                stopped.append(key)
+
+        pool = P.ProxyPool(self.path, loader=lambda u, **k: [], log=lambda _m: None)
+        pool.bridge = Bridge()
+        pool._cached_nodes = list(nodes)
+
+        def prober(batch, **kwargs):
+            out = []
+            for n in batch:
+                usable = n.port == 20001
+                r = ProbeResult(node=n, alive=True, usable=usable,
+                                status=STATUS_OK if usable else STATUS_NEEDS_CLIENT)
+                out.append(r)
+            return out
+
+        pool._prober = prober
+        pool.refresh(fetch=False)
+        self.assertEqual(stopped, [nodes[1].key], "мост мёртвого узла не погашен")
