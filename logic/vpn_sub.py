@@ -336,6 +336,17 @@ def parse_link(link: str, source: str = "") -> VpnNode | None:
     return None
 
 
+def _outbound_raw(out: dict) -> str:
+    """Узел в виде конфига из одного outbound.
+
+    Раньше здесь лежал весь конфиг Xray, обрезанный до 2000 символов.
+    Обрезка рвала JSON посередине строки — мост получал невалидный
+    документ и молча не поднимался, а узел висел «живым, но неприменимым».
+    Нужен мосту только сам outbound, он в разы меньше и влезает целиком.
+    """
+    return json.dumps({"outbounds": [out]}, ensure_ascii=False)
+
+
 def _parse_xray_config(config: dict, source: str) -> list[VpnNode]:
     """Один конфиг xray -> узлы из его outbounds."""
     nodes = []
@@ -377,7 +388,7 @@ def _parse_xray_config(config: dict, source: str) -> list[VpnNode]:
                     security=security,
                     sni=sni or host,
                     login=str(user.get("id") or ""),
-                    raw=json.dumps(config, ensure_ascii=False)[:2000],
+                    raw=_outbound_raw(out),
                     source=source,
                     stub=_is_stub(host, port, name),
                 )
@@ -399,7 +410,7 @@ def _parse_xray_config(config: dict, source: str) -> list[VpnNode]:
                     security=security,
                     sni=sni or host,
                     password=str(server.get("password") or ""),
-                    raw=json.dumps(config, ensure_ascii=False)[:2000],
+                    raw=_outbound_raw(out),
                     source=source,
                     stub=_is_stub(host, port, name),
                 )

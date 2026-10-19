@@ -212,6 +212,43 @@ class RejectionTests(unittest.TestCase):
         self.assertIsNone(B.parse_link(""))
 
 
+class RawNotTruncatedTests(unittest.TestCase):
+    """Узел хранил весь конфиг, обрезанный до 2000 символов.
+
+    Обрезка рвала JSON посередине строки: мост получал невалидный
+    документ, молча не поднимался, и узел висел «живым, но неприменимым».
+    """
+
+    def test_big_config_round_trips(self):
+        from logic.vpn_sub import _parse_xray_config
+
+        cfg = json.loads(json.dumps(VLESS_REALITY))
+        # Надуваем конфиг: настоящие подписки приходят на 3-5 КБ.
+        cfg["routing"]["rules"] = [
+            {"domain": ["domain:example%d.com" % i], "outboundTag": "direct"}
+            for i in range(200)
+        ]
+        self.assertGreater(len(json.dumps(cfg)), 2000)
+
+        nodes = _parse_xray_config(cfg, "test")
+        self.assertEqual(len(nodes), 1)
+        raw = nodes[0].raw
+        self.assertGreater(len(raw), 0)
+        # Главное: raw — валидный JSON, а не обрезанный огрызок.
+        parsed = json.loads(raw)
+        self.assertIn("outbounds", parsed)
+        self.assertIsNotNone(B.parse_link(raw), "raw не разбирается мостом")
+
+    def test_raw_has_no_giant_routing_rules(self):
+        """В узле лежит только outbound, без всего конфига."""
+        from logic.vpn_sub import _parse_xray_config
+
+        cfg = json.loads(json.dumps(VLESS_REALITY))
+        nodes = _parse_xray_config(cfg, "test")
+        self.assertNotIn("routing", nodes[0].raw)
+        self.assertNotIn("inbounds", nodes[0].raw)
+
+
 class BridgeConfigTests(unittest.TestCase):
     def test_build_config_wraps_outbound(self):
         out = B.parse_link(json.dumps(VLESS_REALITY))
