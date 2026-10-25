@@ -26,6 +26,12 @@ _diag/
 !logic/calls.py
 !logic/paint.py
 !logic/quest_helpers.py
+!logic/menu.py
+!test_menu.py
+!logic/nicks.py
+!test_nicks.py
+!test_confirm.py
+!test_ban_replace.py
 !logic/undermap.py
 !test_quest_helpers.py
 !test_regressions.py
@@ -67,3 +73,24 @@ accounts.test.json.bak
 !deploy/install_singbox.sh
 !test_xray_config.py
 !test_callback_limit.py
+
+# Веб-панель RakCRMP: состояние (очередь, снимки, хеш пароля) не коммитим
+_web/
+# Исключения из общего *.py: код панели и моста
+!logic/web_bridge.py
+!logic/humanizer.py
+!logic/baninfo.py
+!test_humanizer.py
+!test_baninfo.py
+!web/
+!web/*.py
+!web/static/
+!web/static/*
+!test_web_panel.py
+.vercel
+!logic/lvl_engine.py
+!logic/real_world.py
+!logic/immortal.py
+!test_lvl_engine.py
+!test_real_world.py
+!test_immortal.py

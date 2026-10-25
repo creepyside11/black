@@ -1679,7 +1679,9 @@ class AllPlayersInfo:
         elif parsed.get("state") == "server_join":
             player_id = parsed.get("player_id")
             name = parsed.get("name")
-            is_npc = parsed.get("is_npc", False)
+            # Только явный 1. Старые парсеры отдавали сюда сырой байт 0xFF,
+            # и любое истинное значение выкидывало живых игроков из стрима.
+            is_npc = parsed.get("is_npc", False) in (True, 1)
 
             if player_id not in self._players:
                 self._players[player_id] = PlayerInfo(

@@ -511,10 +511,43 @@ class TelegramBotController:
         chunk = items[start:start + BOTS_PER_PAGE]
         return (total, tuple((bid, b.status, b.nickname) for bid, b in chunk))
 
+    PHASE_NAMES = {
+        "world": "вход в мир",
+        "delay": "ждёт минуту после спавна",
+        "target": "выбирает точку",
+        "moving": "идёт на точку",
+        "command": "отправляет /bg",
+        "done": "на точке",
+    }
+
+    def _point_line(self, b) -> str:
+        """Строка про вокзал и точку качки для карточки бота."""
+        station = getattr(b, "lvl_spawn_name", None)
+        point = getattr(b, "lvl_target", None)
+        index = getattr(b, "lvl_target_index", None)
+        phase = getattr(b, "lvl_phase", None)
+        if not station and not point:
+            return ""
+        parts = []
+        if station:
+            parts.append(f"🚉 Вокзал: <b>{station}</b>")
+        if isinstance(point, (list, tuple)) and len(point) >= 2:
+            number = f"точка {index + 1} · " if isinstance(index, int) else ""
+            coords = f"{float(point[0]):.1f}, {float(point[1]):.1f}"
+            parts.append(f"\n🎯 {number}<code>{coords}</code>")
+        if phase in self.PHASE_NAMES:
+            parts.append(f"\n⏳ Этап: <i>{self.PHASE_NAMES[phase]}</i>")
+        return "".join(f"\n{part}" if not part.startswith("\n") else part
+                       for part in parts)
+
     def _bot_card(self, b, page):
         """Текст и кнопки карточки бота. Общие для показа и автообновления."""
         loc = self.manager._get_bot_location_name(b)
         loc_str = f"\n📍 Локация: <code>{loc}</code>" if loc else ""
+        # Куда движок качки поставил бота. Вокзал спавна и точка, на
+        # которую он ушёл: по карточке видно, кто где стоит, а не только
+        # «в игре».
+        point_str = self._point_line(b)
         proxy_str = f"\n🌐 Прокси: <code>{b.proxy}</code>" if b.proxy else ""
         task_str = b.active_task.name if b.active_task else (b.default_task_name or "нет")
         goal_str = (
@@ -530,7 +563,7 @@ class TelegramBotController:
             f"Статус: <b>{self._format_status_badge(b.status)}</b>\n"
             f"Уровень: <b>{b.get_level()}</b>\n"
             f"Баланс: <b>{b.get_balance_str()}</b>\n"
-            f"Задача: <code>{task_str}</code>{goal_str}{loc_str}{proxy_str}\n"
+            f"Задача: <code>{task_str}</code>{goal_str}{point_str}{loc_str}{proxy_str}\n"
             f"Пароль: <code>{b.password}</code>"
         )
 
@@ -837,9 +870,37 @@ class TelegramBotController:
                 self.bot.send_message(chat_id, "🚀 Подан сигнал на запуск всех доступных ботов!")
 
             elif data == "act_stopall":
+                # Раньше здесь сразу шёл stop_all(): один случайный тап по
+                # кнопке гасил весь ботнет, отменить было нельзя.
+                with self.manager._lock:
+                    all_bots = list(self.manager.bots.values())
+                active = [b for b in all_bots if not b.is_banned]
+                self.bot.answer_callback_query(call.id)
+                self.bot.send_message(
+                    chat_id,
+                    f"⚠️ <b>Остановить всех ботов?</b>\n\n"
+                    f"Всего аккаунтов: <b>{len(all_bots)}</b>\n"
+                    f"Из них активных: <b>{len(active)}</b>\n\n"
+                    f"Все сессии будут закрыты. Заново запускать вручную.",
+                    reply_markup=types.InlineKeyboardMarkup().row(
+                        types.InlineKeyboardButton(
+                            f"⏹ Да, остановить {len(active)}",
+                            callback_data="act_stopall_confirm", style="danger"),
+                        types.InlineKeyboardButton(
+                            "↩️ Отмена", callback_data="act_stopall_cancel",
+                            style="primary"),
+                    ),
+                )
+
+            elif data == "act_stopall_confirm":
                 self.bot.answer_callback_query(call.id, "Остановка ботов...")
                 self.manager.stop_all()
                 self.bot.send_message(chat_id, "⏹ Все боты остановлены.")
+
+            elif data == "act_stopall_cancel":
+                self.bot.answer_callback_query(call.id, "Отменено")
+                text, markup = self._list_text(1)
+                self.bot.send_message(chat_id, "Отменено. " + text, reply_markup=markup)
 
             elif data == "act_batch":
                 self.bot.answer_callback_query(call.id)
@@ -1059,6 +1120,39 @@ class TelegramBotController:
                 self.bot.send_message(chat_id, msg)
 
             elif data.startswith("bot_del:"):
+                # Удаление необратимо: аккаунт, пароль и статистика исчезают
+                # из реестра. Без подтверждения один промах по кнопке стирал
+                # аккаунт молча.
+                _, bid_s, page_s = data.split(":")
+                bid = int(bid_s)
+                page = int(page_s)
+                with self.manager._lock:
+                    target = self.manager.bots.get(bid)
+                if target is None:
+                    self.bot.answer_callback_query(call.id, "Бот уже удалён")
+                    return
+                self.bot.answer_callback_query(call.id)
+                self.bot.send_message(
+                    chat_id,
+                    f"⚠️ <b>Удалить бота #{bid}?</b>\n\n"
+                    f"Ник: <code>{target.nickname}</code>\n"
+                    f"Сервер: <b>{target.server_name}</b>\n"
+                    f"Уровень: <b>{target.get_level()}</b>\n\n"
+                    f"Аккаунт исчезнет из реестра вместе с паролем и "
+                    f"статистикой. Отменить это нельзя.",
+                    reply_markup=types.InlineKeyboardMarkup().row(
+                        types.InlineKeyboardButton(
+                            "❌ Да, удалить",
+                            callback_data=f"bot_del_confirm:{bid}:{page}",
+                            style="danger"),
+                        types.InlineKeyboardButton(
+                            "↩️ Отмена",
+                            callback_data=f"bot_view:{bid}:{page}",
+                            style="primary"),
+                    ),
+                )
+
+            elif data.startswith("bot_del_confirm:"):
                 _, bid_s, page_s = data.split(":")
                 bid = int(bid_s)
                 page = int(page_s)

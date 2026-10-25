@@ -2,13 +2,49 @@
 # Module: logic/bot_tasks.py
 # Specialized automation tasks: LevelGrinder & QuestMaster (Uncle Slava / Начальные квесты)
 
+import math
 import time
 import threading
 import random
 import re
-import math
+
 from core import logger
+from logic.minigames import is_minigame_packet
 from samp.packets import PacketBuilder
+
+
+# Заголовки, с которых начинается настоящая капча.
+_CAPTCHA_TITLES = ("проверка", "капча", "подтверждение", "античит-проверка")
+
+# Признаки того, что это НЕ капча, а служебный экран.
+_NOT_CAPTCHA = (
+    "anti-cheat",
+    "anti cheat",
+    "кикнуты",
+    "packetloss",
+    "меню игрока",
+    "промокод",
+    "правила сервера",
+)
+
+
+def looks_like_captcha_dialog(title: str, info: str) -> bool:
+    """Это диалог капчи, а не что-то ещё?
+
+    Раньше проверяли подстроку «код» — и под неё попадало «Промо-КОД» из
+    меню игрока, а также «Код: 25» из окна Anti-Cheat. Бот отвечал на меню
+    капчей с текстом «1», то есть выбирал не тот пункт, а на окно
+    античита отправлял ответ, которого сервер не ждал.
+    """
+    clean = re.sub(r"\{[0-9a-fA-F]{6}\}", "", f"{title} {info}").lower()
+    if any(marker in clean for marker in _NOT_CAPTCHA):
+        return False
+    if any(word in clean for word in _CAPTCHA_TITLES):
+        return True
+    # «Введите код: 7123» — но не «Промокод: 7123».
+    if re.search(r"(?<!про)код\b\s*[:\-]?\s*\d{3,7}", clean):
+        return True
+    return any(word in clean for word in ("сколько будет", "решите пример", "введите ответ"))
 
 
 def solve_captcha_text(text: str) -> str | None:
@@ -122,6 +158,154 @@ class BaseTask:
         raise NotImplementedError
 
 
+class LevelRunnerTask(BaseTask):
+    """Качка уровня: из спавна — в мир, на точку и /bg.
+
+    Раньше задача заканчивалась на вокзале: бот стоял там, где сервер
+    его высадил, и в лог писалась только строка про спавн. Теперь
+    выполняется полный заход движка (logic/lvl_engine.run_cycle):
+    подтверждение мира по стриму игроков, минута после спавна,
+    бессмертие от голода, переход на точку своего вокзала на 8 м/с и
+    /bg.
+
+    Точки живут в logic/lvl_targets.json: на каждый вокзал до трёх
+    вариантов, бот берёт случайный и не повторяет предыдущий — десяток
+    аккаунтов не встаёт в одну клетку.
+
+    После /bg задача не бросает бота: держит точку и, если сервер
+    откатил позицию, возвращает на неё и повторяет команду.
+    """
+
+    # Насколько позиция может уехать от точки, прежде чем возвращать.
+    DRIFT_LIMIT = 30.0
+    # Период проверки, что бот всё ещё на точке.
+    HOLD_POLL = 15.0
+    # Пауза перед повторным заходом, если мир не подтвердился.
+    RETRY_DELAY = 90.0
+
+    def __init__(self, bot_instance):
+        super().__init__(bot_instance)
+        self.name = "Качка LVL (мир → точка → /bg)"
+        self._run = None
+        self._report = {"status": "idle"}
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        self.thread.start()
+        self.bot.add_log(f"[TASK] Задача '{self.name}' запущена")
+
+    def stop(self):
+        self.running = False
+        if self._run is not None:
+            self._run.stop()
+            self._run = None
+        self.bot.add_log(f"[TASK] Задача '{self.name}' остановлена")
+
+    @property
+    def report(self):
+        return self._report
+
+    # --- цикл -----------------------------------------------------------
+
+    @property
+    def _nick(self) -> str:
+        return getattr(self.bot, "nickname", "") or f"#{getattr(self.bot, 'bot_id', '?')}"
+
+    def _log(self, message: str) -> None:
+        """В лог с ником: по одной строке видно, кто где встал."""
+        try:
+            self.bot.add_log(f"[{self._nick}] {message}")
+        except Exception:
+            pass
+
+    def _cycle(self) -> dict:
+        from logic.lvl_engine import LevelRun
+
+        run = LevelRun(self.bot, log=self._log)
+        self._run = run
+        try:
+            return run.run_once()
+        finally:
+            self._run = None
+
+    def _run_loop(self):
+        while self.running:
+            try:
+                if not getattr(self.bot.session, "connected", False):
+                    time.sleep(5)
+                    continue
+                if not self._iterate():
+                    time.sleep(self.RETRY_DELAY)
+            except Exception as exc:
+                self._log(f"[LVL] цикл упал: {exc!r}")
+                time.sleep(10)
+
+    def _iterate(self) -> bool:
+        """Один заход. True — дошли до точки и держим её."""
+        report = self._cycle()
+        self._report = report
+        status = report.get("status")
+
+        if status == "done":
+            station = report.get("station")
+            point = report.get("target") or []
+            coords = ", ".join(f"{v:.1f}" for v in point) if point else "?"
+            idx = report.get("index")
+            number = idx + 1 if idx is not None else "?"
+            self._log(
+                f"[LVL] НА ТОЧКЕ: {station} | точка {number} ({coords}) | "
+                f"рядом было {report.get('players', 0)} игрок(ов) | "
+                f"/bg {'отправлен' if report.get('command_sent') else 'не ушёл'}"
+            )
+            self._hold(report)
+            return True
+
+        if status in ("no_targets", "world_unconfirmed", "short", "warp_failed"):
+            self._log(
+                f"[LVL] заход не завершён ({status}) — повтор через "
+                f"{self.RETRY_DELAY:.0f}с"
+            )
+        return False
+
+    def _hold(self, report: dict) -> None:
+        """Держать точку: если сервер откатил — вернуть и повторить /bg."""
+        from logic.lvl_engine import travel_to_point
+
+        point = report.get("target")
+        if not point:
+            return
+        point = tuple(float(v) for v in point)
+        station = report.get("station")
+        while self.running:
+            if not getattr(self.bot.session, "connected", False):
+                time.sleep(5)
+                continue
+            time.sleep(self.HOLD_POLL)
+            if not self.running:
+                return
+            try:
+                pos = self.bot.api.getbotposition() if self.bot.api else None
+            except Exception:
+                pos = None
+            if not pos:
+                continue
+            drift = math.dist((float(pos[0]), float(pos[1]), float(pos[2])), point)
+            if drift <= self.DRIFT_LIMIT:
+                continue
+            self._log(
+                f"[LVL] снесло с точки на {drift:.0f}м ({station}) — возвращаюсь"
+            )
+            try:
+                travel_to_point(self.bot, point, log=self._log)
+                self.bot.api.sendchat("/bg")
+                self._log(f"[LVL] снова на точке, /bg повторён")
+            except Exception as exc:
+                self._log(f"[LVL] вернуться не вышло: {exc!r}")
+
+
 class LevelGrinderTask(BaseTask):
     """
     Бот для прокачки уровня (Anti-AFK + сбор бонусов PayDay + рулетка/кейсы/донат)
@@ -137,6 +321,17 @@ class LevelGrinderTask(BaseTask):
         self.last_action = time.time()
         self.start_time = time.time()
         self.exp_collected = 0
+        # Живое поведение: прогулки, осмотр, простой, перерывы.
+        # Раньше здесь был жёсткий цикл «шаг на метр раз в N секунд».
+        from logic.humanizer import Humanizer
+
+        self._humanizer = Humanizer(
+            bot_instance,
+            bot_instance.api,
+            bot_instance.session,
+            log=lambda m: bot_instance.add_log(m),
+        )
+
 
     def on_chat_message(self, message: str):
         """Интеллектуальный авто-ответ на вопросы игроков и админов рядом, в /pm и общем чате"""
@@ -237,54 +432,109 @@ class LevelGrinderTask(BaseTask):
                     pass
             threading.Thread(target=_reply, daemon=True).start()
 
-    def _ensure_spawn_in_real_world(self):
-        """Ждём меню вокзалов. Никаких RPC-хендшейков.
-
-        Раньше здесь слался сырой RPC spawn и JSON SPAWN_SELECT сразу
-        после входа. Именно это и есть кик античитом кодом 25: сервер
-        видит подтверждение спавна от клиента, который ещё не прошёл
-        меню, и выкидывает как «постороннее ПО». На старых версиях этого
-        блока не было — и киков не было.
-
-        Теперь: если бот не на вокзале, просто ждём меню до 30 секунд и
-        отвечаем на него. Не пришло — пишем в лог, где стоим, и живём
-        дальше. Задача сама подхватит, когда сервер высадит на вокзал.
-        """
-        pos = self.api.getbotposition()
-        if pos and not (pos[0] == 0.0 and pos[1] == 0.0) and pos[2] >= -5.0:
-            return
-        self.bot.add_log(
-            "[LVL-BOT] Бот не на вокзале — жду меню спавна, хендшейк не трогаю."
-        )
+    def _eat_if_hungry(self):
+        """Подлечиться, если просело здоровье. Живой игрок ест, а не игнорит."""
         try:
-            from logic.spawn import wait_spawn_menu, menu_choice, select_spawn
+            if random.random() < 0.5:
+                self.api.sendchat("/eat")
+            else:
+                self.api.sendchat("/food")
+            self.bot.add_log("[LVL-ЕДА] Здоровье просело — поел.")
         except Exception:
-            return
-        items = wait_spawn_menu(self.bot, 30.0)
-        if items:
-            select_spawn(self.bot, menu_choice(items, self.bot))
-            self.bot.add_log("[LVL-BOT] Меню пришло, вокзал выбран.")
-            return
-        self.bot.add_log(f"[LVL-BOT] Меню не пришло за 30с. Стою: {pos}")
+            pass
+
+    def _ensure_spawn_in_real_world(self):
+        """Довести бота до общего мира — так же, как это делается вручную.
+
+        Раньше здесь ждали меню вокзалов и на этом заканчивали. Проблема
+        не в меню: после успешной авторизации сервер разрешает спавн, но
+        если клиент не отправил ответный Spawn, позиция есть, статус
+        «заспавнен», а стрим пустой. Бот стоит в мире один и не видит
+        ни игроков, ни машин.
+
+        Теперь порядок полный: дождаться позиции, один раз завершить
+        спавн, дождаться других игроков в стриме, а если их нет —
+        перейти на вокзал и проверить снова. Возвращает отчёт, поэтому
+        в логе видно, чем всё кончилось, а не «вроде зашли».
+        """
+        try:
+            from logic.real_world import ensure as enter_real_world
+        except Exception as exc:
+            self.bot.add_log(f"[МИР] модуль входа недоступен: {exc}")
+            return None
+
+        result = enter_real_world(self.bot, log=self.bot.add_log)
+        status = result.get("status")
+        if status == "confirmed":
+            names = ", ".join(p["name"] for p in result.get("players", [])[:5])
+            self.bot.add_log(
+                f"[МИР] подтверждён за {result.get('seconds', '?')}с, рядом: {names}"
+            )
+        else:
+            self.bot.add_log(
+                f"[МИР] не подтверждён ({status}) — продолжаю в том же мире"
+            )
+        return result
+
+    def _sleep_in_game(self, seconds: float):
+        """Простой, не выходя из игры.
+
+        Раньше перерыв означал разрыв сессии и повторный вход через
+        полчаса. Каждый такой вход — новый хэндшейк, и сервер на них
+        реагирует банами за частые входы. Здесь бот просто перестаёт
+        дёргаться и остаётся в сети.
+
+        Спим кусками по секунде: иначе остановка бота ждала бы конца
+        всего простоя.
+        """
+        deadline = time.time() + max(0.0, seconds)
+        while self.running and time.time() < deadline:
+            time.sleep(1.0)
 
     def _run_loop(self):
         self.bot.add_log("[LVL-BOT] Режим качки уровня активирован. Поддержание активности 24/7.")
         pause_start_time = None
-        self._ensure_spawn_in_real_world()
+        # Вход в общий мир проверяем только когда бот реально в игре.
+        # Раньше проверка стояла прямо перед циклом и на аккаунте в
+        # очереди ждала бы впустую: позиции нет, а цикл уже должен
+        # крутиться. Здесь она повторяется, пока не подтвердится.
+        world_checked = False
         while self.running:
             try:
                 if not self.session.connected:
                     time.sleep(5)
                     continue
 
-                # 1. Защита от голода/смерти при 0 XP: если 0 XP или 1 lvl, включаем бессмертие (100 HP)
+                if not world_checked and "В игре" in self.bot.status:
+                    world_checked = True
+                    self._ensure_spawn_in_real_world()
+
+                # 1. Здоровье.
+                #
+                # Раньше на нулевом опыте включался godmode_zero_xp, и в
+                # каждом sync-пакете уходило ровно 100 HP — вечно, при
+                # любых обстоятельствах. Живой игрок так не выглядит:
+                # он получает урон, лечится, у него падает здоровье от
+                # голода. Постоянные 100.0 — это подпись.
+                #
+                # Теперь здоровье живёт своей жизнью: бот «ест», когда
+                # просело, и восстанавливается постепенно, а не мгновенно
+                # щёлкает на максимум.
                 bot_player = getattr(self.session.players, "bot", None)
                 cur_lvl = self.bot.get_numeric_level() if hasattr(self.bot, "get_numeric_level") else 1
                 is_zero_xp = (cur_lvl <= 1 and ("0/" in self.bot.level_str or self.bot.level_str == "-" or "1 lvl" in self.bot.level_str))
                 if bot_player:
+                    # Флаг оставляем только как страховку от смерти на нуле,
+                    # но применяем его не всегда, а когда здоровье реально
+                    # упало ниже опасной черты.
                     if is_zero_xp:
-                        bot_player.godmode_zero_xp = True
-                        bot_player.health = 100.0
+                        try:
+                            hp = float(getattr(bot_player, "health", 100.0) or 0.0)
+                        except (TypeError, ValueError):
+                            hp = 100.0
+                        bot_player.godmode_zero_xp = hp < 25.0
+                        if hp < 45.0:
+                            self._eat_if_hungry()
                     else:
                         bot_player.godmode_zero_xp = False
 
@@ -296,7 +546,7 @@ class LevelGrinderTask(BaseTask):
                     bx, by, bz = cur_pos[0], cur_pos[1], cur_pos[2]
                     streamed = self.session.players.get_streamed_players()
                     for pid, p in streamed.items():
-                        if getattr(p, "is_npc", False):
+                        if getattr(p, "is_npc", False) in (True, 1):
                             continue
                         px, py, pz = getattr(p, "x", 0.0), getattr(p, "y", 0.0), getattr(p, "z", 0.0)
                         dist = ((bx - px)**2 + (by - py)**2 + (bz - pz)**2) ** 0.5
@@ -319,7 +569,14 @@ class LevelGrinderTask(BaseTask):
 
                 # 3. Забираем бесплатные награды из донат-меню раз в 30 минут
                 # И забираем ежедневный календарь / календарные подарки раз в час
-                if now - self.last_action > 1800:
+                # Раньше проверка шла ровно раз в 1800 секунд — по минуте
+                # в минуту, как по расписанию. Живой игрок заходит в меню
+                # когда вспомнит, а не по таймеру.
+                reward_interval = getattr(self, "_reward_interval", None)
+                if reward_interval is None:
+                    reward_interval = random.uniform(1500.0, 3300.0)
+                    self._reward_interval = reward_interval
+                if now - self.last_action > reward_interval:
                     try:
                         self.api.GetFreeReward()
                         self.api.DonatMenuClose()
@@ -331,6 +588,7 @@ class LevelGrinderTask(BaseTask):
                     except Exception:
                         pass
                     self.last_action = now
+                    self._reward_interval = random.uniform(1500.0, 3300.0)
 
                 # 4. Проверка и автоматическое повышение уровня через /mm при накоплении EXP
                 if hasattr(self.bot, "stats_pending") and not self.bot.stats_pending:
@@ -340,55 +598,34 @@ class LevelGrinderTask(BaseTask):
                         if tgt_lvl and cur_lvl >= tgt_lvl:
                             self.bot.add_log(f"[LVL-ЦЕЛЬ] 🎉 Достигнут целевой уровень {cur_lvl}/{tgt_lvl}!")
 
-                # 4. Улучшенное анти-АФК поведение (повороты головы, микро-шаги, осмотр, случайные приседания)
-                # Выполняем гарантированно каждые 30-45 секунд для предотвращения 15-минутного AFK-кика
-                if cur_pos and len(cur_pos) >= 3 and cur_pos[0] != 0.0:
-                    x, y, z = cur_pos[0], cur_pos[1], cur_pos[2]
-                    # Случайный угол обзора (эмуляция вращения камеры человеком)
-                    rand_angle = random.uniform(0.0, 360.0)
-                    try:
-                        if hasattr(self.api, "setbotangle"):
-                            self.api.setbotangle(rand_angle)
-                    except Exception:
-                        pass
+                # 4. Живое поведение вместо прежнего «шаг на полтора метра
+                # раз в девять минут».
+                #
+                # Старый блок делал ровно одно и то же: ждал случайные
+                # 20-540 секунд, шагал 1-2 метра в случайную сторону и
+                # пытался повернуть камеру методом setbotangle, которого
+                # не существует — вызов молча падал, и бот не поворачивался
+                # вообще никогда. Со стороны это выглядело как фигура,
+                # которая стоит неподвижно, изредка дёргается на метр и
+                # смотрит вечно в одну сторону. За такое и банят.
+                sleep_time = self._humanizer.step()
+                if sleep_time < 0:
+                    # Перерывы с выходом из игры отключены. Каждый выход —
+                    # это новый вход, а сервер банит за частые входы: часть
+                    # аккаунтов уходила в бан и больше не заходила. Аккаунт
+                    # остаётся в сети, просто замирает на месте.
+                    pause = abs(sleep_time)
+                    self.bot.add_log(
+                        f"[LVL-ОТДЫХ] Тихий простой {pause / 60:.0f} мин без выхода из игры."
+                    )
+                    self._humanizer.new_session()
+                    self._sleep_in_game(pause)
+                    continue
 
-                    # Реальное смещение шагом (от 1.0 до 2.0 метров), чтобы сервер зарегистрировал полноценное движение
-                    angle_rad = math.radians(rand_angle)
-                    dist = random.uniform(1.0, 2.0)
-                    target_x = x + dist * math.cos(angle_rad)
-                    target_y = y + dist * math.sin(angle_rad)
-                    try:
-                        self.api.MoveToCoord(target_x, target_y, z, mode="walk", coord_delay=0.03)
-                    except Exception:
-                        pass
-
-                # 5. Случайное действие: нажатие приседания (C), прыжка или осмотра
-                time.sleep(random.uniform(1.2, 2.5))
-                action_roll = random.random()
-                try:
-                    if action_roll < 0.35:
-                        # Приседание (KEY_CROUCH = 2)
-                        self.api.SetKey(keys=2)
-                        time.sleep(random.uniform(0.4, 0.8))
-                        self.api.SetKey(keys=0)
-                    elif action_roll < 0.65:
-                        # Осмотр / прыжок (KEY_JUMP = 32 или KEY_ACTION = 1)
-                        key_to_press = 32 if random.random() < 0.5 else 1
-                        self.api.SetKey(keys=key_to_press)
-                        time.sleep(0.2)
-                        self.api.SetKey(keys=0)
-                    else:
-                        # Микро-пауза человека
-                        time.sleep(0.5)
-                except Exception:
-                    pass
-
-                # Динамический рандомный интервал простоя:
-                # Минимально: 20 секунд
-                # Максимально: 9 минут (540 секунд, чтобы гарантированно не получить AFK-кик сервера)
-                # Рандомизация с точностью до десятых долей секунды
-                sleep_time = random.uniform(20.0, 540.0)
-                self.bot.add_log(f"[LVL-AFK] Действие завершено. Рандомный таймер простоя: {sleep_time:.1f} сек.")
+                self.bot.add_log(
+                    f"[LVL-ЖИВОЙ] {self._humanizer.last_activity}. "
+                    f"Пауза {sleep_time:.1f} сек."
+                )
                 start_sleep = time.time()
                 while self.running and (time.time() - start_sleep < sleep_time):
                     time.sleep(1.0)
@@ -399,294 +636,93 @@ class LevelGrinderTask(BaseTask):
 
 
 class QuestMasterTask(BaseTask):
+    """Квесты Дяди Славы — тонкая обёртка над logic/slava.py.
+
+    Раньше здесь была своя реализация: маркеры, посадка, гудок, донат.
+    Она работала наполовину — мини-игра искалась по ключам, которых в
+    протоколе нет, а навигация не различала пешком и на машине.
+
+    Теперь всё это в движке `logic.slava.SlavaQuest`: стадии, маршрут,
+    машина, диалоги, звонки, мини-игра, подарок. Задача только
+    прокидывает в него события — так `bot.py` не надо менять.
     """
-    Бот для прохождения квестов Дяди Славы / новой сюжетной линии Black Russia.
-    Учитывает полный цикл:
-    1. Авто-скип заставки и диалогов с Дядей Славой на спавне
-    2. Покупка еды в уличном киоске
-    3. Посадка в авто ("Ласточка" Дяди Славы)
-    4. Поездка в 24/7 за аптечкой
-    5. Стайлинг-центр (заезд/сигнал/выход)
-    6. АЗС (канистра) и 24/7 (ремкомплект)
-    7. Авто-ответ на входящие звонки Дяди Славы (call_notification)
-    8. Поездка на шахту с пропуском поездки на маркере
-    9. Шахта: переодевание, мини-игра добычи руды (клик по шкале/ползунку в зеленую зону)
-    10. Увольнение с шахты, обратный звонок и возврат на вокзал
-    11. ПЕРЕД финальным диалогом: открытие Доната, вкладка Подарок, забор подарка/кейса новичка, открытие кейса, закрытие меню
-    12. Финальный диалог со Славой, получение 20к руб, 2 LVL, прав кат. B и купона x2.
-    """
+
     def __init__(self, bot_instance):
         super().__init__(bot_instance)
         self.name = "Квесты Дяди Славы (Quest Master)"
+
+        from logic.slava import SlavaQuest
+
+        self.engine = SlavaQuest(bot_instance)
+        bot_instance.slava_quest = self.engine
+
+        # Совместимость со старым кодом: часть мест читает эти поля.
         self.current_quest_text = ""
         self.active_checkpoint = None
         self.is_moving_to_cp = False
-        self.last_dialog_time = 0
-        self.last_vehicle_board_attempt = 0
-        self.last_honk_attempt = 0
-        self.last_call_answer = 0
-        self.stage = "start"
         self.gift_claimed = False
+        self.stage = "start"
+
+    # ---- управление --------------------------------------------------
+
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.engine.start()
+        self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        self.thread.start()
+        self.bot.add_log(f"[TASK] Задача '{self.name}' запущена")
+
+    def stop(self):
+        self.running = False
+        try:
+            self.engine.stop()
+        except Exception:
+            pass
+        self.bot.add_log(f"[TASK] Задача '{self.name}' остановлена")
+
+    # ---- события от сервера ------------------------------------------
 
     def on_quest_task(self, text: str):
         if not self.running:
             return
-        clean_t = text.strip()
-        if clean_t != self.current_quest_text:
-            self.current_quest_text = clean_t
-            self.bot.add_log(f"[КВЕСТ] Новая цель: {clean_t}")
-
-    def on_call_notification(self, header: str, text: str, button: str, notif_type: int):
-        """Автоматический ответ на звонки Дяди Славы во время сюжетки"""
-        if not self.running:
-            return
-        now = time.time()
-        if now - self.last_call_answer < 2.0:
-            return
-        self.last_call_answer = now
-        self.bot.add_log(f"[КВЕСТ-ЗВОНОК] Входящий от '{header}': '{text}'. Принимаем вызов...")
-        def _ans():
-            time.sleep(random.uniform(0.5, 1.2))
-            try:
-                self.api.send_call_notification_response(notification_type=int(notif_type or 2), button=1)
-                self.bot.add_log("[КВЕСТ-ЗВОНОК] Звонок успешно принят")
-            except Exception as e:
-                self.bot.add_log(f"[КВЕСТ-ЗВОНОК] Ошибка ответа: {e}")
-        threading.Thread(target=_ans, daemon=True).start()
-
-    def on_npc_dialog(self, name: str, text: str, model, buttons):
-        if not self.running:
-            return
-        self.bot.add_log(f"[КВЕСТ-NPC] Разговор с {name}: '{text[:50]}...'")
-
-        # Если мы на финальном этапе и вернулись к Дяде Славе, но ещё НЕ забрали кейс из доната
-        if any(w in str(name).lower() for w in ["слав", "дядя"]) and not self.gift_claimed:
-            q_lower = self.current_quest_text.lower()
-            if any(w in q_lower for w in ["вернитесь", "назад", "вокзал", "славе", "поговорите"]):
-                self.bot.add_log("[КВЕСТ-ФИНАЛ] Сначала нужно открыть Донат и забрать Подарок/Кейс новичка!")
-                self._claim_donate_gift_and_case()
-
-        # Ищем кнопку согласия (Ок, Далее, Да, Хорошо, Взять, Завершить)
-        chosen_key = 1
-        for b in (buttons or []):
-            b_text = str(b.get("text", "")).lower()
-            if any(w in b_text for w in ["далее", "хорошо", "да", "готов", "взять", "понял", "ок", "выполнить", "завершить", "забрать"]):
-                chosen_key = b.get("key", 1)
-                break
-            elif b.get("index") == 0 or b.get("key") == 1:
-                chosen_key = b.get("key", 1)
-
-        def _reply():
-            time.sleep(random.uniform(1.0, 2.0))
-            try:
-                self.api.send_npc_dialog_response(chosen_key)
-                self.bot.add_log(f"[КВЕСТ-NPC] Выбран ответ (key={chosen_key})")
-            except Exception as e:
-                self.bot.add_log(f"[КВЕСТ-NPC] Ошибка ответа: {e}")
-
-        threading.Thread(target=_reply, daemon=True).start()
-
-    def _claim_donate_gift_and_case(self):
-        """Перед сдачей квеста Славе: открываем Донат -> Подарок (кейс новичка) -> Открываем кейс"""
-        def _flow():
-            try:
-                self.bot.add_log("[КВЕСТ-ДОНАТ] Открываем меню наград / подарка новичка...")
-                self.api.GetFreeReward()
-                time.sleep(1.5)
-                # Открываем кейс новичка (id=1 или бесплатный кейс)
-                self.bot.add_log("[КВЕСТ-ДОНАТ] Открываем полученный кейс новичка...")
-                self.api.CaseOpen(case_id=1, skip_animation=True)
-                time.sleep(2.0)
-                # Забираем выбитый приз
-                self.api.CaseCollectReward()
-                time.sleep(1.0)
-                self.api.CaseMenuClose()
-                time.sleep(0.5)
-                self.api.DonatMenuClose()
-                self.gift_claimed = True
-                self.bot.add_log("[КВЕСТ-ДОНАТ] Подарок и кейс успешно получены и открыты! Готовы завершать сюжетку.")
-            except Exception as e:
-                self.bot.add_log(f"[КВЕСТ-ДОНАТ] Ошибка получения подарка: {e}")
-        threading.Thread(target=_flow, daemon=True).start()
-
-    def on_receive_json(self, interface_id: int, data: dict):
-        """
-        Перехват интерфейсов:
-        - Мини-игра шахты (ползунок/шкала)
-        - Пропуск поездки (диалог/уведомление при подъезде к мосту/остановке)
-        - Киоск с едой
-        """
-        if not self.running:
-            return
-
-        # 1. Пропуск дороги (диалог с кнопкой 'Пропустить поездку' / уведомление)
-        if interface_id == 13: # NOTIFICATION
-            txt = str(data.get("i", "")).lower()
-            if any(w in txt for w in ["пропустить", "дорог", "поездк", "быстро"]):
-                self.bot.add_log("[КВЕСТ] Обнаружено предложение пропустить поездку! Нажимаем подтверждение...")
-                try:
-                    self.api.send_notification_response(c=13, notification_type=data.get("t", 0), notification_s=data.get("s", 0), button=1)
-                except Exception:
-                    pass
-
-        # 2. Киоск с едой (InterfaceID.SHOP_FOOD = 3)
-        if interface_id == 3:
-            self.bot.add_log("[КВЕСТ] Меню киоска открыто. Покупаем еду...")
-            def _buy_food():
-                time.sleep(0.8)
-                try:
-                    self.api.setbotfood(1)
-                    time.sleep(0.5)
-                    self.api.close_interface(3)
-                except Exception:
-                    pass
-            threading.Thread(target=_buy_food, daemon=True).start()
-
-        # 3. Мини-игра на шахте (ползунок / шкала попадания в зеленую зону)
-        # В Black Russia это JSON-интерфейс мини-игры (обычно id=81, 82, 90 или кастомные данные с ползунком)
-        if isinstance(data, dict):
-            # Проверяем маркеры мини-игры шахты
-            is_minigame = any(k in data for k in ["slider", "green_zone", "minigame", "cursor", "target_zone", "target"])
-            # Либо специфические поля: скорость ползунка, ширина зоны попадания
-            if is_minigame or (data.get("t") in (1, 2) and "gz" in data):
-                self.bot.add_log(f"[КВЕСТ-ШАХТА] Обнаружена мини-игра (interface={interface_id}). Рассчитываем попадание...")
-                self._solve_slider_minigame(interface_id, data)
-
-    def _solve_slider_minigame(self, interface_id: int, data: dict):
-        """Авто-решение мини-игры со слайдером/ползунком"""
-        def _click():
-            # Если передана позиция целевой зоны и скорость, ждем расчетное время
-            speed = float(data.get("speed", data.get("sp", 1.0)) or 1.0)
-            target = float(data.get("target", data.get("gz", 50.0)) or 50.0)
-            # Прикидываем идеальный момент клика
-            wait_time = max(0.4, min(1.8, target / (speed * 100.0) if speed > 0 else 0.8))
-            time.sleep(wait_time)
-            try:
-                # Отправляем подтверждение попадания
-                self.api.send_json(interface_id, {"t": 2, "r": 1, "success": 1})
-                # Также эмулируем нажатие клавиши действия / ЛКМ / ПРОБЕЛ
-                self.api.SetKey(keys=1)
-                time.sleep(0.1)
-                self.api.SetKey(keys=0)
-                self.bot.add_log("[КВЕСТ-ШАХТА] Мини-игра успешно решена (клик в зону)!")
-            except Exception as e:
-                self.bot.add_log(f"[КВЕСТ-ШАХТА] Ошибка клика мини-игры: {e}")
-        threading.Thread(target=_click, daemon=True).start()
+        self.current_quest_text = str(text or "")
+        self.engine.on_quest_text(text)
+        if self.engine.stage is not None:
+            self.stage = self.engine.stage.key
 
     def on_checkpoint(self, x, y, z, radius):
         if not self.running:
             return
-        self.active_checkpoint = (float(x), float(y), float(z), float(radius))
-        self.bot.add_log(f"[КВЕСТ] Получен чекпоинт: X={x:.1f}, Y={y:.1f}, Z={z:.1f} (радиус: {radius})")
+        self.active_checkpoint = (x, y, z, radius)
+        self.engine.on_checkpoint(x, y, z, radius)
+        self.bot.add_log(
+            f"[КВЕСТ] маркер X={float(x):.1f} Y={float(y):.1f} "
+            f"Z={float(z):.1f} (r={float(radius or 0):.1f})"
+        )
 
-        # Запускаем перемещение к чекпоинту
-        if not self.is_moving_to_cp:
-            threading.Thread(target=self._navigate_to_cp, args=(x, y, z, radius), daemon=True).start()
-
-    def _navigate_to_cp(self, x, y, z, radius):
-        self.is_moving_to_cp = True
-        try:
-            time.sleep(0.3)
-            self.bot.add_log(f"[КВЕСТ] Направляюсь к маркеру квеста ({x:.1f}, {y:.1f}, {z:.1f})...")
-            
-            # Если бот уже в машине, управляем в режиме vehicle
-            is_in_veh = self.session.players.bot.is_in_vehicle()
-            move_mode = "vehicle" if is_in_veh else "auto"
-
-            # Умное прокладывание пути / перемещение
-            self.api.MoveToCoord(
-                float(x), float(y), float(z),
-                mode=move_mode,
-                coord_delay=0.035 if not is_in_veh else 0.05,
-                accel_time=1.0,
-                brake_time=1.0,
-                completion_distance=max(1.2, float(radius) * 0.8)
-            )
-
-            # Если мы приехали на маркер на авто и в квесте упоминается стайлинг/тюнинг/гараж/бокс, жмём гудок
-            q_lower = self.current_quest_text.lower()
-            if is_in_veh and any(w in q_lower for w in ["стайлинг", "тюнинг", "бокс", "покрас", "автомастерск", "гараж"]):
-                self._trigger_horn()
-
-        except Exception as e:
-            self.bot.add_log(f"[КВЕСТ] Навигация: {e}")
-        finally:
-            self.is_moving_to_cp = False
-
-    def _trigger_horn(self):
-        now = time.time()
-        if now - self.last_honk_attempt < 3.0:
+    def on_npc_dialog(self, name: str, text: str, model, buttons):
+        if not self.running:
             return
-        self.last_honk_attempt = now
-        self.bot.add_log("[КВЕСТ-АВТО] Подаём сигнал клаксона (гудок) для въезда в бокс/стайлинг...")
-        def _horn():
-            try:
-                # В SAMP/CRMP гудок в авто - KEY_CROUCH (key=2)
-                self.api.SetKey(keys=2)
-                time.sleep(0.4)
-                self.api.SetKey(keys=0)
-            except Exception:
-                pass
-        threading.Thread(target=_horn, daemon=True).start()
+        self.bot.add_log(f"[КВЕСТ-NPC] {name}: '{str(text)[:60]}'")
+        self.engine.on_npc_dialog(name, text, model, buttons)
 
-    def _check_auto_board_vehicle(self):
-        """Сканирует близлежащий транспорт, если цель квеста требует сесть за руль/скутер"""
-        if self.session.players.bot.is_in_vehicle():
+    def on_call_notification(self, header: str, text: str, button: str,
+                             notif_type: int):
+        if not self.running:
             return
+        self.engine.on_call(header, text, button, notif_type)
 
-        now = time.time()
-        if now - self.last_vehicle_board_attempt < 4.0:
+    def on_receive_json(self, interface_id: int, data: dict):
+        if not self.running:
             return
-
-        q_lower = self.current_quest_text.lower()
-        needs_vehicle = any(w in q_lower for w in ["скутер", "мопед", "авто", "машин", "транспорт", "руль", "сядьте", "доехать", "аренд"])
-        if not needs_vehicle:
-            return
-
-        bot_pos = self.api.getbotposition()
-        if not bot_pos or len(bot_pos) < 3:
-            return
-        bx, by, bz = bot_pos[0], bot_pos[1], bot_pos[2]
-
-        vehicles = self.session.stream.vehicles
-        best_veh_id = None
-        best_dist = 999.0
-
-        for vid, v in list(vehicles.items()):
-            try:
-                dist = ((v.x - bx)**2 + (v.y - by)**2 + (v.z - bz)**2)**0.5
-                if dist < best_dist and dist < 25.0:
-                    best_dist = dist
-                    best_veh_id = vid
-            except Exception:
-                continue
-
-        if best_veh_id is not None:
-            self.last_vehicle_board_attempt = now
-            self.bot.add_log(f"[КВЕСТ-АВТО] Найден подходящий транспорт ID {best_veh_id} (дистанция {best_dist:.1f}м). Садимся...")
-            def _board():
-                try:
-                    veh = self.session.stream.get_vehicle(best_veh_id)
-                    if not veh:
-                        return
-                    if best_dist > 3.0:
-                        self.bot.add_log(f"[КВЕСТ-АВТО] Подходим к транспорту ID {best_veh_id}...")
-                        self.api.MoveToCoord(float(veh.x), float(veh.y), float(veh.z), mode="walk", completion_distance=2.0)
-                        time.sleep(0.5)
-
-                    # Садимся за руль
-                    self.api.setbotvehicle(best_veh_id, seat_id=0)
-                    time.sleep(1.0)
-                    # Пробуем завести двигатель (/en или /engine)
-                    self.api.sendchat("/en")
-                except Exception as e:
-                    self.bot.add_log(f"[КВЕСТ-АВТО] Ошибка посадки: {e}")
-            threading.Thread(target=_board, daemon=True).start()
+        self.engine.on_json(interface_id, data)
 
     def on_rewards(self, rewards):
         if not self.running:
             return
-        self.bot.add_log(f"[КВЕСТ] Доступны награды: {len(rewards)} шт. Забираем...")
+        self.bot.add_log(f"[КВЕСТ] наград: {len(rewards)}, забираем")
         for r in rewards:
             r_id = r.get("id") if isinstance(r, dict) else r
             try:
@@ -699,21 +735,35 @@ class QuestMasterTask(BaseTask):
         except Exception:
             pass
 
+    def on_dialog(self, d_id: int, style: int, title: str, info: str,
+                  b1: str = "", b2: str = ""):
+        """Сюжетные диалоги-меню (не реплики НПС)."""
+        if not self.running:
+            return
+        from logic.slava import match_stage
+
+        text = f"{title} {info}"
+        if match_stage(text) is not None:
+            self.engine.on_quest_text(text)
+
+    # ---- цикл --------------------------------------------------------
+
     def _run_loop(self):
-        self.bot.add_log("[КВЕСТ] Модуль прохождения квестов запущен. Ожидание событий...")
+        self.bot.add_log("[КВЕСТ] движок прохождения запущен")
         while self.running:
             try:
                 if not self.session.connected:
-                    time.sleep(5)
+                    time.sleep(3)
                     continue
-
-                # Проверяем, не требуется ли сесть в транспорт по квесту
-                self._check_auto_board_vehicle()
-
-                time.sleep(3)
+                # Вся работа — в потоке движка. Здесь только держим задачу
+                # живой и обновляем совместимые поля.
+                self.gift_claimed = self.engine.gift_claimed
+                if self.engine.stage is not None:
+                    self.stage = self.engine.stage.key
+                time.sleep(2)
             except Exception as e:
-                time.sleep(5)
-
+                self.bot.add_log(f"[КВЕСТ] сбой цикла: {e}")
+                time.sleep(3)
 
 class MinerTask(BaseTask):
     """
@@ -733,6 +783,9 @@ class MinerTask(BaseTask):
         self.minigame_active = False
         self.minigame_done = threading.Event()
         self.last_scooter_attempt = 0
+        # Последний пришедший диалог: аренда скутера подтверждается им,
+        # а не выдуманным dialog_id=1 (см. _find_and_rent_scooter).
+        self.last_dialog_id = None
         # Точные координаты шахты и спавнов Нижегородской области
         self.mine_territory = (2378.989, 1670.212, 13.782)
         self.mine_entrance = (2379.218, 1677.226, 15.284)
@@ -767,65 +820,45 @@ class MinerTask(BaseTask):
         """Автоматическое распознавание и решение капчи в диалогах на шахте"""
         if not self.running:
             return
+        # Запоминаем ЛЮБОЙ диалог, а не только капчу: аренда скутера
+        # подтверждается ответом в этот же d_id.
+        try:
+            self.last_dialog_id = int(d_id)
+        except Exception:
+            pass
+        if not looks_like_captcha_dialog(title, info):
+            return
         combined_text = f"{title} {info}"
-        c_lower = combined_text.lower()
-        if any(w in c_lower for w in ["капч", "проверк", "введите ответ", "сколько будет", "решите пример", "код", "букв", "картинк"]):
-            ans = solve_captcha_text(combined_text) or getattr(self, "last_captcha_solution", None)
-            self.bot.add_log(f"[ШАХТА-КАПЧА] Диалог проверки #{d_id}: '{title}'. Распознанный ответ: {ans}")
-            def _reply():
-                time.sleep(random.uniform(1.2, 2.2))
-                try:
-                    out_text = str(ans) if ans is not None else "1"
-                    self.session._sender.send(
-                        PacketBuilder.rpc_build("dialog_response", int(d_id), 1, 0, out_text),
-                        rpc_name="dialog_response",
-                    )
-                    self.bot.add_log(f"[ШАХТА-КАПЧА] Ответ '{out_text}' отправлен в диалог #{d_id}")
-                except Exception as e:
-                    self.bot.add_log(f"[ШАХТА-КАПЧА] Ошибка отправки капчи: {e}")
-            threading.Thread(target=_reply, daemon=True).start()
+        ans = solve_captcha_text(combined_text) or getattr(self, "last_captcha_solution", None)
+        self.bot.add_log(f"[ШАХТА-КАПЧА] Диалог проверки #{d_id}: '{title}'. Распознанный ответ: {ans}")
+        def _reply():
+            time.sleep(random.uniform(1.2, 2.2))
+            out_text = str(ans) if ans is not None else "1"
+            if self.bot.menu_answerer.answer(
+                self.session, int(d_id), list_item=0, response=1,
+                text=out_text, note=f"шахта-капча → '{out_text}'",
+            ):
+                self.bot.add_log(f"[ШАХТА-КАПЧА] Ответ '{out_text}' отправлен в диалог #{d_id}")
+        threading.Thread(target=_reply, daemon=True).start()
 
     def on_receive_json(self, interface_id: int, data: dict):
-        """Перехват мини-игры шахты и капчи в JSON-интерфейсах"""
+        """Перехват мини-игры шахты.
+
+        Капчу здесь НЕ трогаем: bot.py вызывает logic.captcha.handle_captcha
+        раньше задачи, и она уже отправила корректный {"t":0,"s":"..."} в iid 26.
+        Раньше тут стоял второй ответ по выдуманным ключам
+        {"t":1,"s":...,"ans":...,"r":1} — он летел следом и только мешал.
+        """
         if not self.running or not isinstance(data, dict):
             return
 
-        # Капча в JSON интерфейсе
-        json_str = str(data).lower()
-        if any(w in json_str for w in ["captcha", "капч", "answer", "question"]):
-            ans = solve_captcha_text(json_str)
-            if ans:
-                self.bot.add_log(f"[ШАХТА-КАПЧА] Решена JSON-капча (interface={interface_id}): ответ {ans}")
-                time.sleep(1.0)
-                try:
-                    self.api.send_json(interface_id, {"t": 1, "s": str(ans), "ans": str(ans), "r": 1})
-                except Exception:
-                    pass
-
-        is_minigame = any(k in data for k in ["slider", "green_zone", "minigame", "cursor", "target_zone", "target"])
-        if is_minigame or (data.get("t") in (1, 2) and "gz" in data):
-            self.bot.add_log(f"[ШАХТА] Обнаружена мини-игра (интерфейс {interface_id}). Решаем попадание...")
+        # Мини-игра — интерфейс 31, ключ "g". Ответ {"s":1} уже отправил
+        # logic.minigames.handle_minigame (bot.py вызывает его до задачи).
+        # Здесь только отмечаем факт, чтобы _run_loop не добивал клавишей.
+        if is_minigame_packet(interface_id, data):
+            self.bot.add_log(f"[ШАХТА] Мини-игра, режим g={data.get('g')} — отвечено")
             self.minigame_active = True
-            self.minigame_done.clear()
-
-            def _solve():
-                speed = float(data.get("speed", data.get("sp", 1.0)) or 1.0)
-                target = float(data.get("target", data.get("gz", 50.0)) or 50.0)
-                wait_time = max(0.4, min(1.8, target / (speed * 100.0) if speed > 0 else 0.8))
-                time.sleep(wait_time)
-                try:
-                    self.api.send_json(interface_id, {"t": 2, "r": 1, "success": 1})
-                    self.api.SetKey(keys=1)
-                    time.sleep(0.1)
-                    self.api.SetKey(keys=0)
-                    self.bot.add_log("[ШАХТА] Мини-игра шахты успешно пройдена (клик в зеленую зону)!")
-                except Exception as e:
-                    self.bot.add_log(f"[ШАХТА] Ошибка отправки результата мини-игры: {e}")
-                finally:
-                    self.minigame_active = False
-                    self.minigame_done.set()
-
-            threading.Thread(target=_solve, daemon=True).start()
+            self.minigame_done.set()
 
     def _find_and_rent_scooter(self) -> bool:
         """Поиск пикапа аренды скутеров, взаимодействие и спавн своего мопеда"""
@@ -879,15 +912,19 @@ class MinerTask(BaseTask):
             self.api.SetKey(keys=0)
             time.sleep(1.0)
 
-            # Подтверждаем диалог аренды скутера (Кнопка 'Арендовать' = 1)
-            try:
-                self.session._sender.send(
-                    PacketBuilder.rpc_build("dialog_response", 1, 1, 0, ""),
-                    rpc_name="dialog_response",
-                )
-            except Exception:
-                pass
-            self.bot.add_log("[ШАХТА-АРЕНДА] Пикап активирован, аренда подтверждена!")
+            # Подтверждаем диалог аренды скутера. Раньше здесь был
+            # rpc_build("dialog_response", 1, 1, 0, "") — dialog_id прибит
+            # гвоздями к 1, поэтому ответ уходил в пустоту и аренда не
+            # подтверждалась. Теперь отвечаем в тот диалог, что реально пришёл.
+            d_id = self.last_dialog_id
+            if d_id is not None:
+                if self.bot.menu_answerer.answer(
+                    self.session, int(d_id), list_item=0, response=1,
+                    note="шахта: аренда скутера",
+                ):
+                    self.bot.add_log(f"[ШАХТА-АРЕНДА] Аренда подтверждена в диалоге #{d_id}")
+            else:
+                self.bot.add_log("[ШАХТА-АРЕНДА] Диалог аренды не приходил — подтверждать нечего")
             time.sleep(1.5)
 
         # 2. После взаимодействия с пикапом сервером спавнится наш личный арендованный скутер рядом
@@ -992,33 +1029,44 @@ class MinerTask(BaseTask):
                     self.state = "mining"
 
                 elif self.state == "mining":
-                    # Выбираем случайную рудную точку
-                    target_ore = random.choice(self.mine_ore_points)
-                    self.bot.add_log(f"[ШАХТА] Идем к точке добычи руды ({target_ore[0]:.1f}, {target_ore[1]:.1f})...")
-                    self.api.MoveToCoord(
-                        target_ore[0], target_ore[1], target_ore[2],
-                        mode="walk",
-                        completion_distance=1.0
-                    )
+                    # Реальная точка добычи у нас одна, поэтому "random.choice"
+                    # по списку из одного элемента ничего не рандомизировал —
+                    # бот вставал в ту же точку с точностью до сантиметра.
+                    # Разбрасываем подход в радиусе метра.
+                    ox, oy, oz = random.choice(self.mine_ore_points)
+                    jitter = 1.2
+                    tx = ox + random.uniform(-jitter, jitter)
+                    ty = oy + random.uniform(-jitter, jitter)
+                    self.bot.add_log(f"[ШАХТА] Идем к точке добычи руды ({tx:.1f}, {ty:.1f})...")
+                    self.api.MoveToCoord(tx, ty, oz, mode="walk", completion_distance=1.0)
                     time.sleep(0.8)
 
                     self.bot.add_log("[ШАХТА] Добываем руду...")
-                    # Начинаем добычу руды клавишей действия
+                    # Сбрасываем флаг ДО удара: иначе wait() ниже возвращался
+                    # мгновенно на событии от прошлого цикла (clear+set подряд
+                    # в on_receive_json делали ожидание мёртвым).
+                    self.minigame_done.clear()
+                    self.minigame_active = False
                     self.api.SetKey(keys=1)
                     time.sleep(0.2)
                     self.api.SetKey(keys=0)
 
-                    # Ждем решение мини-игры (или до 10 секунд таймаут)
-                    self.minigame_done.wait(timeout=10.0)
+                    # Ждём мини-игру. Ответ {"s":1} отправляет logic.minigames
+                    # раньше задачи — здесь только ждём сам факт прихода.
+                    got_minigame = self.minigame_done.wait(timeout=10.0)
 
-                    # Дополнительные удары киркой для завершения добычи
-                    mine_time = random.uniform(3.0, 6.0)
-                    start_mine = time.time()
-                    while time.time() - start_mine < mine_time and self.running:
-                        self.api.SetKey(keys=1)
-                        time.sleep(0.25)
-                        self.api.SetKey(keys=0)
-                        time.sleep(random.uniform(0.8, 1.4))
+                    if got_minigame:
+                        # Мини-игра решена — не долбим клавишей поверх неё.
+                        time.sleep(random.uniform(0.4, 1.0))
+                    else:
+                        # Мини-игры не было — добиваем клавишей, как раньше.
+                        mine_time = random.uniform(3.0, 6.0)
+                        start_mine = time.time()
+                        while time.time() - start_mine < mine_time and self.running:
+                            self.api.SetKey(keys=1)
+                            time.sleep(0.25)
+                            self.api.SetKey(keys=0)
+                            time.sleep(random.uniform(0.8, 1.4))
 
                     self.ore_count += 1
                     self.bot.add_log(f"[ШАХТА] Руда добыта! (Всего за смену: {self.ore_count}). Несем на склад...")
@@ -1141,67 +1189,42 @@ class FactoryTask(BaseTask):
         """Автоматическое распознавание и решение капчи в диалогах на заводе"""
         if not self.running:
             return
+        if not looks_like_captcha_dialog(title, info):
+            return
         combined_text = f"{title} {info}"
-        c_lower = combined_text.lower()
-        if any(w in c_lower for w in ["капч", "проверк", "введите ответ", "сколько будет", "решите пример", "код", "букв", "картинк"]):
-            ans = solve_captcha_text(combined_text) or getattr(self, "last_captcha_solution", None)
-            self.bot.add_log(f"[ЗАВОД-КАПЧА] Диалог проверки #{d_id}: '{title}'. Распознанный ответ: {ans}")
-            def _reply():
-                time.sleep(random.uniform(1.2, 2.2))
-                try:
-                    out_text = str(ans) if ans is not None else "1"
-                    self.session._sender.send(
-                        PacketBuilder.rpc_build("dialog_response", int(d_id), 1, 0, out_text),
-                        rpc_name="dialog_response",
-                    )
-                    self.bot.add_log(f"[ЗАВОД-КАПЧА] Ответ '{out_text}' отправлен в диалог #{d_id}")
-                except Exception as e:
-                    self.bot.add_log(f"[ЗАВОД-КАПЧА] Ошибка отправки капчи: {e}")
-            threading.Thread(target=_reply, daemon=True).start()
+        ans = solve_captcha_text(combined_text) or getattr(self, "last_captcha_solution", None)
+        self.bot.add_log(f"[ЗАВОД-КАПЧА] Диалог проверки #{d_id}: '{title}'. Распознанный ответ: {ans}")
+        def _reply():
+            time.sleep(random.uniform(1.2, 2.2))
+            out_text = str(ans) if ans is not None else "1"
+            if self.bot.menu_answerer.answer(
+                self.session, int(d_id), list_item=0, response=1,
+                text=out_text, note=f"завод-капча → '{out_text}'",
+            ):
+                self.bot.add_log(f"[ЗАВОД-КАПЧА] Ответ '{out_text}' отправлен в диалог #{d_id}")
+        threading.Thread(target=_reply, daemon=True).start()
 
     def on_receive_json(self, interface_id: int, data: dict):
-        """Решение мини-игры со слайдером/ползунком и капчи на станке завода"""
+        """Решение мини-игры со слайдером/ползунком на станке завода.
+
+        Капчу здесь НЕ трогаем: bot.py вызывает logic.captcha.handle_captcha
+        раньше задачи, и она уже отправила корректный {"t":0,"s":"..."} в iid 26.
+        Раньше следом летел второй ответ по выдуманным ключам
+        {"t":1,"s":...,"ans":...,"r":1} и только мешал.
+        """
         if not self.running or not isinstance(data, dict):
             return
 
-        # Капча в JSON интерфейсе
-        json_str = str(data).lower()
-        if any(w in json_str for w in ["captcha", "капч", "answer", "question"]):
-            ans = solve_captcha_text(json_str)
-            if ans:
-                self.bot.add_log(f"[ЗАВОД-КАПЧА] Решена JSON-капча (interface={interface_id}): ответ {ans}")
-                time.sleep(1.0)
-                try:
-                    self.api.send_json(interface_id, {"t": 1, "s": str(ans), "ans": str(ans), "r": 1})
-                except Exception:
-                    pass
-
-        is_minigame = any(k in data for k in ["slider", "green_zone", "minigame", "cursor", "target_zone", "target"])
-        if is_minigame or (data.get("t") in (1, 2) and "gz" in data):
-            self.bot.add_log(f"[ЗАВОД] Мини-игра станка обнаружена (интерфейс {interface_id}). Расчет попадания...")
+        # Мини-игра станка — тот же интерфейс 31, ключ "g". Ответ уже
+        # отправлен logic.minigames.handle_minigame. Здесь только флаги для
+        # цикла задачи; выдуманный {"t":2,"r":1,"success":1} убран.
+        if is_minigame_packet(interface_id, data):
+            self.bot.add_log(
+                f"[ЗАВОД] Мини-игра станка, режим g={data.get('g')} — отвечено"
+            )
             self.minigame_active = True
-            self.minigame_done.clear()
-
-            def _solve():
-                speed = float(data.get("speed", data.get("sp", 1.0)) or 1.0)
-                target = float(data.get("target", data.get("gz", 50.0)) or 50.0)
-                wait_time = max(0.4, min(1.8, target / (speed * 100.0) if speed > 0 else 0.8))
-                time.sleep(wait_time)
-                try:
-                    self.api.send_json(interface_id, {"t": 2, "r": 1, "success": 1})
-                    self.api.SetKey(keys=1)
-                    time.sleep(0.1)
-                    self.api.SetKey(keys=0)
-                    self.minigame_success = True
-                    self.bot.add_log("[ЗАВОД] Ползунок успешно пойман в зеленую зону!")
-                except Exception as e:
-                    self.bot.add_log(f"[ЗАВОД] Ошибка мини-игры: {e}")
-                    self.minigame_success = False
-                finally:
-                    self.minigame_active = False
-                    self.minigame_done.set()
-
-            threading.Thread(target=_solve, daemon=True).start()
+            self.minigame_success = True
+            self.minigame_done.set()
 
     def _find_and_rent_scooter(self) -> bool:
         """Аренда скутера через пикап для поездки на завод"""
@@ -1383,16 +1406,20 @@ class FactoryTask(BaseTask):
                     self.api.SetKey(keys=0)
 
                     # Ждем завершения мини-игры со слайдером
-                    self.minigame_done.wait(timeout=10.0)
+                    got_minigame = self.minigame_done.wait(timeout=10.0)
 
-                    # Имитируем процесс работы на станке
-                    work_time = random.uniform(3.0, 5.0)
-                    start_work = time.time()
-                    while time.time() - start_work < work_time and self.running:
-                        self.api.SetKey(keys=1)
-                        time.sleep(0.2)
-                        self.api.SetKey(keys=0)
-                        time.sleep(random.uniform(0.7, 1.2))
+                    if got_minigame:
+                        # Мини-игра решена — не долбим клавишей поверх неё.
+                        time.sleep(random.uniform(0.4, 1.0))
+                    else:
+                        # Мини-игры не было — имитируем работу на станке.
+                        work_time = random.uniform(3.0, 5.0)
+                        start_work = time.time()
+                        while time.time() - start_work < work_time and self.running:
+                            self.api.SetKey(keys=1)
+                            time.sleep(0.2)
+                            self.api.SetKey(keys=0)
+                            time.sleep(random.uniform(0.7, 1.2))
 
                     # Если был зафиксирован брак/неудача, сбрасываем и берем новый ресурс
                     if not self.has_material or not self.minigame_success:

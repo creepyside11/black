@@ -29,7 +29,12 @@ class RPCParser:
 
         player_id = bs.read_uint16()
         color = bs.read_uint32()
-        is_npc = bs.read_uint8()
+        # Байт «NPC» в ответе Black Russia приходит не 0/1, а 0xFF у живых
+        # игроков. В сыром виде 255 — истина, и любой фильтр вида
+        # `if player.is_npc: continue` выкидывал ВСЕХ подряд: бот считал
+        # стрим пустым, хотя рядом стояло три десятка человек.
+        # NPC — это ровно 1.
+        is_npc = bs.read_uint8() == 1
         bs.skip_bits(64)
         name = bs.read_string(
             bs.read_uint8(),

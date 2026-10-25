@@ -129,16 +129,18 @@ class GeometryTests(unittest.TestCase):
         self.assertEqual(name, "Батырево")
 
     def test_unknown_station_is_not_guessed(self):
-        # Вокзал не из таблицы: ближайшая точка в 2км — это не «почти он».
-        far = (831.0, 778.4, 13.3)
+        # Точка далеко от всех известных вокзалов: ближайший в километрах —
+        # это не «почти он». Координата (831, 778) раньше была свободной,
+        # но теперь это Арзамас, поэтому берём заведомо пустое место.
+        far = (-1500.0, -1500.0, 5.0)
         name, dist = S.nearest_spawn_name(far)
         self.assertIsNone(name)
         self.assertGreater(dist, S.STATION_RADIUS)
-        self.assertIn("831", S.station_name(far))
+        self.assertIn("-1500", S.station_name(far))
 
     def test_remember_station_learns_new_point(self):
         before = set(S.SPAWNS)
-        point = (831.0, 778.4, 13.3)
+        point = (-1500.0, -1500.0, 5.0)
         S.remember_station(point)
         try:
             added = set(S.SPAWNS) - before
