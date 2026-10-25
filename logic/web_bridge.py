@@ -402,6 +402,43 @@ class WebBridge:
             proxy, bot_ids=args.get("ids") or None)
         return result
 
+    def _cmd_proxy_many(self, args):
+        """Прокси на выбранные аккаунты.
+
+        Принимает либо готовую строку (proxy), либо ключ узла из пула
+        (node). Во втором случае узел проходит через socks_url_for —
+        для VLESS/VMess он поднимает мост и отдаёт локальный socks5.
+        """
+        ids = self._ids(args)
+        raw = str(args.get("proxy") or "").strip()
+        node_key = str(args.get("node") or "").strip()
+        pool = getattr(self.manager, "proxy_pool", None)
+
+        if node_key:
+            node = pool.find_node(node_key) if pool else None
+            if node is None:
+                raise ValueError("узел не найден")
+            raw = pool.socks_url_for(node) or ""
+            if not raw:
+                raise ValueError(
+                    f"{node.name}: узел не поднялся (нужен мост sing-box)")
+        if not raw:
+            raise ValueError("не указан прокси")
+
+        if raw in ("none", "off", "reset"):
+            raw = ""
+
+        def run():
+            for bot_id in ids:
+                try:
+                    self.manager.set_bot_proxy(bot_id, raw)
+                except Exception as exc:
+                    self.log(f"[WEB] proxy #{bot_id}: {exc!r}")
+
+        threading.Thread(target=run, daemon=True,
+                         name="web-bulk-proxy").start()
+        return {"queued": ids, "count": len(ids)}
+
     def _cmd_vpn_status(self, args):
         return self._vpn_payload()
 
@@ -524,7 +561,19 @@ class WebBridge:
                 "total": len(nodes),
                 "usable": sum(1 for n in nodes if n["usable"]),
             }
-        return {"available": True, "nodes": nodes, "summary": summary}
+        # Сохранённые вручную прокси: панель строит из них выпадашку
+        # «применить к выбранным», чтобы не вводить строку каждый раз.
+        saved = []
+        for item in (getattr(pool, "manual", None) or []):
+            try:
+                saved.append({
+                    "name": str(item.get("name") or ""),
+                    "proxy": str(item.get("proxy") or ""),
+                })
+            except Exception:
+                continue
+        return {"available": True, "nodes": nodes, "summary": summary,
+                "saved": saved}
 
     def _snapshot(self) -> None:
         """Снимок для панели, когда её нет или бот занят."""

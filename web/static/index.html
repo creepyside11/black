@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#08060a">
+<title>RakCRMP — панель управления</title>
+<link rel="icon" href="/logo.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- ВХОД -->
+<div id="login" class="login-wrap hidden">
+  <form class="login-card glass" id="login-form" autocomplete="on">
+    <img src="/logo.svg" alt="Black Russia">
+    <h1>RakCRMP</h1>
+    <div class="sub">панель управления фермой</div>
+
+    <div class="field">
+      <label for="login-name">Логин</label>
+      <input id="login-name" name="login" type="text" autocomplete="username"
+             spellcheck="false" autocapitalize="off" required>
+    </div>
+    <div class="field">
+      <label for="login-pass">Пароль</label>
+      <input id="login-pass" name="password" type="password"
+             autocomplete="current-password" required>
+    </div>
+
+    <div class="err" id="login-err"></div>
+    <button class="btn btn-red btn-block" type="submit" id="login-btn">Войти</button>
+  </form>
+</div>
+
+<!-- ПАНЕЛЬ -->
+<div id="app" class="shell hidden">
+  <header class="topbar glass">
+    <img src="/logo.svg" alt="Black Russia">
+    <div class="brand">
+      <b>RakCRMP</b>
+      <span>BLACK RUSSIA FARM</span>
+    </div>
+    <div class="spacer"></div>
+    <a class="tg-link" href="https://t.me/an0ym" target="_blank" rel="noopener">
+      ✈ <span>Telegram</span>
+    </a>
+    <button class="icon-btn" id="logout" title="Выйти">⏻</button>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab active" data-tab="accounts">Аккаунты</button>
+    <button class="tab" data-tab="vpn">Прокси и VPN</button>
+    <button class="tab" data-tab="create">Создание</button>
+    <button class="tab" data-tab="settings">Настройки</button>
+  </nav>
+
+  <!-- АККАУНТЫ -->
+  <section id="tab-accounts">
+    <div class="stats" id="stats"></div>
+
+    <div class="panel glass">
+      <div class="panel-head">
+        <label class="check-all" title="Выделить всех">
+          <input type="checkbox" id="pick-all">
+        </label>
+        <h2>Аккаунты</h2>
+        <span class="count" id="bots-count"></span>
+        <div class="spacer"></div>
+        <input class="search" id="bots-search" placeholder="Поиск по нику или серверу">
+        <button class="btn btn-sm" id="refresh">Обновить</button>
+      </div>
+
+      <div class="bulk hidden" id="bulk">
+        <span class="bulk-count" id="bulk-count">Выбрано: 0</span>
+        <button class="btn btn-sm green" data-bulk="start">▶ Запустить</button>
+        <button class="btn btn-sm" data-bulk="stop">■ Остановить</button>
+        <button class="btn btn-sm" data-bulk="stats">↻ Статистика</button>
+        <button class="btn btn-sm" data-bulk="real_world">◎ В мир</button>
+        <button class="btn btn-sm red" data-bulk="delete">✕ Удалить</button>
+        <select class="bulk-proxy" id="bulk-proxy" title="Прокси для выбранных">
+          <option value="">— прокси —</option>
+        </select>
+        <button class="btn btn-sm" data-bulk="proxy">🌐 Прокси</button>
+        <div class="spacer"></div>
+        <button class="btn btn-sm" id="bulk-clear">Снять</button>
+      </div>
+
+      <div class="bots" id="bots"></div>
+    </div>
+  </section>
+
+  <!-- VPN -->
+  <section id="tab-vpn" class="hidden">
+    <div class="stats" id="vpn-stats"></div>
+    <div class="panel glass">
+      <div class="panel-head">
+        <h2>Серверы прокси и VPN</h2>
+        <span class="count" id="vpn-count"></span>
+        <div class="spacer"></div>
+        <button class="btn btn-sm" id="vpn-refresh">Перепроверить</button>
+      </div>
+      <div class="nodes" id="nodes"></div>
+    </div>
+  </section>
+
+  <!-- СОЗДАНИЕ -->
+  <section id="tab-create" class="hidden">
+    <div class="panel glass">
+      <div class="panel-head"><h2>Новый аккаунт</h2></div>
+      <form id="create-form" class="form-grid">
+        <div class="field">
+          <label for="c-server">Сервер</label>
+          <select id="c-server" required></select>
+        </div>
+        <div class="field">
+          <label for="c-nick">Ник (пусто — сгенерировать)</label>
+          <input id="c-nick" type="text" maxlength="20" spellcheck="false" autocapitalize="off">
+        </div>
+        <div class="field">
+          <label for="c-pass">Пароль (пусто — базовый)</label>
+          <input id="c-pass" type="text" spellcheck="false" autocapitalize="off">
+        </div>
+        <div class="field">
+          <label for="c-task">Задача</label>
+          <select id="c-task">
+            <option value="lvl">Прокачка</option>
+            <option value="quest">Квесты</option>
+            <option value="mine">Шахта</option>
+            <option value="factory">Завод</option>
+            <option value="bus">Автобус</option>
+            <option value="stop">Без задачи</option>
+          </select>
+        </div>
+        <div class="field" style="align-self:end">
+          <button class="btn btn-red btn-block" type="submit" id="c-submit">Создать</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <!-- НАСТРОЙКИ -->
+  <section id="tab-settings" class="hidden">
+    <div class="panel glass">
+      <div class="panel-head"><h2>Базовые настройки</h2></div>
+      <form id="settings-form" class="form-grid">
+        <div class="field">
+          <label for="s-pass">Базовый пароль новых аккаунтов</label>
+          <input id="s-pass" type="text" spellcheck="false" autocapitalize="off">
+        </div>
+        <div class="field">
+          <label for="s-task">Задача по умолчанию</label>
+          <select id="s-task">
+            <option value="lvl">Прокачка</option>
+            <option value="quest">Квесты</option>
+            <option value="mine">Шахта</option>
+            <option value="factory">Завод</option>
+            <option value="bus">Автобус</option>
+            <option value="stop">Без задачи</option>
+          </select>
+        </div>
+        <div class="field" style="align-self:end">
+          <button class="btn btn-red btn-block" type="submit" id="s-submit">Сохранить</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <div class="foot">
+    RakCRMP · <a href="https://t.me/an0ym" target="_blank" rel="noopener">t.me/an0ym</a>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<script src="/app.js"></script>
+</body>
+</html>

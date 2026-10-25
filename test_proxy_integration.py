@@ -265,5 +265,90 @@ class BatchProxyTests(unittest.TestCase):
         self.assertEqual(created, [SOCKS, SOCKS])
 
 
+class PerAccountBridgeTests(unittest.TestCase):
+    """Узел с мостом применяется к ОДНОМУ аккаунту так же, как ко всем.
+
+    Раньше меню одного бота проверяло node.is_direct и звало proxy_url(),
+    а у VLESS он пустой: «этот узел требует внешний клиент». Массовое
+    применение шло через socks_url_for и работало. Теперь путь один.
+    """
+
+    def test_bridge_node_gets_local_socks(self):
+        pool = MagicMock()
+        pool.socks_url_for.return_value = "socks5://127.0.0.1:20001"
+        pool.verify_before_connect.return_value = (True, "живой")
+
+        node = MagicMock()
+        node.is_direct = False
+        node.proxy_url.return_value = ""
+        node.name = "Германия"
+        pool.find_node.return_value = node
+
+        url = pool.socks_url_for(node)
+        self.assertTrue(url.startswith("socks5://127.0.0.1:"))
+        ok, _ = pool.verify_before_connect(url)
+        self.assertTrue(ok)
+
+    def test_direct_url_is_empty_for_client_protocol(self):
+        from logic.vpn_sub import parse_link
+
+        node = parse_link(VLESS)
+        self.assertIsNotNone(node)
+        self.assertFalse(node.is_direct)
+        self.assertEqual(node.proxy_url(), "",
+                         "у VLESS прямой URL пустой — нужен мост")
+
+
+class ReplaceProxyTests(unittest.TestCase):
+    """Прокси при автозамене забаненного аккаунта берётся из настроек."""
+
+    def _manager(self):
+        manager = botmod.BotManager.__new__(botmod.BotManager)
+        manager.settings = MagicMock()
+        manager.proxy_pool = None
+        return manager
+
+    def test_inherit_keeps_old_proxy(self):
+        manager = self._manager()
+        manager.settings.replace_proxy = "inherit"
+        old = MagicMock()
+        old.proxy = SOCKS
+        self.assertEqual(manager.proxy_for_replacement(old), SOCKS)
+
+    def test_none_gives_own_ip(self):
+        manager = self._manager()
+        manager.settings.replace_proxy = "none"
+        old = MagicMock()
+        old.proxy = SOCKS
+        self.assertEqual(manager.proxy_for_replacement(old), "")
+
+    def test_pool_takes_node_from_pool(self):
+        manager = self._manager()
+        manager.settings.replace_proxy = "pool"
+        manager.proxy_pool = MagicMock()
+        manager.proxy_pool.rotate.return_value = ["socks5://127.0.0.1:20002"]
+        old = MagicMock()
+        old.proxy = SOCKS
+        self.assertEqual(
+            manager.proxy_for_replacement(old), "socks5://127.0.0.1:20002")
+
+    def test_pool_falls_back_to_old_when_empty(self):
+        manager = self._manager()
+        manager.settings.replace_proxy = "pool"
+        manager.proxy_pool = MagicMock()
+        manager.proxy_pool.rotate.return_value = []
+        old = MagicMock()
+        old.proxy = SOCKS
+        self.assertEqual(manager.proxy_for_replacement(old), SOCKS)
+
+    def test_raw_string_is_used_as_is(self):
+        manager = self._manager()
+        manager.settings.replace_proxy = "socks5://1.2.3.4:1080"
+        old = MagicMock()
+        old.proxy = SOCKS
+        self.assertEqual(
+            manager.proxy_for_replacement(old), "socks5://1.2.3.4:1080")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

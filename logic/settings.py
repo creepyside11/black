@@ -45,6 +45,11 @@ class Settings:
             "default_task": DEFAULT_TASK,
             # Сколько аккаунтов разрешено создавать одной партией.
             "batch_limit": 50,
+            # Какой прокси ставить новому аккаунту при автозамене
+            # забаненного. "inherit" — тот же, что был у старого;
+            # "pool" — взять рабочий узел из пула; "none" — своё IP;
+            # иначе это готовая строка прокси или имя сохранённого.
+            "replace_proxy": "inherit",
         }
         self.load()
 
@@ -62,7 +67,8 @@ class Settings:
         if not isinstance(data, dict):
             return
         with self._lock:
-            for key in ("base_password", "default_task", "batch_limit"):
+            for key in ("base_password", "default_task", "batch_limit",
+                        "replace_proxy"):
                 if key in data:
                     self._data[key] = data[key]
 
@@ -104,6 +110,18 @@ class Settings:
             value = DEFAULT_TASK
         with self._lock:
             self._data["default_task"] = value
+        self.save()
+
+    @property
+    def replace_proxy(self) -> str:
+        with self._lock:
+            return str(self._data.get("replace_proxy") or "inherit").strip()
+
+    @replace_proxy.setter
+    def replace_proxy(self, value: str) -> None:
+        value = (value or "inherit").strip() or "inherit"
+        with self._lock:
+            self._data["replace_proxy"] = value
         self.save()
 
     @property

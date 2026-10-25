@@ -179,6 +179,10 @@ class TelegramBotController:
         # Быстрые глобальные действия
         markup.row(
             types.InlineKeyboardButton("▶️ Запустить выбранных", callback_data=f"act_start_some:{page}", style="success"),
+            types.InlineKeyboardButton("⏹ Остановить выбранных", callback_data=f"act_stop_some:{page}", style="danger"),
+        )
+        markup.row(
+            types.InlineKeyboardButton("🌐 Прокси выбранным", callback_data=f"act_proxy_some:{page}", style="primary"),
             types.InlineKeyboardButton("▶️ Всех", callback_data="act_startall", style="success"),
             types.InlineKeyboardButton("⏹ Всех", callback_data="act_stopall", style="danger")
         )
@@ -213,7 +217,10 @@ class TelegramBotController:
                 f"<i>Его получают все новые аккаунты: при массовой регистрации "
                 f"и при автозамене забаненных.</i>\n\n"
                 f"🎯 Задача по умолчанию: <code>{settings.default_task}</code>\n"
-                f"📦 Лимит партии: <b>{settings.batch_limit}</b>"
+                f"📦 Лимит партии: <b>{settings.batch_limit}</b>\n"
+                f"🌐 Прокси при автозамене: <b>{self._replace_proxy_label(settings)}</b>\n"
+                f"<i>Какой адрес получит новый аккаунт, когда старый уйдёт "
+                f"в бан и его заменит свежий.</i>"
             )
             markup.add(types.InlineKeyboardButton(
                 "🔑 Изменить базовый пароль",
@@ -224,9 +231,72 @@ class TelegramBotController:
             markup.add(types.InlineKeyboardButton(
                 f"📦 Лимит партии: {settings.batch_limit}",
                 callback_data="set_batch_limit", style="primary"))
+            markup.add(types.InlineKeyboardButton(
+                f"🌐 Прокси при автозамене: {settings.replace_proxy}",
+                callback_data="set_replace_proxy", style="primary"))
         markup.add(types.InlineKeyboardButton(
             "⬅️ Назад в меню", callback_data="page:1", style="primary"))
 
+        if message_id is None:
+            self.bot.send_message(chat_id, text, reply_markup=markup)
+        else:
+            try:
+                self.bot.edit_message_text(
+                    text, chat_id=chat_id, message_id=message_id, reply_markup=markup)
+            except Exception:
+                self.bot.send_message(chat_id, text, reply_markup=markup)
+        if callback_id:
+            try:
+                self.bot.answer_callback_query(callback_id)
+            except Exception:
+                pass
+
+    REPLACE_PROXY_CHOICES = (
+        ("inherit", "тот же, что был у старого"),
+        ("pool", "взять из пула"),
+        ("none", "своё IP"),
+    )
+
+    def _replace_proxy_label(self, settings) -> str:
+        mode = settings.replace_proxy
+        for key, title in self.REPLACE_PROXY_CHOICES:
+            if key == mode:
+                return f"{key} — {title}"
+        return mode
+
+    def _render_replace_proxy(self, chat_id, message_id=None, callback_id=None):
+        settings = getattr(self.manager, "settings", None)
+        if settings is None:
+            return
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        current = settings.replace_proxy
+        for key, title in self.REPLACE_PROXY_CHOICES:
+            mark = "✅ " if key == current else ""
+            markup.add(types.InlineKeyboardButton(
+                f"{mark}{title} ({key})",
+                callback_data=f"replace_proxy:{key}",
+                style="success" if key == current else "primary"))
+        # Сохранённые прокси тоже годятся: у части людей адрес привязан
+        # к аккаунту, и менять его при замене нельзя.
+        for index, (name, _value) in enumerate(load_proxy_list()[:5]):
+            mark = "✅ " if current == name else ""
+            markup.add(types.InlineKeyboardButton(
+                f"{mark}⚡️ {name}",
+                callback_data=f"replace_proxy:s{index}",
+                style="success" if current == name else "primary"))
+        markup.add(types.InlineKeyboardButton(
+            "⬅️ Назад", callback_data="settings", style="primary"))
+
+        text = (
+            "<b>🌐 Прокси при автозамене аккаунта</b>\n\n"
+            "Когда аккаунт уходит в бан и вместо него создаётся новый, "
+            "какой адрес ему дать.\n\n"
+            "<b>inherit</b> — тот же, что был у старого. Новый аккаунт "
+            "не светит свежий IP рядом со старым.\n"
+            "<b>pool</b> — рабочий узел из пула.\n"
+            "<b>none</b> — своё IP.\n\n"
+            f"Сейчас: <code>{settings.replace_proxy}</code>"
+        )
         if message_id is None:
             self.bot.send_message(chat_id, text, reply_markup=markup)
         else:
@@ -539,6 +609,70 @@ class TelegramBotController:
             parts.append(f"\n⏳ Этап: <i>{self.PHASE_NAMES[phase]}</i>")
         return "".join(f"\n{part}" if not part.startswith("\n") else part
                        for part in parts)
+
+    def _parse_ids(self, raw: str) -> list[int]:
+        """Разобрать «1-5, 8, 12-15» в список ID.
+
+        Один разбор на запуск, остановку и прокси: три копии одинакового
+        кода разъезжались, и диапазоны в одном месте работали, а в другом
+        молча игнорировались.
+        """
+        ids = set()
+        for token in re.split(r"[\s,]+", (raw or "").strip()):
+            if not token:
+                continue
+            if "-" in token:
+                left, _, right = token.partition("-")
+                if left.isdigit() and right.isdigit():
+                    start, end = int(left), int(right)
+                    if start > end:
+                        start, end = end, start
+                    # Ограничение, чтобы опечатка «1-99999» не повесила бота.
+                    for value in range(start, min(end, start + 500) + 1):
+                        ids.add(value)
+            elif token.isdigit():
+                ids.add(int(token))
+        return sorted(ids)
+
+    def _ask_bulk_proxy(self, chat_id, ids: list[int], page: int = 1):
+        """Меню выбора прокси для пачки аккаунтов."""
+        self._bulk_proxy_ids = ids
+        pool = getattr(self.manager, "proxy_pool", None)
+        saved = load_proxy_list()
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        picks = {}
+
+        for index, (name, _value) in enumerate(saved[:6]):
+            token = f"s{index}"
+            picks[token] = ("saved", name)
+            markup.add(types.InlineKeyboardButton(
+                f"⚡️ {name}", callback_data=f"bulkpx:{token}", style="success"))
+
+        if pool is not None:
+            for index, res in enumerate(pool.statuses()[:6]):
+                node = res.node
+                mark = "🟢" if res.usable else ("🟡" if res.alive else "🔴")
+                label = f"{mark} {node.name[:22]}"
+                if not node.is_direct:
+                    label += " (мост)"
+                token = f"n{index}"
+                picks[token] = ("node", node.key)
+                markup.add(types.InlineKeyboardButton(
+                    label, callback_data=f"bulkpx:{token}", style="primary"))
+
+        self._bulk_px_picks = picks
+        markup.add(types.InlineKeyboardButton(
+            "🚫 Свой IP (сбросить)", callback_data="bulkpx:none", style="danger"))
+        markup.add(types.InlineKeyboardButton(
+            "⬅️ Отмена", callback_data=f"page:{page}", style="primary"))
+
+        self.bot.send_message(
+            chat_id,
+            f"<b>🌐 Прокси для {len(ids)} аккаунт(ов)</b>\n\n"
+            f"Выбери узел. Узлы с пометкой «мост» поднимаются через sing-box "
+            f"и тоже рабочие.",
+            reply_markup=markup,
+        )
 
     def _bot_card(self, b, page):
         """Текст и кнопки карточки бота. Общие для показа и автообновления."""
@@ -864,6 +998,79 @@ class TelegramBotController:
                 )
                 self.bot.send_message(chat_id, help_msg)
 
+            elif data.startswith("act_stop_some:"):
+                page = int(data.split(":")[1])
+                self.bot.answer_callback_query(call.id)
+                self.user_states[chat_id] = {"action": "stop_selected_bots", "page": page}
+                self.bot.send_message(
+                    chat_id,
+                    "<b>⏹ Остановка нескольких ботов</b>\n\n"
+                    "Введите ID через пробел или запятую, либо диапазон:\n"
+                    "• <code>1 2 5 8</code>\n"
+                    "• <code>1-10</code>\n"
+                    "• <code>1-5, 8, 12-15</code>\n\n"
+                    "Для отмены: /cancel",
+                )
+
+            elif data.startswith("act_proxy_some:"):
+                page = int(data.split(":")[1])
+                self.bot.answer_callback_query(call.id)
+                self.user_states[chat_id] = {"action": "proxy_selected_bots", "page": page}
+                self.bot.send_message(
+                    chat_id,
+                    "<b>🌐 Прокси для нескольких ботов</b>\n\n"
+                    "Введите ID через пробел или запятую, либо диапазон:\n"
+                    "• <code>1 2 5 8</code>\n"
+                    "• <code>1-10</code>\n\n"
+                    "Дальше выберете узел. Для отмены: /cancel",
+                )
+
+            elif data.startswith("bulkpx:"):
+                token = data.split(":", 1)[1]
+                ids = getattr(self, "_bulk_proxy_ids", None) or []
+                if not ids:
+                    self.bot.answer_callback_query(
+                        call.id, "Список устарел, начни заново", show_alert=True)
+                    return
+
+                if token == "none":
+                    proxy = ""
+                else:
+                    pick = (getattr(self, "_bulk_px_picks", None) or {}).get(token)
+                    if pick is None:
+                        self.bot.answer_callback_query(
+                            call.id, "Меню устарело, открой заново", show_alert=True)
+                        return
+                    kind, value = pick
+                    if kind == "saved":
+                        proxy = dict(load_proxy_list()).get(value, "")
+                    else:
+                        pool = getattr(self.manager, "proxy_pool", None)
+                        node = pool.find_node(value) if pool else None
+                        if node is None:
+                            self.bot.answer_callback_query(
+                                call.id, "Узел не найден", show_alert=True)
+                            return
+                        proxy = pool.socks_url_for(node) or ""
+                        if not proxy:
+                            self.bot.answer_callback_query(
+                                call.id,
+                                f"{node.name}: не поднялся мост sing-box",
+                                show_alert=True,
+                            )
+                            return
+
+                done = 0
+                for bot_id in ids:
+                    try:
+                        if self.manager.set_bot_proxy(bot_id, proxy):
+                            done += 1
+                    except Exception:
+                        continue
+                self.bot.answer_callback_query(
+                    call.id, f"Прокси применён: {done} из {len(ids)}", show_alert=True)
+                self._bulk_proxy_ids = []
+
             elif data == "act_startall":
                 self.bot.answer_callback_query(call.id, "Запуск всех ботов...")
                 threading.Thread(target=self.manager.start_all, daemon=True).start()
@@ -956,6 +1163,30 @@ class TelegramBotController:
 
             elif data == "settings_menu":
                 self._render_settings(chat_id, message_id, call.id)
+
+            elif data == "settings":
+                self._render_settings(chat_id, message_id, call.id)
+
+            elif data == "set_replace_proxy":
+                self._render_replace_proxy(chat_id, message_id, call.id)
+
+            elif data.startswith("replace_proxy:"):
+                choice = data.split(":", 1)[1]
+                settings = getattr(self.manager, "settings", None)
+                if settings is None:
+                    self.bot.answer_callback_query(call.id, "Настройки недоступны")
+                    return
+                if choice.startswith("s") and choice[1:].isdigit():
+                    saved = load_proxy_list()
+                    index = int(choice[1:])
+                    if index >= len(saved):
+                        self.bot.answer_callback_query(
+                            call.id, "Список устарел", show_alert=True)
+                        return
+                    settings.replace_proxy = saved[index][0]
+                else:
+                    settings.replace_proxy = choice
+                self._render_replace_proxy(chat_id, message_id, call.id)
 
             elif data == "set_base_password":
                 self.user_states[chat_id] = {"action": "set_base_password"}
@@ -1262,7 +1493,11 @@ class TelegramBotController:
                 # красные мёртвые. Нажать можно только зелёный.
                 pool = getattr(self.manager, "proxy_pool", None)
                 if pool is not None:
-                    for res in pool.statuses()[:8]:
+                    # Полный ключ узла в callback_data не влезает (лимит
+                    # 64 байта), поэтому в кнопку кладём короткий номер,
+                    # а сам ключ держим в словаре на этот рендер.
+                    picks = {}
+                    for index, res in enumerate(pool.statuses()[:8]):
                         node = res.node
                         if res.usable:
                             mark = "🟢"
@@ -1271,19 +1506,21 @@ class TelegramBotController:
                         else:
                             mark = "🔴"
                         latency = f" {res.latency_ms:.0f}мс" if res.latency_ms else ""
-                        label = f"{mark} {node.name[:24]}{latency}"
-                        if node.is_direct:
-                            markup.add(types.InlineKeyboardButton(
-                                label,
-                                callback_data=f"pool_px:{bid}:{page}:{node.key}",
-                                style="success",
-                            ))
-                        else:
-                            markup.add(types.InlineKeyboardButton(
-                                f"{label} (нужен клиент)",
-                                callback_data=f"pool_dead:{bid}:{page}",
-                                style="danger",
-                            ))
+                        label = f"{mark} {node.name[:22]}{latency}"
+                        # Узлу с внешним клиентом нужен мост sing-box:
+                        # без него VLESS применить некуда. Мост поднимает
+                        # pool.socks_url_for, поэтому кнопка рабочая —
+                        # раньше такие узлы были красными и не нажимались.
+                        if not node.is_direct:
+                            label = f"{label} (мост)"
+                        token = str(index)
+                        picks[token] = node.key
+                        markup.add(types.InlineKeyboardButton(
+                            label,
+                            callback_data=f"pool_px:{bid}:{page}:{token}",
+                            style="success" if res.usable else "primary",
+                        ))
+                    self._px_picks = picks
                     markup.add(types.InlineKeyboardButton(
                         "🔄 Проверить прокси", callback_data=f"pool_refresh:{bid}:{page}",
                         style="success",
@@ -1312,19 +1549,34 @@ class TelegramBotController:
                 handle_callbacks(call)
 
             elif data.startswith("pool_px:"):
-                _, bid_s, page_s, node_key = data.split(":", 3)
+                _, bid_s, page_s, token = data.split(":", 3)
                 bid = int(bid_s)
                 page = int(page_s)
                 pool = getattr(self.manager, "proxy_pool", None)
+                picks = getattr(self, "_px_picks", None) or {}
+                node_key = picks.get(token, token)
                 node = pool.find_node(node_key) if pool else None
-                if node is None or not node.is_direct:
-                    self.bot.answer_callback_query(call.id, "Узел не годится", show_alert=True)
+                if node is None:
+                    self.bot.answer_callback_query(
+                        call.id, "Меню устарело, открой заново", show_alert=True)
                     return
-                ok, reason = pool.verify_before_connect(node.proxy_url())
+                # socks_url_for поднимает мост для VLESS/VMess/Trojan/SS и
+                # отдаёт локальный socks5. Прямой proxy_url() у таких узлов
+                # пустой — из-за этого раньше и было «бот умеет только socks5».
+                url = pool.socks_url_for(node)
+                if not url:
+                    self.bot.answer_callback_query(
+                        call.id,
+                        f"{node.name}: узел не поднялся. Нужен мост sing-box "
+                        f"(BR_VPN_BRIDGE=1) — без него VLESS применить некуда.",
+                        show_alert=True,
+                    )
+                    return
+                ok, reason = pool.verify_before_connect(url)
                 if not ok:
                     self.bot.answer_callback_query(call.id, f"Не работает: {reason}", show_alert=True)
                     return
-                if self.manager.set_bot_proxy(bid, node.proxy_url()):
+                if self.manager.set_bot_proxy(bid, url):
                     self.bot.answer_callback_query(call.id, f"Применён: {node.name}", show_alert=True)
                 else:
                     self.bot.answer_callback_query(call.id, "Не вышло", show_alert=True)
@@ -1681,32 +1933,31 @@ class TelegramBotController:
                     message, f"✅ Лимит партии: <b>{settings.batch_limit}</b>")
                 self._render_settings(message.chat.id)
 
-            elif action == "start_selected_bots":
+            elif action in ("start_selected_bots", "stop_selected_bots",
+                            "proxy_selected_bots"):
                 page = state.get("page", 1)
                 del self.user_states[message.chat.id]
-                raw_input = message.text.strip()
-                ids_to_start = set()
+                selected_list = self._parse_ids(message.text)
 
-                tokens = re.split(r'[\s,]+', raw_input)
-                for t in tokens:
-                    if not t:
-                        continue
-                    if "-" in t:
-                        parts = t.split("-", 1)
-                        if parts[0].isdigit() and parts[1].isdigit():
-                            r_start, r_end = int(parts[0]), int(parts[1])
-                            if r_start > r_end:
-                                r_start, r_end = r_end, r_start
-                            for x in range(r_start, r_end + 1):
-                                ids_to_start.add(x)
-                    elif t.isdigit():
-                        ids_to_start.add(int(t))
-
-                if not ids_to_start:
+                if not selected_list:
                     self.bot.reply_to(message, "❌ Не распознано ни одного ID бота. Пример: <code>1-5, 8, 10</code>")
                     return
 
-                selected_list = sorted(list(ids_to_start))
+                if action == "stop_selected_bots":
+                    stopped = self.manager.stop_selected(selected_list)
+                    self.bot.reply_to(
+                        message,
+                        f"⏹ Остановлены ({len(stopped)} шт.): "
+                        + ", ".join(f"#{i}" for i in stopped[:15])
+                        if stopped else "⚠️ Таких ботов нет или они уже стоят.",
+                    )
+                    return
+
+                if action == "proxy_selected_bots":
+                    self._ask_bulk_proxy(message.chat.id, selected_list, page)
+                    return
+
+                ids_to_start = set(selected_list)
                 started = self.manager.start_selected(selected_list)
                 if started:
                     names_str = ", ".join([f"#{b.bot_id} [{b.nickname}]" for b in started[:10]])

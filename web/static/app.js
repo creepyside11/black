@@ -182,6 +182,7 @@ function render() {
 
   renderBots(bots);
   renderVpn(vpn);
+  renderBulkProxy(vpn);
   renderSettings();
   pruneSelection();
   renderBulk();
@@ -313,6 +314,36 @@ function shortProxy(url) {
   return m ? `${m[1]}:${m[2]}` : String(url).slice(0, 24);
 }
 
+// Выпадашка «прокси для выбранных»: сохранённые вручную плюс узлы пула.
+// Узлы с мостом тоже годятся — сервер сам поднимет sing-box и отдаст
+// локальный socks5.
+function renderBulkProxy(vpn) {
+  const sel = $("#bulk-proxy");
+  if (!sel) return;
+  const keep = sel.value;
+  const saved = vpn.saved || [];
+  const nodes = (vpn.nodes || []).filter((n) => n.usable || n.alive);
+  const parts = ['<option value="">— прокси —</option>'];
+  if (saved.length) {
+    parts.push('<optgroup label="Сохранённые">');
+    for (const item of saved) {
+      parts.push(`<option value="px:${escapeHtml(item.name)}">${escapeHtml(item.name)}</option>`);
+    }
+    parts.push('</optgroup>');
+  }
+  if (nodes.length) {
+    parts.push('<optgroup label="Узлы пула">');
+    for (const node of nodes) {
+      const mark = node.usable ? "🟢" : "🟡";
+      parts.push(`<option value="node:${escapeHtml(node.key)}">${mark} ${escapeHtml(node.name)}</option>`);
+    }
+    parts.push('</optgroup>');
+  }
+  parts.push('<option value="none">🚫 Свой IP (сбросить)</option>');
+  sel.innerHTML = parts.join("");
+  if (keep) sel.value = keep;
+}
+
 function renderVpn(vpn) {
   const nodes = vpn.nodes || [];
   const summary = vpn.summary || {};
@@ -400,18 +431,45 @@ document.addEventListener("click", async (e) => {
     if (!ids.length) return;
     if (act === "delete" && !confirm(`Удалить ${ids.length} аккаунт(ов)?`)) return;
 
-    bulkBtn.disabled = true;
-    try {
+    // Прокси для выбранных берём из выпадашки: имя сохранённого или
+    // ключ узла пула. Пусто — ничего не делаем, чтобы не сбросить
+    // случайно настроенные прокси.
+    let payload = { ids };
+    let cmd;
+    if (act === "proxy") {
+      const value = ($("#bulk-proxy") || {}).value || "";
+      if (!value) {
+        toast("Выбери прокси в списке", "bad");
+        return;
+      }
+      cmd = "proxy_many";
+      if (value === "none") payload.proxy = "none";
+      else if (value.startsWith("node:")) payload.node = value.slice(5);
+      else if (value.startsWith("px:")) {
+        const item = ((state.vpn || {}).saved || [])
+          .find((p) => p.name === value.slice(3));
+        if (!item) {
+          toast("Сохранённый прокси не найден", "bad");
+          return;
+        }
+        payload.proxy = item.proxy;
+      }
+    } else {
       // Старт/стоп/удаление идут пачкой, статистика и вход в мир —
       // своими командами: они работают в фоне и не блокируют мост.
-      const cmd = act === "stats" ? "stats"
+      cmd = act === "stats" ? "stats"
         : act === "real_world" ? "real_world"
         : act + "_many";
-      const res = await post(cmd, { ids });
+    }
+
+    bulkBtn.disabled = true;
+    try {
+      const res = await post(cmd, payload);
       const done = (res.result || {}).count ?? ids.length;
       toast(
         act === "delete" ? `Удаляю: ${done}`
           : act === "stats" ? `Запросил статистику: ${done}`
+          : act === "proxy" ? `Прокси применяю: ${done}`
           : `В очереди: ${done}`,
         "ok",
       );

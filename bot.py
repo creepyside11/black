@@ -38,7 +38,8 @@ from samp.sync import PlayerSyncScheduler
 from logic.registration import RegistrationConfig
 from logic.json_ui import JsonUIConfig
 from logic.events import emitter
-from logic.bot_tasks import LevelGrinderTask, QuestMasterTask, MinerTask, FactoryTask, BusDriverTask
+from logic.bot_tasks import (LevelGrinderTask, LevelRunnerTask, QuestMasterTask,
+                             MinerTask, FactoryTask, BusDriverTask)
 from tg_controller import TelegramBotController
 
 # Файл с аккаунтами (рядом с bot.py, независимо от cwd)
@@ -63,6 +64,35 @@ PROXY_REFRESH_INTERVAL = float(os.environ.get("BR_PROXY_REFRESH", "300"))
 
 # Максимальная длина игрового ника в Black Russia
 MAX_NICKNAME_LEN = 20
+
+# Сколько секунд считать повторное сообщение о бане тем же самым баном.
+# Сервер пишет о бане дважды: строкой в чат и диалогом на входе.
+BAN_ALERT_DEDUPE = 300.0
+
+# Пауза между созданием аккаунтов-замен.
+#
+# При волне банов замена запускается на каждый забаненный аккаунт сразу.
+# Раньше это давало полсотни регистраций почти одновременно — сервер
+# отвечает на такое блокировкой за частые входы, и свежие аккаунты
+# сгорают быстрее, чем успевают зайти. Создаём по одному с интервалом.
+REPLACE_INTERVAL = max(5.0, float(os.environ.get("BR_REPLACE_INTERVAL", "25")))
+
+# Пауза перед самой первой заменой после простоя: не создавать аккаунт в
+# ту же секунду, когда пришёл бан.
+REPLACE_FIRST_DELAY = (5.0, 10.0)
+
+# Сколько раз подряд прямой вход должен провалиться, прежде чем пробовать
+# прокси.
+#
+# На части машин игровые серверы с прямого IP недоступны: TCP-соединение
+# устанавливается, а данные не идут, и UDP-хендшейк молчит. Бот при этом
+# честно рапортует «Сервер не ответил на подключение» и переподключается
+# вечно. Через прокси тот же сервер отвечает нормально.
+DIRECT_FALLBACK_AFTER = max(1, int(os.environ.get("BR_DIRECT_FALLBACK_AFTER", "3")))
+
+# Сколько замен разрешено за час. Защита от лавины: если сервер банит
+# всё подряд, бесконечная регистрация только жжёт аккаунты.
+REPLACE_PER_HOUR = max(1, int(os.environ.get("BR_REPLACE_PER_HOUR", "20")))
 
 # Ограничение по входу (частые подключения / лимит времени).
 #
@@ -181,6 +211,11 @@ QUEUE_JITTER = 0.35
 RECONNECT_MIN = max(1.0, float(os.environ.get("BR_RECONNECT_MIN", "8")))
 RECONNECT_MAX = max(RECONNECT_MIN, float(os.environ.get("BR_RECONNECT_MAX", "20")))
 
+# Минимальная пауза перед намеренным выходом (почасовой цикл payday).
+# Меньше ставить нельзя: переподключение само занимает время, и бот
+# вернётся раньше, чем сервер отпустит старую сессию.
+PAUSE_MIN = max(1.0, float(os.environ.get("BR_PAUSE_MIN", "10")))
+
 # accounts.json пишется не чаще раза в N секунд (на телефоне флеш — узкое место).
 SAVE_DEBOUNCE = max(0.0, float(os.environ.get("BR_SAVE_DEBOUNCE", "10")))
 
@@ -257,6 +292,23 @@ class ConnectGate:
             self._cond.notify_all()
 
 
+# Наборы внешности Black Russia: пол и скин подбираются парой, чтобы не
+# получить мужской скин на женском персонаже.
+MALE_SKINS = (78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90, 91, 92)
+FEMALE_SKINS = (93, 94, 95, 96, 97, 98, 99, 100, 101, 102, 103, 104, 105)
+
+
+def _appearance_for(nickname: str) -> dict:
+    """Стабильная внешность из ника: один ник — всегда один персонаж."""
+    seed = 0
+    for ch in str(nickname or ""):
+        seed = (seed * 131 + ord(ch)) & 0xFFFFFFFF
+    rng = random.Random(seed)
+    gender = 1 if rng.random() < 0.45 else 0
+    pool = FEMALE_SKINS if gender == 1 else MALE_SKINS
+    return {"gender": gender, "skin": rng.choice(pool)}
+
+
 class BotInstance:
     def __init__(
         self,
@@ -282,10 +334,33 @@ class BotInstance:
         self.manager = manager
         self.stopping = False
         self.is_banned = is_banned
+        # Кто и за что забанил. Сервер сообщает это в чате при ручном бане,
+        # и без разбора строка уходила в Telegram целиком — по ней не было
+        # видно ни админа, ни причины. Здесь лежит разобранный результат
+        # (logic.baninfo.parse_ban).
+        self.ban_admin = ""
+        self.ban_reason = ""
+        self.ban_kind = ""
+        self.ban_duration = ""
+        self.banned_at = 0.0
         self.default_task_name = default_task
         self.proxy = proxy.strip() if proxy else ""
+        # Автопереключение на прокси уже пробовали — второй раз не дёргаем.
+        self._auto_proxy_tried = False
 
         self.level_str = "-"
+        # Числа уровня отдельно от строки: из них считается «сколько до
+        # следующего уровня» и полоска прогресса в панели.
+        self.level_num = None
+        self.exp_cur = None
+        self.exp_next = None
+        self.exp_left = None
+        # Когда статистика реально обновилась. Панель по этому полю
+        # понимает, что /mm дошёл и данные свежие, а не из реестра.
+        self.stats_updated_at = 0.0
+        # Время последнего сообщения в общем чате. Живой чат — доказательство,
+        # что клиент уже в мире, даже если рядом никого не стримит.
+        self.last_chat_at = 0.0
         self.money = 0
         self.target_lvl = None  # Целевой уровень (например 4)
         self._quest_helpers = None
@@ -297,7 +372,25 @@ class BotInstance:
         # Разброс, чтобы десяток ботов не опрашивал статистику синхронно.
         self._stats_jitter = 0.0
         self.stats_pending = False
+        self.stats_pending_at = 0.0
         self.stats_dialog_id = None
+
+        # Общий ответчик на диалоги: не даёт ответить на один и тот же
+        # пункт дважды, если событие поймали несколько обработчиков.
+        from logic.menu import MenuAnswerer
+
+        self.menu_answerer = MenuAnswerer(log=lambda m: self.add_log(m))
+
+        # Автосбор урожая («Сборщик»). Ведёт диалоги работы и закрывает
+        # мини-игру сбора. Свой ответчик не нужен — берёт menu_answerer.
+        from logic.harvester import Harvester, autostart_enabled
+
+        self.harvester = Harvester()
+        # Автосбор включается только явно: BR_AUTOHARVEST=1. По умолчанию
+        # молчит, иначе бот на шахте переключился бы на сборщика урожая,
+        # увидев любое меню работ.
+        if autostart_enabled():
+            self.harvester.start(self)
 
         self.logs = deque(maxlen=MAX_LOG_HISTORY)
         self.status = "ЗАБАНЕН" if self.is_banned else "Остановлен"
@@ -314,10 +407,17 @@ class BotInstance:
         self.spawned_at = None
         self.spawn_point = None
         self.spawn_report = None
+        # Проверка общего мира выполняется один раз за вход; при новом
+        # подключении снимается, иначе после реконнекта бот остался бы
+        # без проверки стрима.
+        self._real_world_checked = False
 
         self.reconnect_thread = None
         self.reconnect_cancel_event = threading.Event()
         self.scheduled_reconnect_delay = None
+        # До какого момента бот намеренно не в игре (почасовой цикл payday).
+        # Нужен, чтобы монитор 24/7 не поднимал его раньше времени.
+        self.paused_until = 0.0
 
         # Очередь на переполненный сервер (как в лаунчере)
         self.queue_mode = False
@@ -482,6 +582,10 @@ class BotInstance:
         self.spawned_at = time.time()
         self.spawn_point = tuple(float(v) for v in pos)
         self.status = "В игре (заспавнен)"
+        # Позиция на вокзале ещё не значит, что бот в общем мире: если
+        # ответный Spawn не ушёл, стрим остаётся пустым. Проверяем один
+        # раз за вход, в фоне — вход не должен ждать сорок секунд.
+        self.start_real_world_check()
         try:
             name, dist = nearest_spawn_name(pos)
             label = name or f"вокзал ({pos[0]:.0f}, {pos[1]:.0f})"
@@ -491,6 +595,29 @@ class BotInstance:
             )
         except Exception:
             pass
+        return True
+
+    def start_real_world_check(self):
+        """Один раз за вход довести бота до общего мира.
+
+        Проверка идёт в своём потоке: она ждёт игроков в стриме до сорока
+        секунд, и держать на этом вход нельзя. Флаг снимается при новом
+        подключении, поэтому после переподключения проверка повторится.
+        """
+        if getattr(self, "_real_world_checked", False):
+            return False
+        # Движок качки сам ведёт бота в мир. Второй ensure в фоне начал бы
+        # двигать ту же сессию своим warp_to_station — два потока на одного
+        # бота дают откат позиции и пустой стрим.
+        if getattr(self, "_lvl_engine_active", False):
+            return False
+        self._real_world_checked = True
+        try:
+            from logic.real_world import ensure_async
+        except Exception as exc:
+            self.add_log(f"[МИР] проверка недоступна: {exc}")
+            return False
+        ensure_async(self, log=self.add_log)
         return True
 
     def begin_spawn_watchdog(self):
@@ -549,6 +676,7 @@ class BotInstance:
 
     def setup_session(self):
         self.stopping = False
+        self._real_world_checked = False
         self.network = Network(self.host, self.port)
         self.protocol = RakNetProtocol(self.network, security)
         # В ECO-режиме снижаем интервал OnFoot синхронизации для стоячего бота
@@ -562,12 +690,22 @@ class BotInstance:
 
         reg_config = None
         if self.password:
+            # Внешность — своя у каждого аккаунта.
+            #
+            # Раньше ВСЕ боты регистрировались с gender=0 и skin=78. Два
+            # десятка одинаковых персонажей, зашедших с одного адреса, —
+            # это подпись даже без анализа поведения: админу достаточно
+            # посмотреть на список игроков.
+            #
+            # Значение выводится из ника, поэтому при переподключении и
+            # повторном заходе персонаж остаётся тем же — как у живого.
+            appearance = _appearance_for(self.nickname)
             reg_config = RegistrationConfig(
                 enabled=True,
                 auto_login=True,
                 password=self.password,
-                gender=0,
-                skin=78,
+                gender=appearance["gender"],
+                skin=appearance["skin"],
                 step_delay=float(os.environ.get("BR_AUTH_STEP_DELAY", "0.6")),
                 ack_timeout=float(os.environ.get("BR_AUTH_TIMEOUT", "15.0")),
             )
@@ -613,6 +751,59 @@ class BotInstance:
                 self.add_log(f"Настроен SOCKS5 прокси: {self.proxy}")
             except Exception as e:
                 self.add_log(f"Ошибка настройки прокси {self.proxy}: {e}")
+
+    def _try_auto_proxy(self) -> bool:
+        """Прямой вход не проходит — подобрать прокси из пула.
+
+        Зачем: на части машин до игровых серверов не доходит трафик с
+        прямого IP. TCP-соединение при этом устанавливается за десятки
+        миллисекунд, поэтому снаружи всё выглядит исправным, а на деле
+        запросы уходят в пустоту: Send-Q висит, ответа нет. Бот в таком
+        состоянии бесконечно пишет «Сервер не ответил на подключение».
+        Через прокси тот же сервер отвечает сразу.
+
+        Возвращает True, если прокси назначен и есть смысл переподключиться.
+        """
+        self._auto_proxy_tried = True
+        mgr = getattr(self, "manager", None)
+        pool = getattr(mgr, "proxy_pool", None) if mgr else None
+        if pool is None:
+            return False
+        try:
+            urls = pool.usable_proxies()
+        except Exception as exc:
+            self.add_log(f"[ПРОКСИ] не смог получить список рабочих: {exc}")
+            return False
+        if not urls:
+            self.add_log(
+                "[ПРОКСИ] прямой вход не проходит, а рабочих прокси в пуле нет. "
+                "Проверь «Прокси и VPN» — без них на этой машине не зайти."
+            )
+            return False
+
+        # Берём наименее загруженный узел: иначе все боты сядут на один
+        # адрес, а это ровно та причина, по которой сервер банит пачками.
+        counts: dict[str, int] = {}
+        try:
+            with mgr._lock:
+                for other in mgr.bots.values():
+                    if getattr(other, "proxy", ""):
+                        counts[other.proxy] = counts.get(other.proxy, 0) + 1
+        except Exception:
+            pass
+        url = min(urls, key=lambda u: counts.get(u, 0))
+
+        self.proxy = url
+        self.add_log(
+            f"[ПРОКСИ] прямой вход не проходит ({self.connect_failures} попыток). "
+            f"Переключаюсь на {url} — ботов на нём: {counts.get(url, 0)}."
+        )
+        try:
+            if mgr is not None:
+                mgr.save_accounts()
+        except Exception:
+            pass
+        return True
 
     def check_proxy_before_start(self) -> tuple[bool, str]:
         """Сначала запрос, потом заход.
@@ -701,6 +892,17 @@ class BotInstance:
             return
         if "В игре" not in self.status:
             return
+        # Зависший запрос: отправили /mm, а меню не разобралось. Держать
+        # флаг поднятым нельзя — пока он поднят, любой диалог со словом
+        # «уровень» считается экраном статистики.
+        if self.stats_pending and self.stats_pending_at:
+            if now - self.stats_pending_at > 120.0:
+                self.stats_pending = False
+                self.stats_pending_at = 0.0
+                self.add_log(
+                    "[СТАТИСТИКА] /mm не разобрался за 120 с — сбрасываю запрос"
+                )
+
         if not self.stats_next_at:
             # Первый тик после входа: назначаем окно, ничего не отправляем.
             self.arm_stats()
@@ -708,6 +910,7 @@ class BotInstance:
         if now < self.stats_next_at:
             return
         self.stats_pending = True
+        self.stats_pending_at = now
         self.send_chat("/mm")
         self.last_stats_check = now
         self.stats_next_at = now + self.stats_interval()
@@ -738,6 +941,18 @@ class BotInstance:
                 return
 
             self.connect_failures += 1
+
+            # Прямой вход стабильно не проходит — возможно, с этого IP
+            # сервер недоступен вовсе. Один раз пробуем прокси.
+            if (
+                self.connect_failures >= DIRECT_FALLBACK_AFTER
+                and not self.proxy
+                and not self._auto_proxy_tried
+            ):
+                if self._try_auto_proxy():
+                    self.connect_failures = 0
+                    self.schedule_reconnect(delay=3.0, force=True)
+                    return
 
             # Сервер молчит: чаще всего это переполнение. Встаём в очередь.
             if self.connect_failures >= 2 or self.queue_mode:
@@ -831,6 +1046,40 @@ class BotInstance:
         with self._sched_lock:
             self._reconnect_pending = False
 
+    def pause_until(self, when: float, reason: str = "") -> float:
+        """Выйти из игры и вернуться в назначенное время.
+
+        Раньше «перерыв» делался через stop(): он ставит stopping=True и
+        отменяет переподключение, а монитор 24/7 такие аккаунты не поднимает.
+        То есть бот уходил на отдых и не возвращался никогда.
+
+        Здесь наоборот: ставим задержку, гасим задачу, отключаемся — и
+        штатный обработчик disconnect сам планирует вход через эту задержку.
+        """
+        delay = max(PAUSE_MIN, float(when) - time.time())
+        self.scheduled_reconnect_delay = delay
+        self.paused_until = time.time() + delay
+        self.add_log(
+            f"[ПАУЗА] {reason or 'перерыв'}: выход, вход через "
+            f"{delay / 60:.0f} мин"
+        )
+        if self.active_task:
+            try:
+                self.active_task.stop()
+            except Exception:
+                pass
+            self.active_task = None
+        try:
+            if self.api:
+                self.api.disconnect()
+        except Exception:
+            pass
+        # Если событие disconnect почему-то не придёт, таймер всё равно
+        # поставим сами. Повторный вызов безопасен: schedule_reconnect
+        # игнорирует второй вызов, пока висит первый.
+        self.schedule_reconnect(delay=delay)
+        return delay
+
     def send_chat(self, msg: str):
         if self.api:
             self.api.sendchat(msg)
@@ -846,9 +1095,15 @@ class BotInstance:
             self.manager.save_accounts()
 
         if task_type == "lvl":
+            # Новый движок: подтверждение мира, вокзал, минута после
+            # спавна, бессмертие, точка из lvl_targets.json, /bg.
+            self.active_task = LevelRunnerTask(self)
+            self.active_task.start()
+            return "Качка LVL запущена (движок: мир → точка → /bg)"
+        elif task_type in ("lvl_old", "lvl_classic", "lvl2"):
             self.active_task = LevelGrinderTask(self)
             self.active_task.start()
-            return "Качка LVL запущена"
+            return "Качка LVL запущена (старый цикл)"
         elif task_type == "quest":
             self.active_task = QuestMasterTask(self)
             self.active_task.start()
@@ -868,7 +1123,8 @@ class BotInstance:
         elif task_type in ("stop", "none", "off"):
             return "Авто-задача остановлена"
         else:
-            return "Неизвестный тип задачи. Доступно: 'lvl', 'quest', 'mine', 'factory', 'bus', 'stop'"
+            return ("Неизвестный тип задачи. Доступно: 'lvl', 'lvl_old', 'quest', "
+                "'mine', 'factory', 'bus', 'stop'")
 
     def stop(self, banned: bool = False):
         self.stopping = True
@@ -908,6 +1164,10 @@ class BotManager:
         self._nick_index: dict[str, BotInstance] = {}
         # Индекс id(session/api) -> bot_id: O(1) на событиях пакетов
         self._obj_index: dict[int, int] = {}
+        # Автозамена банов: сериализуем создания и держим лимит в час.
+        self._replace_lock = threading.Lock()
+        self._replace_recent: list[float] = []
+
         # Дебаунс записи accounts.json
         self._save_lock = threading.Lock()
         self._last_save = 0.0
@@ -1092,40 +1352,105 @@ class BotManager:
                     return b
         return None
 
-    def mark_bot_banned(self, bot: BotInstance, reason: str = ""):
+    def mark_bot_banned(self, bot: BotInstance, reason: str = "", raw: str = ""):
+        """Пометить аккаунт забаненным, разобрав кто и за что.
+
+        `raw` — исходная строка от сервера (чат или текст диалога). Из неё
+        достаётся ник администратора, причина и срок; в Telegram уходит уже
+        разобранное, а не вся строка целиком.
+
+        Сервер сообщает об одном и том же бане дважды — строкой в чат и
+        диалогом при следующем входе. Без защиты это давало два оповещения
+        подряд и два «новых аккаунта взамен». Повторный вызов в пределах
+        BAN_ALERT_DEDUPE секунд игнорируется.
+        """
+        from logic.baninfo import parse_ban
+
+        info = parse_ban(raw or reason)
+        now = time.time()
+
+        # Тот же бан пришёл второй раз (чат + диалог) — не дублируем.
+        if bot.is_banned and bot.banned_at and (now - bot.banned_at) < BAN_ALERT_DEDUPE:
+            bot.add_log(f"[!] Повторное сообщение о бане проигнорировано: {info.summary}")
+            return
+
         bot.is_banned = True
+        bot.ban_admin = info.admin
+        bot.ban_reason = info.reason or reason
+        bot.ban_kind = info.kind
+        bot.ban_duration = info.duration
+        bot.banned_at = now
         bot.cancel_reconnect()
         bot.status = "ЗАБАНЕН"
-        bot.add_log(f"[!] АККАУНТ ЗАБАНЕН СЕРВЕРОМ! Причина: {reason}")
-        print(f"\n[!] ВНИМАНИЕ: Бот #{bot.bot_id} [{bot.nickname}] получил БАН! ({reason})")
+        bot.add_log(f"[!] АККАУНТ ЗАБАНЕН! {info.summary} | сырое: {reason}")
+        print(f"\n[!] ВНИМАНИЕ: Бот #{bot.bot_id} [{bot.nickname}] получил БАН! "
+              f"({info.summary})")
         bot.stop(banned=True)
         self.save_accounts()
 
         # 1. Отправляем в Telegram и ИИ-анализ если подключен Telegram контроллер
         if hasattr(self, "tg_controller") and self.tg_controller:
-            alert_text = (
-                f"🚨 <b>АККАУНТ ЗАБАНЕН!</b>\n"
-                f"• Бот: #{bot.bot_id} <b>{bot.nickname}</b>\n"
-                f"• Сервер: <b>{bot.server_name}</b>\n"
-                f"• Причина: <code>{reason}</code>\n"
-            )
+            if info.kind == "manual":
+                title = "🚨 <b>АККАУНТ ЗАБАНЕН АДМИНИСТРАТОРОМ</b>"
+            elif info.kind == "auto":
+                title = "🚨 <b>АККАУНТ ЗАБАНЕН СЕРВЕРОМ</b>"
+            else:
+                title = "🚨 <b>АККАУНТ ЗАБАНЕН</b>"
+
+            lines = [
+                title,
+                f"• Бот: #{bot.bot_id} <b>{bot.nickname}</b>",
+                f"• Сервер: <b>{bot.server_name}</b>",
+            ]
+            if info.admin:
+                role = info.role.capitalize() if info.role else "Администратор"
+                lines.append(f"• Забанил: <b>{info.admin}</b> ({role})")
+            else:
+                lines.append("• Забанил: <i>автоматически, без администратора</i>")
+            if info.reason:
+                lines.append(f"• Причина: <code>{info.reason}</code>")
+                if info.reason_human and info.reason_human.lower() not in info.reason.lower():
+                    lines.append(f"• Тип: <i>{info.reason_human}</i>")
+            else:
+                lines.append("• Причина: <i>сервер не указал</i>")
+            if info.duration:
+                lines.append(f"• Срок: <b>{info.duration}</b>")
+            if info.issuer:
+                lines.append(f"• Выписал: <i>{info.issuer}</i>")
+            if info.target and info.target.lower() != str(bot.nickname).lower():
+                lines.append(f"• В сообщении игрок: <code>{info.target}</code>")
+            alert_text = "\n".join(lines) + "\n"
             # Отправляем в ИИ для анализа причины и рекомендаций
             if hasattr(self.tg_controller, "ai") and self.tg_controller.ai.config.get("api_key"):
                 def _ai_ban_inspect():
+                    who = f"администратор {info.admin}" if info.admin else "сервер автоматически"
                     ai_res = self.tg_controller.ai.execute_natural_command(
-                        f"Бот {bot.nickname} на сервере {bot.server_name} получил бан по причине: '{reason}'. Проанализируй причину."
+                        f"Бот {bot.nickname} на сервере {bot.server_name} получил бан. "
+                        f"Забанил: {who}. Причина: '{info.reason or reason}'. "
+                        f"Срок: {info.duration or 'не указан'}. Проанализируй причину."
                     )
                     self.tg_controller.broadcast(f"{alert_text}\n🤖 <b>Анализ ИИ:</b>\n{ai_res}")
                 threading.Thread(target=_ai_ban_inspect, daemon=True).start()
             else:
                 self.tg_controller.broadcast(alert_text)
 
-        # 2. Если бан выдан именно за бота / читы / автокликер — создаем новый аккаунт на том же сервере
-        r_lower = reason.lower()
-        if any(w in r_lower for w in ["бот", "bot", "читер", "чит", "постороннее по", "кликер", "auto-clicker", "connection_banned"]):
+        # 2. Автозамена: новый аккаунт взамен забаненного.
+        #
+        # Раньше замена срабатывала только если в тексте бана встречалось
+        # слово из узкого списка: «бот», «чит», «кликер», «постороннее ПО».
+        # Сервер в большинстве случаев пишет другое — «автобан сервера
+        # (без админа и причины)» или «Ваш игровой аккаунт заблокирован,
+        # вход невозможен» — и ни одно слово не совпадало, замена не
+        # создавалась. Из 105 банов в логе замену получили 16.
+        #
+        # Замену не делаем только в одном случае: IP-бан (kick 999,
+        # CONNECTION_BANNED). Он на адрес, а не на аккаунт — новый ник с
+        # того же IP забанят так же, и регистрация сгорит впустую.
+        ip_banned = "connection_banned" in (reason or "").lower()
+        if not ip_banned and not getattr(bot, "_replaced", False):
+            bot._replaced = True
+
             def _create_replacement():
-                time.sleep(random.uniform(5.0, 10.0))
-                print(f"[*] Создаем новый аккаунт взамен забаненного бота на сервере {bot.server_name}...")
                 # Пароль берём базовый из настроек: он одинаков для всех
                 # новых аккаунтов, и в реестре не плодятся разные пароли.
                 # Если настройки пусты — пароль забаненного.
@@ -1134,14 +1459,46 @@ class BotManager:
                 task = bot.default_task_name
                 if not task and settings is not None:
                     task = settings.default_task
-                new_bot = self.add_bot(
-                    target_server=bot.server_name,
-                    nickname=None,  # None -> сгенерировать реалистичный ник
-                    password=pwd,
-                    auto_regen_nick=True,
-                    proxy=bot.proxy,
-                    default_task=task,
-                )
+
+                # Сериализуем замены: одновременно создаётся ровно одна,
+                # с паузой между попытками и лимитом в час. Без этого
+                # волна банов порождала полсотни регистраций разом, и
+                # сервер отвечал блокировкой за частые входы.
+                with self._replace_lock:
+                    now_ts = time.time()
+                    self._replace_recent = [
+                        t for t in self._replace_recent if now_ts - t < 3600.0
+                    ]
+                    if len(self._replace_recent) >= REPLACE_PER_HOUR:
+                        print(
+                            f"[-] Автозамена: лимит {REPLACE_PER_HOUR} в час "
+                            f"исчерпан, #{bot.bot_id} [{bot.nickname}] без замены"
+                        )
+                        bot.add_log(
+                            f"[!] Замена не создана: лимит {REPLACE_PER_HOUR} "
+                            f"аккаунтов в час исчерпан."
+                        )
+                        return
+
+                    if self._replace_recent:
+                        wait = self._replace_recent[-1] + REPLACE_INTERVAL - time.time()
+                        if wait > 0:
+                            time.sleep(min(wait, REPLACE_INTERVAL))
+                    else:
+                        # Первая замена после паузы — не мгновенно, чтобы не
+                        # совпасть с самим баном.
+                        time.sleep(random.uniform(*REPLACE_FIRST_DELAY))
+
+                    print(f"[*] Создаем новый аккаунт взамен забаненного бота на сервере {bot.server_name}...")
+                    self._replace_recent.append(time.time())
+                    new_bot = self.add_bot(
+                        target_server=bot.server_name,
+                        nickname=None,  # None -> сгенерировать реалистичный ник
+                        password=pwd,
+                        auto_regen_nick=True,
+                        proxy=bot.proxy,
+                        default_task=task,
+                    )
                 if new_bot:
                     notice = (
                         f"♻️ <b>Автозамена забаненного бота!</b>\n"
@@ -1167,6 +1524,11 @@ class BotManager:
                         for bid, b in self.bots.items():
                             # Автоматический перезапуск упавших активных ботов
                             if not b.is_banned and not b.stopping:
+                                # Намеренная пауза (почасовой цикл payday) —
+                                # не поднимаем раньше срока, иначе бот вернётся
+                                # в игру вне своего окна и словит payday мимо.
+                                if b.paused_until and time.time() < b.paused_until:
+                                    continue
                                 if b.status in ("Остановлен", "Отключен") and b.default_task_name:
                                     b.add_log("[МОНИТОР] Авто-подъем упавшего бота 24/7...")
                                     b.start()
@@ -1249,6 +1611,9 @@ class BotManager:
         def _on_chat(bot_obj, message, *args, **kwargs):
             b = self._find_bot_by_session_or_api(bot_obj)
             if b:
+                # Метка живого чата: по ней вход в мир подтверждается, когда
+                # стрим рядом пуст, а люди на сервере пишут.
+                b.last_chat_at = time.time()
                 b.add_log(f"[ЧАТ] {message}")
                 if b.active_task and hasattr(b.active_task, "on_chat_message"):
                     b.active_task.on_chat_message(str(message))
@@ -1284,7 +1649,7 @@ class BotManager:
                     return
 
                 if is_admin_ban:
-                    self.mark_bot_banned(b, reason=f"Чат: {clean_msg}")
+                    self.mark_bot_banned(b, reason=f"Чат: {clean_msg}", raw=clean_msg)
                     return
 
                 # 3. Много заходов с вашего IP -> реконнект через 5 минут (300 сек)
@@ -1307,7 +1672,12 @@ class BotManager:
         def _on_dialog(bot_obj, d_id, style, title, info, b1, b2, *args, **kwargs):
             b = self._find_bot_by_session_or_api(bot_obj)
             if b:
-                b.add_log(f"[ДИАЛОГ #{d_id}] {title} | Кнопки: '{b1}' / '{b2}'")
+                b.add_log(
+                    f"[ДИАЛОГ #{d_id} стиль={style}] {title} | Кнопки: '{b1}' / '{b2}'"
+                )
+                if os.environ.get("BR_TRACE_JSON"):
+                    body = re.sub(r'\{[0-9a-fA-F]{6}\}', '', str(info))
+                    b.add_log(f"[ДИАЛОГ-ТЕЛО] {body[:400]!r}")
                 if b.active_task and hasattr(b.active_task, "on_dialog"):
                     b.active_task.on_dialog(d_id, style, title, info, b1, b2)
 
@@ -1333,81 +1703,90 @@ class BotManager:
                     b.enter_queue("Сервер переполнен (диалог)")
                     return
 
-                # 1. Автоматический опрос /mm -> Статистика
-                # Меню /mm: выбор "Статистика персонажа" (обычно 0 пункт)
-                if ("главное меню" in dialog_text or "меню персонажа" in dialog_text or "mm" in dialog_text) and b.stats_pending:
-                    # Находим пункт "Статистика" в списке
-                    lines = [ln.strip() for ln in clean_info.split("\n") if ln.strip()]
-                    stat_idx = 0
-                    for idx, ln in enumerate(lines):
-                        if "статистик" in ln.lower():
-                            stat_idx = idx
-                            break
-                    def _pick_stat():
-                        time.sleep(0.4)
-                        from samp.packets import PacketBuilder
-                        if b.session and b.session.connected:
-                            b.session._sender.send(
-                                PacketBuilder.rpc_build("dialog_response", int(d_id), 1, stat_idx, ""),
-                                rpc_name="dialog_response",
-                            )
-                    threading.Thread(target=_pick_stat, daemon=True).start()
+                # 1. Меню /mm: первый экран — список пунктов, второй — данные.
+                #
+                # Раньше меню искали по строкам «главное меню» и «меню
+                # персонажа», а сервер пишет «Меню игрока». Меню не
+                # распознавалось, зато следующая ветка ловила слово
+                # «Статистика» из СПИСКА ПУНКТОВ и парсила меню как экран
+                # статистики: цифр не находила и просто закрывала диалог.
+                # Итог — /mm уходил в пустоту, уровень в реестре оставался «-».
+                from logic.menu import decide_stats_flow, dialog_signature, parse_stats
 
-                # Окно со статистикой персонажа (уровень, exp)
-                if "статистика" in dialog_text or "уровень" in dialog_text or "exp" in dialog_text:
+                # Отпечаток текущего экрана. Все диалоги BR приходят с id 0,
+                # поэтому «тот же диалог» отличаем по содержимому.
+                sig = dialog_signature(style, title, info)
+
+                decision = decide_stats_flow(
+                    style, title, info, stats_pending=bool(b.stats_pending)
+                )
+
+                # Экран 1: меню игрока -> выбрать «Статистика».
+                # Экран 2: данные -> разобрать и закрыть.
+                if decision is not None and decision.action == "pick":
+                    def _pick_stat(dialog_id=int(d_id), item=int(decision.list_item),
+                                   note=str(decision.note), signature=sig):
+                        # Пауза как у человека: он читает список, а не
+                        # щёлкает в тот же кадр, что меню появилось.
+                        time.sleep(random.uniform(0.35, 0.9))
+                        b.menu_answerer.answer(
+                            b.session, dialog_id, list_item=item, response=1,
+                            note=note, signature=signature,
+                        )
+                    threading.Thread(target=_pick_stat, daemon=True).start()
+                    b.add_log(f"[МЕНЮ] /mm: {decision.note} (пункт {decision.list_item})")
+
+                elif decision is not None and decision.action == "close":
+                    def _close_menu(dialog_id=int(d_id), note=str(decision.note),
+                                    signature=sig):
+                        time.sleep(0.4)
+                        b.menu_answerer.answer(
+                            b.session, dialog_id, list_item=0, response=0,
+                            note=note, signature=signature,
+                        )
+                    threading.Thread(target=_close_menu, daemon=True).start()
+                    b.add_log(f"[МЕНЮ] /mm: {decision.note}")
+
+                # --- экран 2: сами данные (вложенный диалог) ---
+                if decision is not None and decision.screen == "stats":
                     # Ищем уровень и exp: например "Уровень: 2", "Игровой уровень: 2", "Очки опыта: 2/8", "EXP: 2/8", "Опыт: 2 из 8"
                     # Также форматы: "2 lvl", "2/8 exp"
-                    lvl_match = re.search(r'(?:уровень|level|lvl)[:\s]+(\d+)', clean_info, re.IGNORECASE)
-                    exp_match = re.search(r'(?:exp|опыт|очки опыта|очков)[:\s]+(\d+)\s*[\/из]\s*(\d+)', clean_info, re.IGNORECASE)
-                    
-                    found_lvl = lvl_match.group(1) if lvl_match else None
-                    found_exp = f"{exp_match.group(1)}/{exp_match.group(2)}" if exp_match else None
-
-                    if not found_exp:
-                        # Иногда формат просто 2/8
-                        exp_fallback = re.search(r'(\d+)\s*\/\s*(\d+)', clean_info)
-                        if exp_fallback:
-                            found_exp = f"{exp_fallback.group(1)}/{exp_fallback.group(2)}"
-
-                    # Ищем деньги / баланс: например "Баланс: 15,000 руб", "Деньги: 1000", "Наличные: 500 руб"
-                    # В диалогах Black Russia часто пишется: "Наличные деньги: 15000 руб.", "Банковский счет: 20000 руб.", "Баланс: 500"
-                    money_matches = re.findall(r'(?:баланс|деньги|наличные|рублей|на руках|основной счет|банк(?:\s+счет)?)[^\d\n\r]{0,15}?([\d\s,]+)', clean_info, re.IGNORECASE)
-                    if money_matches:
-                        for mm in money_matches:
-                            raw_m = re.sub(r'[^\d]', '', mm)
-                            if raw_m:
-                                val = int(raw_m)
-                                if val > 0:
-                                    b.money = val
-                                    break
-                    else:
-                        money_match = re.search(r'([\d\s,]{2,})\s*(?:руб|rub|\$)', clean_info, re.IGNORECASE)
-                        if money_match:
-                            raw_m = re.sub(r'[^\d]', '', money_match.group(1))
-                            if raw_m and int(raw_m) > 0:
-                                b.money = int(raw_m)
+                    stats = parse_stats(info)
+                    found_lvl = stats["level"]
+                    if stats["money"]:
+                        b.money = int(stats["money"])
 
                     if found_lvl:
-                        if found_exp:
-                            b.level_str = f"{found_lvl} ({found_exp})"
-                        else:
-                            b.level_str = f"{found_lvl} lvl"
+                        # Уровень и опыт пишутся через общий слой: строка
+                        # «3 lvl · 12/40», числа и отметка времени. Панель
+                        # и Telegram читают одно и то же, расхождений нет.
+                        from logic.stats import apply as apply_stats
+
+                        apply_stats(b, stats)
                         b.last_stats_check = time.time()
                         b.stats_next_at = b.last_stats_check + b.stats_interval()
                         b.stats_pending = False
-                        b.add_log(f"[СТАТИСТИКА] Обновлен уровень: {b.level_str}, баланс: {b.get_balance_str()}")
+                        b.add_log(
+                            f"[СТАТИСТИКА] Уровень: {b.level_str}, "
+                            f"баланс: {b.get_balance_str()}"
+                        )
                         self.save_accounts()
                         b.check_target_level_achieved()
+                    else:
+                        b.add_log(
+                            "[СТАТИСТИКА] Экран статистики пришёл, но уровень "
+                            f"в нём не разобрался: {stats['raw'][:90]!r}"
+                        )
 
-                    # Закрываем диалог статистики, чтобы не висел
-                    def _close_stats():
-                        time.sleep(0.3)
-                        from samp.packets import PacketBuilder
-                        if b.session and b.session.connected:
-                            b.session._sender.send(
-                                PacketBuilder.rpc_build("dialog_response", int(d_id), 0, 0, ""),
-                                rpc_name="dialog_response",
-                            )
+                    # Закрываем диалог статистики, чтобы не висел поверх игры.
+                    # Именно этот второй диалог и есть «вложенное меню»:
+                    # сначала список пунктов, потом данные по выбранному.
+                    def _close_stats(dialog_id=int(d_id), signature=sig):
+                        time.sleep(0.35)
+                        b.menu_answerer.answer(
+                            b.session, dialog_id, list_item=0, response=0,
+                            note="статистика: закрываю", signature=signature,
+                        )
                     threading.Thread(target=_close_stats, daemon=True).start()
 
                 # Проверяем диалоговые окна на бан / лимиты входа / рестарт
@@ -1471,12 +1850,27 @@ class BotManager:
                 elif any(trigger in dialog_text for trigger in ban_triggers) or any(
                     pattern.search(dialog_text) for pattern in ban_patterns
                 ):
-                    self.mark_bot_banned(b, reason=f"Диалог #{d_id}: {title} | {clean_info[:80]}")
+                    self.mark_bot_banned(
+                        b,
+                        reason=f"Диалог #{d_id}: {title} | {clean_info[:120]}",
+                        raw=f"{title} {info}",
+                    )
 
                 # Много заходов с одного IP в диалоге
                 if "много заходов" in dialog_text or ("ip" in dialog_text and ("слишком много" in dialog_text or "подозрител" in dialog_text or "повторите попытку позже" in dialog_text)):
                     b.add_log(f"[РЕКОННЕКТ] Диалог #{d_id}: много заходов с IP. Ожидание 5 минут...")
                     b.scheduled_reconnect_delay = 5 * 60.0
+
+                # Автосбор урожая: меню устройства на работу и подтверждение
+                # сбора. Стоит последним намеренно — выше проверяются бан,
+                # кик античита и лимиты, и они должны срабатывать первыми.
+                try:
+                    from logic.harvester import handle_harvest_dialog
+
+                    if handle_harvest_dialog(b, d_id, style, title, info, b1, b2):
+                        b.add_log(f"[АВТОСБОР] диалог #{d_id} обработан")
+                except Exception as exc:
+                    b.add_log(f"[АВТОСБОР] ошибка обработки диалога: {exc}")
 
         @emitter.on("OnShowTextDraw")
         def _on_textdraw(bot_obj, textdraw_id, info, *args, **kwargs):
@@ -1577,12 +1971,35 @@ class BotManager:
             b = self._find_bot_by_session_or_api(bot_obj)
             if not b:
                 return
+            if os.environ.get("BR_TRACE_JSON"):
+                try:
+                    b.add_log(f"[ТРЕЙС] iid={interface_id} {str(json_data)[:220]}")
+                except Exception:
+                    pass
             # Помощники сюжетки видят всё: диалоги НПС, ларёк, звонки, палитру.
             try:
                 handled = b.quest_helpers.on_json(interface_id, json_data)
             except Exception as exc:
                 b.add_log(f"[ПОМОЩНИК] сбой на iid={interface_id}: {exc!r}")
                 handled = None
+            # Капча приходит JSON-интерфейсом 26, URL картинки — в ключе "u".
+            # Ответ: {"t": 0, "s": "<текст>"} в тот же интерфейс.
+            # Почему именно так и что проверено как нерабочее — logic/captcha.py.
+            try:
+                from logic.captcha import handle_captcha
+                if handle_captcha(b, interface_id, json_data):
+                    handled = True
+            except Exception as exc:
+                b.add_log(f"[КАПЧА] сбой на iid={interface_id}: {exc!r}")
+            # Мини-игры — JSON интерфейс 31. Попадание клиент считает локально
+            # и просто сообщает серверу {"s":1}; автопрохождение = послать это
+            # сразу. Разбор режимов — logic/minigames.py.
+            try:
+                from logic.minigames import handle_minigame
+                if handle_minigame(b, interface_id, json_data):
+                    handled = True
+            except Exception as exc:
+                b.add_log(f"[МИНИ-ИГРА] сбой на iid={interface_id}: {exc!r}")
             if b.active_task and hasattr(b.active_task, "on_receive_json"):
                 b.active_task.on_receive_json(interface_id, json_data)
             return handled
@@ -1616,6 +2033,20 @@ class BotManager:
             if b and b.active_task and hasattr(b.active_task, "on_checkpoint"):
                 b.active_task.on_checkpoint(x, y, z, radius)
 
+        @emitter.on("OnDisableCheckpoint")
+        def _on_checkpoint_cleared(bot_obj, *args, **kwargs):
+            # Маркер снят — цель отработана. Движок квестов не должен
+            # продолжать ехать к точке, которой уже нет.
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if not b:
+                return
+            quest = getattr(b, "slava_quest", None)
+            if quest is not None:
+                try:
+                    quest.on_checkpoint_cleared()
+                except Exception as exc:
+                    b.add_log(f"[СЛАВА] сброс маркера упал: {exc!r}")
+
         @emitter.on("OnSetMoney")
         def _on_set_money(bot_obj, amount, *args, **kwargs):
             b = self._find_bot_by_session_or_api(bot_obj)
@@ -1647,6 +2078,15 @@ class BotManager:
             skipped_dupes = 0
             skipped_bad = 0
             seen_nicks = set()
+            # Все ники из реестра — чтобы генератор не выдал занятый.
+            # Без этого после перезапуска процесса бот мог получить ник,
+            # который уже есть у другого аккаунта.
+            known = {
+                str(item.get("nickname")).strip()
+                for item in data
+                if isinstance(item, dict) and item.get("nickname")
+            }
+            self._known_nicknames = known
             for item in data:
                 # Разбор каждой записи отдельно и без предположений о типах.
                 #
@@ -1664,6 +2104,14 @@ class BotManager:
                 srv_str = str(item.get("server") or "").strip()
                 task = item.get("task") or "lvl"
                 is_banned = bool(item.get("is_banned", False))
+                ban_admin = str(item.get("ban_admin") or "")
+                ban_reason = str(item.get("ban_reason") or "")
+                ban_kind = str(item.get("ban_kind") or "")
+                ban_duration = str(item.get("ban_duration") or "")
+                try:
+                    banned_at = float(item.get("banned_at") or 0.0)
+                except (TypeError, ValueError):
+                    banned_at = 0.0
                 proxy = item.get("proxy") or ""
                 saved_lvl = item.get("lvl") or "-"
                 try:
@@ -1696,13 +2144,26 @@ class BotManager:
                     srv = None
 
                 if not srv:
-                    skipped_bad += 1
-                    continue
-
-                clean_name = srv.get("firstname") or srv.get("name", "").replace("BLACK RUSSIA | ", "").strip()
-                clean_name = clean_name.upper()
-                ip = srv["ip"]
-                port = int(srv["port"])
+                    # Список серверов мог не прийти (сеть, API лежит). Раньше
+                    # такой аккаунт молча отбрасывался, и при лежащем API
+                    # пропадала вся ферма. Теперь берём адрес, сохранённый в
+                    # самом аккаунте: он уже прописан и рабочий.
+                    saved_ip = item.get("ip") or item.get("host")
+                    saved_port = item.get("port") or 5125
+                    if not saved_ip:
+                        skipped_bad += 1
+                        continue
+                    ip = saved_ip
+                    port = int(saved_port)
+                    clean_name = (item.get("server_name") or srv_str or "").upper()
+                    if not clean_name:
+                        skipped_bad += 1
+                        continue
+                else:
+                    clean_name = srv.get("firstname") or srv.get("name", "").replace("BLACK RUSSIA | ", "").strip()
+                    clean_name = clean_name.upper()
+                    ip = srv["ip"]
+                    port = int(srv["port"])
 
                 with self._lock:
                     bot_id = self._next_id
@@ -1720,6 +2181,11 @@ class BotManager:
                         default_task=task,
                         proxy=proxy,
                     )
+                    b.ban_admin = ban_admin
+                    b.ban_reason = ban_reason
+                    b.ban_kind = ban_kind
+                    b.ban_duration = ban_duration
+                    b.banned_at = banned_at
                     b.level_str = saved_lvl
                     b.money = saved_money
                     b.target_lvl = saved_target_lvl
@@ -1776,6 +2242,11 @@ class BotManager:
                     "server": b.server_name,
                     "task": b.default_task_name or (b.active_task.name if b.active_task else "lvl"),
                     "is_banned": b.is_banned,
+                    "ban_admin": getattr(b, "ban_admin", "") or "",
+                    "ban_reason": getattr(b, "ban_reason", "") or "",
+                    "ban_kind": getattr(b, "ban_kind", "") or "",
+                    "ban_duration": getattr(b, "ban_duration", "") or "",
+                    "banned_at": getattr(b, "banned_at", 0.0) or 0.0,
                     "proxy": b.proxy,
                     "lvl": b.level_str,
                     "money": b.money,
@@ -1925,47 +2396,110 @@ class BotManager:
         return bot
 
     def generate_random_nickname(self) -> str:
-        names_file = os.path.join(os.path.dirname(__file__), "names.txt")
-        surnames_file = os.path.join(os.path.dirname(__file__), "surnames.txt")
+        """Ник, похожий на настоящего игрока Black Russia.
 
-        if not hasattr(self, "_cached_names") or not self._cached_names:
-            self._cached_names = []
-            if os.path.exists(names_file):
-                with open(names_file, "r", encoding="utf-8", errors="ignore") as f:
-                    self._cached_names = [line.strip() for line in f if line.strip()]
-            if not self._cached_names:
-                self._cached_names = ["Alex", "Dmitry", "Sergey", "Maxim", "Ivan", "Artem", "Nikita"]
+        Раньше брались случайное имя из names.txt и фамилия из
+        surnames.txt. Оба файла — английские (Jacob, Michael, Abramson),
+        поэтому выходило «Moira_Amosov»: английское имя с русской фамилией
+        в транслите. Живых таких не бывает, и вся сотня аккаунтов
+        выглядела как одна сгенерированная пачка.
 
-        if not hasattr(self, "_cached_surnames") or not self._cached_surnames:
-            self._cached_surnames = []
-            if os.path.exists(surnames_file):
-                with open(surnames_file, "r", encoding="utf-8", errors="ignore") as f:
-                    self._cached_surnames = [line.strip() for line in f if line.strip()]
-            if not self._cached_surnames:
-                self._cached_surnames = ["Smith", "Ivanov", "Smirnov", "Kuznetsov", "Popov", "Sokolov"]
+        Теперь стиль ника собирается по тому же распределению, что и у
+        реальных игроков: русские имена с фамилиями, тюркские имена,
+        мемные связки вида Sotka_NaCapte, английские пары и выдуманные
+        фамилии. Подробности и пулы — в logic/nicks.py.
+        """
+        if not hasattr(self, "_nick_generator") or self._nick_generator is None:
+            from logic.nicks import NickGenerator
+
+            self._nick_generator = NickGenerator()
 
         if not hasattr(self, "_used_nicknames"):
             self._used_nicknames = set()
 
         with self._lock:
-            current_active_nicks = {b.nickname for b in self.bots.values() if b.nickname}
-            all_used = self._used_nicknames | current_active_nicks
+            current_active = {b.nickname for b in self.bots.values() if b.nickname}
 
-        for _ in range(500):
-            first_name = random.choice(self._cached_names)
-            last_name = random.choice(self._cached_surnames)
-            nick = f"{first_name}_{last_name}"
-            if len(nick) > MAX_NICKNAME_LEN:
-                nick = nick[:MAX_NICKNAME_LEN]
-            if nick not in all_used:
-                self._used_nicknames.add(nick)
-                return nick
+        # Учитываем и уже выданные, и занятые сейчас, и те, что в реестре:
+        # после перезапуска процесса «выданные» теряются, а ники заняты.
+        avoid = self._used_nicknames | current_active
+        known = getattr(self, "_known_nicknames", None)
+        if known:
+            avoid |= known
 
-        suffix = random.randint(10, 99)
-        base = f"{random.choice(self._cached_names)}_{random.choice(self._cached_surnames)}"
-        nick = f"{base[:MAX_NICKNAME_LEN - 3]}_{suffix}"
+        try:
+            nick = self._nick_generator.generate(avoid=avoid)
+        except Exception:
+            # Крайний случай: генератор не смог — отдаём простой ник,
+            # чтобы регистрация не встала.
+            #
+            # Здесь стоял f"Player_{random.randint(1000, 9999)}", и это
+            # худший из возможных ников: английское слово, подчёркивание
+            # и четыре цифры. Такой аккаунт видно за секунду. Собираем
+            # обычную пару «имя_фамилия» напрямую из пулов.
+            from logic.nicks import FEMALE_NAMES, MALE_NAMES, SURNAMES
+
+            for _ in range(200):
+                nick = f"{random.choice(MALE_NAMES + FEMALE_NAMES)}" \
+                       f"_{random.choice(SURNAMES)}"
+                if nick not in avoid and len(nick) <= 20:
+                    break
+            else:
+                nick = f"Nick_{random.choice(SURNAMES)}"
+
         self._used_nicknames.add(nick)
         return nick
+
+    def proxy_for_replacement(self, old_bot) -> str:
+        """Какой прокси дать новому аккаунту при автозамене забаненного.
+
+        Режим задаётся в настройках (replace_proxy):
+        inherit — тот же, что был у старого (по умолчанию: новый аккаунт
+        садится на тот же IP, что и прежний, и не палит «свежий» адрес);
+        pool — рабочий узел из пула;
+        none — своё IP;
+        иначе — имя сохранённого прокси или готовая строка.
+        """
+        # Берём тот же объект настроек, в который пишет Telegram и панель:
+        # отдельный get_settings() дал бы другой экземпляр, и смена режима
+        # не доехала бы до замены.
+        settings = getattr(self, "settings", None)
+        try:
+            if settings is None:
+                from logic.settings import get_settings
+                settings = get_settings()
+            mode = settings.replace_proxy
+        except Exception:
+            mode = "inherit"
+
+        if mode == "inherit":
+            return getattr(old_bot, "proxy", "") or ""
+        if mode in ("none", "off", "reset", ""):
+            return ""
+
+        if mode == "pool":
+            pool = getattr(self, "proxy_pool", None)
+            if pool is None:
+                return getattr(old_bot, "proxy", "") or ""
+            try:
+                picked = pool.rotate(1)
+            except Exception:
+                picked = []
+            return picked[0] if picked else (getattr(old_bot, "proxy", "") or "")
+
+        # Имя сохранённого прокси из proxies.txt.
+        try:
+            from tg_controller import load_proxy_list
+            saved = dict(load_proxy_list())
+        except Exception:
+            saved = {}
+        if mode in saved and saved[mode]:
+            return saved[mode]
+
+        # Готовая строка вида socks5://...
+        if "://" in mode or (":" in mode and " " not in mode):
+            return mode
+        return getattr(old_bot, "proxy", "") or ""
 
     def replace_bot_nickname(self, bot: BotInstance):
         if bot.stopping:
@@ -1979,6 +2513,7 @@ class BotManager:
         task_name = bot.default_task_name or (bot.active_task.name if bot.active_task else "lvl")
         srv_name = bot.server_name
         pwd = bot.password
+        new_proxy = self.proxy_for_replacement(bot)
 
         bot.stop()
 
@@ -1990,6 +2525,13 @@ class BotManager:
                 self._forget_bot(bot)
 
             new_b = self.add_bot(srv_name, new_nick, password=pwd, auto_regen_nick=True, default_task=task_name)
+            # Прокси для замены берём из настроек: иначе новый аккаунт
+            # уходил с прямого IP и палил «свежий» адрес рядом со старым.
+            if new_proxy and new_b is not None:
+                try:
+                    self.set_bot_proxy(new_b.bot_id, new_proxy)
+                except Exception as exc:
+                    new_b.add_log(f"[ПРОКСИ] замена не применилась: {exc!r}")
             self.save_accounts(force=True)
 
         threading.Thread(target=_respawn, daemon=True).start()
@@ -2087,6 +2629,19 @@ class BotManager:
 
         threading.Thread(target=_starter, daemon=True).start()
         return bots_to_start
+
+    def stop_selected(self, bot_ids: list[int]) -> list[int]:
+        """Остановить выбранные аккаунты. Возвращает те, что реально встали."""
+        stopped = []
+        with self._lock:
+            targets = [self.bots[bid] for bid in bot_ids if bid in self.bots]
+        for b in targets:
+            try:
+                self.stop_bot(b.bot_id)
+                stopped.append(b.bot_id)
+            except Exception as exc:
+                print(f"[!] Остановка #{b.bot_id}: {exc!r}")
+        return stopped
 
     def start_all(self):
         with self._lock:
@@ -2864,11 +3419,33 @@ def main():
 
     manager = BotManager()
 
+    # Мост веб-панели. Панель — отдельный процесс: она не поднимает второй
+    # менеджер и не лезет в accounts.json, иначе два клиента на один ник
+    # бились бы за сессию. Здесь только очередь команд и снимок состояния.
+    # Запускается до Telegram, чтобы панель видела бота сразу.
+    if os.environ.get("BR_WEB_BRIDGE", "1").lower() not in ("0", "false", "no", "off"):
+        try:
+            from logic.web_bridge import WebBridge
+
+            _web_bridge = WebBridge(manager, log=lambda m: print(m, flush=True))
+            _web_bridge.start()
+            manager.web_bridge = _web_bridge
+        except Exception as _exc:
+            print(f"[!] Мост веб-панели не поднялся: {_exc!r}")
+
     if tg_token:
         print(f"[*] Запуск Telegram бота управления...")
         tg_bot = TelegramBotController(tg_token, manager, admin_id=tg_admin)
         manager.tg_controller = tg_bot
         tg_bot.start()
+
+    # Фоновый режим: запущены с Telegram и без живого терминала.
+    #
+    # Признак считается здесь и только здесь. Раньше он проверялся лишь
+    # перед финальным циклом ожидания, а на пустом реестре управление
+    # уходило в интерактивное меню, упиралось в input() без TTY и падало
+    # с EOFError — сервис на чистой машине не поднимался вообще.
+    background = bool(tg_token) and not sys.stdin.isatty()
 
     if len(filtered_args) >= 3:
         target_server = filtered_args[0]
@@ -2883,6 +3460,8 @@ def main():
             print(f"\n[i] Найдено {len(manager.bots)} сохраненных аккаунтов из {os.path.basename(ACCOUNTS_FILE)}.")
             manager.list_bots()
             print("Введите /startall чтобы запустить всех, или /menu для перехода в меню.\n")
+        elif background:
+            print("\n[i] Аккаунтов нет. Добавь их через Telegram-бота: кнопка «➕ Добавить бота».")
         else:
             print("\n[i] Первый запуск. Добавьте аккаунты через меню.")
             interactive_menu(manager)
@@ -2890,7 +3469,7 @@ def main():
     print_help()
 
     # Если запущен в фоне с Telegram ботом (например nohup / daemon без интерактивного TTY)
-    if tg_token and not sys.stdin.isatty():
+    if background:
         print("[*] Режим фоновой работы с Telegram-ботом активен. Ожидание команд из Telegram...")
         try:
             while True:
