@@ -422,6 +422,13 @@ select option { background: #14090d; color: var(--ink); }
 }
 .bulk .spacer { flex: 1; }
 /* Выпадашка прокси в панели массовых действий: сохранённые и узлы пула. */
+/* Поле цели по уровню рядом с кнопкой «Цель». */
+.bulk .bulk-goal {
+  width: 72px; padding: 7px 9px; font-size: 11.5px;
+  border-radius: 9px; color: var(--ink);
+  border: 1px solid rgba(255,255,255,.16);
+  background: rgba(12,12,14,.75);
+}
 .bulk .bulk-proxy {
   padding: 7px 9px; font-size: 11.5px; max-width: 210px;
   border-radius: 9px; color: var(--ink);

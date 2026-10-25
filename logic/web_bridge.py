@@ -376,12 +376,26 @@ class WebBridge:
         return {"task": task, "note": note}
 
     def _cmd_add(self, args):
+        # "none" — это «своё IP». Без нормализации строка "none" уехала бы
+        # в bot.proxy, и бот пытался бы подключиться к прокси с именем none.
+        raw_proxy = str(args.get("proxy") or "").strip()
+        node_key = str(args.get("node") or "").strip()
+        if node_key:
+            pool = getattr(self.manager, "proxy_pool", None)
+            node = pool.find_node(node_key) if pool else None
+            if node is None:
+                raise ValueError("узел не найден")
+            raw_proxy = pool.socks_url_for(node) or ""
+            if not raw_proxy:
+                raise ValueError(f"{node.name}: узел не поднялся (нужен мост)")
+        if raw_proxy.lower() in ("none", "off", "direct", "-"):
+            raw_proxy = ""
         bot = self.manager.add_bot(
             str(args["server"]),
             str(args.get("nickname") or ""),
             str(args.get("password") or ""),
             default_task=str(args.get("task") or "lvl"),
-            proxy=str(args.get("proxy") or ""),
+            proxy=raw_proxy,
         )
         if bot is None:
             raise ValueError("аккаунт не создан — проверь сервер и пароль")
@@ -401,6 +415,66 @@ class WebBridge:
         result = self.manager.apply_proxy_to_bots(
             proxy, bot_ids=args.get("ids") or None)
         return result
+
+    def _cmd_goal_many(self, args):
+        """Цель по уровню пачке аккаунтов. level=0 снимает цель."""
+        ids = self._ids(args)
+        level = args.get("level")
+        if level is None:
+            level = 0
+        changed = self.manager.set_target_level(ids, level)
+        return {"changed": changed, "count": len(changed), "level": int(level or 0)}
+
+    def _cmd_add_many(self, args):
+        """Создать партию аккаунтов, сразу с прокси.
+
+        Прокси берётся одним из трёх способов:
+        proxy — конкретная строка или имя сохранённого (на всех);
+        node — узел пула (на всех, через мост);
+        пусто и spread=true — рабочие узлы вразброс, как при запуске.
+        """
+        count = int(args.get("count") or 1)
+        if count < 1:
+            raise ValueError("количество должно быть больше нуля")
+        server = str(args.get("server") or "").strip()
+        if not server:
+            raise ValueError("не указан сервер")
+
+        proxies: list[str] = []
+        pool = getattr(self.manager, "proxy_pool", None)
+        node_key = str(args.get("node") or "").strip()
+        raw = str(args.get("proxy") or "").strip()
+
+        if node_key:
+            node = pool.find_node(node_key) if pool else None
+            if node is None:
+                raise ValueError("узел не найден")
+            url = pool.socks_url_for(node) or ""
+            if not url:
+                raise ValueError(f"{node.name}: узел не поднялся (нужен мост)")
+            proxies = [url] * count
+        elif raw and raw not in ("none", "spread"):
+            proxies = [raw] * count
+        elif raw == "spread" or args.get("spread"):
+            if pool is not None:
+                try:
+                    spread = pool.rotate(count)
+                except Exception:
+                    spread = []
+                proxies = [item for item in spread if item]
+
+        created = self.manager.add_bots_batch(
+            server, count,
+            password=str(args.get("password") or ""),
+            default_task=str(args.get("task") or "lvl"),
+            proxies=proxies or None,
+        )
+        ok = [b for b in created if getattr(b, "nickname", None)]
+        return {
+            "count": len(ok),
+            "ids": [b.bot_id for b in ok],
+            "with_proxy": len([b for b in ok if getattr(b, "proxy", "")]),
+        }
 
     def _cmd_proxy_many(self, args):
         """Прокси на выбранные аккаунты.

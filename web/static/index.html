@@ -82,6 +82,9 @@
           <option value="">— прокси —</option>
         </select>
         <button class="btn btn-sm" data-bulk="proxy">🌐 Прокси</button>
+        <input class="bulk-goal" id="bulk-goal" type="number" min="0" max="200"
+               placeholder="цель" title="Целевой уровень, 0 — снять">
+        <button class="btn btn-sm" data-bulk="goal">🎯 Цель</button>
         <div class="spacer"></div>
         <button class="btn btn-sm" id="bulk-clear">Снять</button>
       </div>
@@ -118,6 +121,10 @@
           <input id="c-nick" type="text" maxlength="20" spellcheck="false" autocapitalize="off">
         </div>
         <div class="field">
+          <label for="c-count">Сколько создать</label>
+          <input id="c-count" type="number" min="1" max="50" value="1">
+        </div>
+        <div class="field">
           <label for="c-pass">Пароль (пусто — базовый)</label>
           <input id="c-pass" type="text" spellcheck="false" autocapitalize="off">
         </div>
@@ -130,6 +137,13 @@
             <option value="factory">Завод</option>
             <option value="bus">Автобус</option>
             <option value="stop">Без задачи</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="c-proxy">Прокси для новых</label>
+          <select id="c-proxy">
+            <option value="spread">🎲 Рабочие из пула (вразброс)</option>
+            <option value="none">🚫 Своё IP</option>
           </select>
         </div>
         <div class="field" style="align-self:end">

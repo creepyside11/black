@@ -197,6 +197,61 @@ class BridgeTests(TempDirMixin, unittest.TestCase):
         self.assertNotIn("password", bot, "пароль аккаунта утёк в панель")
         self.assertNotIn("network", bot)
 
+    def test_goal_many_sets_and_clears(self):
+        """Массовая правка цели: один вызов на пачку, 0 снимает цель."""
+        import bot as botmod
+
+        bots = [FakeBot(1, "A"), FakeBot(2, "B"), FakeBot(3, "C")]
+        for b in bots:
+            b.target_lvl = None
+            b.target_achieved = False
+            b.level_num = 1
+
+        manager = FakeManager(bots)
+        manager._lock = threading.RLock()
+        # Берём настоящий метод менеджера: проверяем его, а не заглушку.
+        manager.set_target_level = botmod.BotManager.set_target_level.__get__(
+            manager, FakeManager)
+        bridge = self._bridge(manager)
+
+        out = bridge._cmd_goal_many({"ids": [1, 2, 3], "level": 10})
+        self.assertEqual(out["count"], 3)
+        self.assertEqual([b.target_lvl for b in bots], [10, 10, 10])
+
+        out = bridge._cmd_goal_many({"ids": [1, 2], "level": 0})
+        self.assertEqual(out["count"], 2)
+        self.assertIsNone(bots[0].target_lvl)
+        self.assertIsNone(bots[1].target_lvl)
+        self.assertEqual(bots[2].target_lvl, 10, "третий не должен меняться")
+
+    def test_delete_selected_stops_then_removes(self):
+        """Удаление пачки: сначала стоп, иначе сессия висит без записи."""
+        import bot as botmod
+
+        removed, stopped = [], []
+
+        class Target:
+            def __init__(self, i):
+                self.bot_id = i
+                self.session = object()
+
+            def stop(self):
+                stopped.append(self.bot_id)
+
+        class Mgr(FakeManager):
+            def __init__(self):
+                super().__init__([])
+                self.bots = {i: Target(i) for i in (1, 2)}
+                self._lock = threading.RLock()
+
+            def delete_bot(self, bot_id):
+                removed.append(bot_id)
+
+        out = botmod.BotManager.delete_selected(Mgr(), [1, 2, 99])
+        self.assertEqual(out, [1, 2])
+        self.assertEqual(stopped, [1, 2], "перед удалением обязаны остановить")
+        self.assertEqual(removed, [1, 2])
+
     def test_bot_payload_shows_point(self):
         """Панель должна показывать, куда движок поставил бота."""
         bot = FakeBot(3, "Nick_Three")

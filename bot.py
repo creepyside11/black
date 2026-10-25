@@ -2565,7 +2565,9 @@ class BotManager:
 
         password = password.strip()
         created = []
-        proxies_pool = list(proxies) if proxies else []
+        # Пустые строки — это «без прокси», а не прокси, который не прошёл
+        # проверку. Иначе на каждую партию в лог летело «не годится».
+        proxies_pool = [p for p in (proxies or []) if p and str(p).strip()]
         if proxies_pool:
             # Проверяем прокси один раз на всю пачку: незачем дёргать сервер
             # N раз за одно и то же, а мёртвые надо выкинуть до захода.
@@ -2629,6 +2631,69 @@ class BotManager:
 
         threading.Thread(target=_starter, daemon=True).start()
         return bots_to_start
+
+    def delete_selected(self, bot_ids: list[int]) -> list[int]:
+        """Удалить выбранные аккаунты. Возвращает те, что реально удалены.
+
+        Останавливаем перед удалением: иначе живая сессия останется висеть
+        в памяти и продолжит слать пакеты уже без записи в реестре.
+        """
+        removed = []
+        for bot_id in bot_ids:
+            with self._lock:
+                bot = self.bots.get(bot_id)
+            if bot is None:
+                continue
+            try:
+                if getattr(bot, "session", None) is not None:
+                    bot.stop()
+            except Exception:
+                pass
+            try:
+                self.delete_bot(bot_id)
+                removed.append(bot_id)
+            except Exception as exc:
+                print(f"[!] Удаление #{bot_id}: {exc!r}")
+        return removed
+
+    def set_target_level(self, bot_ids: list[int], level) -> list[int]:
+        """Поставить цель по уровню пачке аккаунтов.
+
+        level=None или 0 снимает цель. Возвращает те аккаунты, где вышло.
+        """
+        try:
+            target = int(level)
+        except (TypeError, ValueError):
+            target = 0
+        if target < 0:
+            target = 0
+
+        changed = []
+        for bot_id in bot_ids:
+            with self._lock:
+                bot = self.bots.get(bot_id)
+            if bot is None:
+                continue
+            try:
+                if target <= 0:
+                    bot.target_lvl = None
+                    bot.target_achieved = False
+                else:
+                    bot.target_lvl = target
+                    # Достигнутость пересчитываем сразу: если бот уже
+                    # дотянул до новой цели, ждать следующего PayDay незачем.
+                    cur = 0
+                    try:
+                        cur = int(bot.level_num or 0)
+                    except Exception:
+                        cur = 0
+                    bot.target_achieved = bool(cur and cur >= target)
+                changed.append(bot_id)
+            except Exception as exc:
+                print(f"[!] Цель #{bot_id}: {exc!r}")
+        if changed:
+            self.save_accounts()
+        return changed
 
     def stop_selected(self, bot_ids: list[int]) -> list[int]:
         """Остановить выбранные аккаунты. Возвращает те, что реально встали."""

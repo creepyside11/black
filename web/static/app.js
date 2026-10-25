@@ -183,6 +183,7 @@ function render() {
   renderBots(bots);
   renderVpn(vpn);
   renderBulkProxy(vpn);
+  renderCreateProxy(vpn);
   renderSettings();
   pruneSelection();
   renderBulk();
@@ -344,6 +345,37 @@ function renderBulkProxy(vpn) {
   if (keep) sel.value = keep;
 }
 
+// Прокси для формы создания: рабочие вразброс, своё IP, сохранённые
+// и узлы пула. Тот же набор, что в полосе массовых действий.
+function renderCreateProxy(vpn) {
+  const sel = $("#c-proxy");
+  if (!sel) return;
+  const keep = sel.value || "spread";
+  const saved = vpn.saved || [];
+  const nodes = (vpn.nodes || []).filter((n) => n.usable || n.alive);
+  const parts = [
+    '<option value="spread">🎲 Рабочие из пула (вразброс)</option>',
+    '<option value="none">🚫 Своё IP</option>',
+  ];
+  if (saved.length) {
+    parts.push('<optgroup label="Сохранённые">');
+    for (const item of saved) {
+      parts.push(`<option value="px:${escapeHtml(item.name)}">⚡️ ${escapeHtml(item.name)}</option>`);
+    }
+    parts.push('</optgroup>');
+  }
+  if (nodes.length) {
+    parts.push('<optgroup label="Узлы пула">');
+    for (const node of nodes) {
+      const mark = node.usable ? "🟢" : "🟡";
+      parts.push(`<option value="node:${escapeHtml(node.key)}">${mark} ${escapeHtml(node.name)}</option>`);
+    }
+    parts.push('</optgroup>');
+  }
+  sel.innerHTML = parts.join("");
+  if (keep) sel.value = keep;
+}
+
 function renderVpn(vpn) {
   const nodes = vpn.nodes || [];
   const summary = vpn.summary || {};
@@ -454,6 +486,14 @@ document.addEventListener("click", async (e) => {
         }
         payload.proxy = item.proxy;
       }
+    } else if (act === "goal") {
+      const raw = (($("#bulk-goal") || {}).value || "").trim();
+      if (raw === "") {
+        toast("Введи целевой уровень (0 — снять)", "bad");
+        return;
+      }
+      cmd = "goal_many";
+      payload.level = Number(raw) || 0;
     } else {
       // Старт/стоп/удаление идут пачкой, статистика и вход в мир —
       // своими командами: они работают в фоне и не блокируют мост.
@@ -470,6 +510,7 @@ document.addEventListener("click", async (e) => {
         act === "delete" ? `Удаляю: ${done}`
           : act === "stats" ? `Запросил статистику: ${done}`
           : act === "proxy" ? `Прокси применяю: ${done}`
+          : act === "goal" ? `Цель ${payload.level || 0} lvl: ${done}`
           : `В очереди: ${done}`,
         "ok",
       );
@@ -562,18 +603,49 @@ function fillServers() {
 $("#create-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const btn = $("#c-submit");
+  const count = Math.max(1, Number($("#c-count").value) || 1);
+  const choice = $("#c-proxy").value || "spread";
+  // Значение из выпадашки переводим в то, что понимает сервер:
+  // px:<имя> -> строка сохранённого, node:<ключ> -> узел пула.
+  const payloadProxy = { proxy: choice };
+  if (choice.startsWith("px:")) {
+    const item = ((state.vpn || {}).saved || [])
+      .find((p) => p.name === choice.slice(3));
+    payloadProxy.proxy = item ? item.proxy : "none";
+  } else if (choice.startsWith("node:")) {
+    payloadProxy.proxy = "";
+    payloadProxy.node = choice.slice(5);
+  }
   btn.disabled = true;
   btn.textContent = "Создаю…";
   try {
-    const res = await post("add", {
-      server: $("#c-server").value,
-      nickname: $("#c-nick").value.trim(),
-      password: $("#c-pass").value.trim(),
-      task: $("#c-task").value,
-    });
-    const r = res.result || {};
-    toast(`Создан ${r.nickname || ""} (#${r.id ?? "?"})`, "ok");
-    $("#c-nick").value = "";
+    if (count > 1) {
+      // Партия: ник не задаётся — при десятке одинаковых имён сервер
+      // всё равно перегенерирует занятые.
+      const res = await post("add_many", {
+        server: $("#c-server").value,
+        count,
+        password: $("#c-pass").value.trim(),
+        task: $("#c-task").value,
+        ...payloadProxy,
+      });
+      const r = res.result || {};
+      toast(
+        `Создано ${r.count ?? 0} · с прокси ${r.with_proxy ?? 0}`,
+        "ok",
+      );
+    } else {
+      const res = await post("add", {
+        server: $("#c-server").value,
+        nickname: $("#c-nick").value.trim(),
+        password: $("#c-pass").value.trim(),
+        task: $("#c-task").value,
+        ...payloadProxy,
+      });
+      const r = res.result || {};
+      toast(`Создан ${r.nickname || ""} (#${r.id ?? "?"})`, "ok");
+      $("#c-nick").value = "";
+    }
     await loadState(true);
   } catch (exc) {
     toast(exc.message, "bad");

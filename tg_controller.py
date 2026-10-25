@@ -183,6 +183,10 @@ class TelegramBotController:
         )
         markup.row(
             types.InlineKeyboardButton("🌐 Прокси выбранным", callback_data=f"act_proxy_some:{page}", style="primary"),
+            types.InlineKeyboardButton("🎯 Цель выбранным", callback_data=f"act_goal_some:{page}", style="primary"),
+        )
+        markup.row(
+            types.InlineKeyboardButton("🗑 Удалить выбранных", callback_data=f"act_del_some:{page}", style="danger"),
             types.InlineKeyboardButton("▶️ Всех", callback_data="act_startall", style="success"),
             types.InlineKeyboardButton("⏹ Всех", callback_data="act_stopall", style="danger")
         )
@@ -384,7 +388,7 @@ class TelegramBotController:
             "✖️ Отмена", callback_data="batch_cancel", style="danger"))
 
         text = (
-            f"<b>➕ Массовая регистрация — шаг 1 из 4</b>\n\n"
+            f"<b>➕ Массовая регистрация — шаг 1 из 5</b>\n\n"
             f"Выбери сервер. Всего серверов: <b>{len(servers)}</b>, "
             f"страница <b>{page}</b> из <b>{total_pages}</b>.\n\n"
             f"🟢 свободно · 🟡 загружен · 🔴 почти полный"
@@ -416,7 +420,7 @@ class TelegramBotController:
             "✖️ Отмена", callback_data="batch_cancel", style="danger"))
         sent = self.bot.send_message(
             chat_id,
-            f"<b>➕ Массовая регистрация — шаг 2 из 4</b>\n\n"
+            f"<b>➕ Массовая регистрация — шаг 2 из 5</b>\n\n"
             f"Сервер: <b>{server}</b>\n\n"
             f"Сколько аккаунтов создать? Пришли числом от 1 до {limit}.\n"
             f"<i>Например: 5</i>",
@@ -446,7 +450,7 @@ class TelegramBotController:
         )
         self.bot.send_message(
             chat_id,
-            f"<b>➕ Массовая регистрация — шаг 3 из 4</b>\n\n"
+            f"<b>➕ Массовая регистрация — шаг 3 из 5</b>\n\n"
             f"Сервер: <b>{server}</b> · аккаунтов: <b>{count}</b>\n\n"
             f"Какой пароль поставить новым аккаунтам?\n{hint}",
             reply_markup=markup,
@@ -485,14 +489,107 @@ class TelegramBotController:
             "✖️ Отмена", callback_data="batch_cancel", style="danger"))
         self.bot.send_message(
             chat_id,
-            f"<b>➕ Массовая регистрация — шаг 4 из 4</b>\n\n"
+            f"<b>➕ Массовая регистрация — шаг 4 из 5</b>\n\n"
             f"Сервер: <b>{server}</b> · аккаунтов: <b>{count}</b> · "
             f"пароль: <code>{password}</code>\n\n"
             f"Что делают аккаунты после входа?",
             reply_markup=markup,
         )
 
-    def _run_batch(self, chat_id, server, count, password, task):
+    def _ask_batch_proxy(self, chat_id, server, count, password, task):
+        """Шаг 5: какой прокси дать новым аккаунтам.
+
+        Раньше прокси в массовом создании не выбирался вообще: аккаунты
+        поднимались с прямого IP, и десяток свежих ников светился одним
+        адресом. Здесь либо конкретный узел, либо раздача рабочих по
+        кругу из пула.
+        """
+        self.user_states[chat_id] = {
+            "action": "batch_proxy",
+            "server": server,
+            "count": count,
+            "password": password,
+            "task": task,
+        }
+        pool = getattr(self.manager, "proxy_pool", None)
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        picks = {}
+
+        markup.add(types.InlineKeyboardButton(
+            "🎲 Рабочие из пула (вразброс)",
+            callback_data="batch_px:random", style="success"))
+        markup.add(types.InlineKeyboardButton(
+            "🚫 Своё IP (без прокси)",
+            callback_data="batch_px:none", style="primary"))
+
+        saved = load_proxy_list()
+        for index, (name, _value) in enumerate(saved[:4]):
+            token = f"s{index}"
+            picks[token] = ("saved", name)
+            markup.add(types.InlineKeyboardButton(
+                f"⚡️ {name}", callback_data=f"batch_px:{token}", style="primary"))
+
+        if pool is not None:
+            for index, res in enumerate(pool.statuses()[:4]):
+                node = res.node
+                mark = "🟢" if res.usable else ("🟡" if res.alive else "🔴")
+                label = f"{mark} {node.name[:20]}"
+                if not node.is_direct:
+                    label += " (мост)"
+                token = f"n{index}"
+                picks[token] = ("node", node.key)
+                markup.add(types.InlineKeyboardButton(
+                    label, callback_data=f"batch_px:{token}", style="primary"))
+
+        self._batch_px_picks = picks
+        markup.row(types.InlineKeyboardButton(
+            "✖️ Отмена", callback_data="batch_cancel", style="danger"))
+
+        self.bot.send_message(
+            chat_id,
+            f"<b>➕ Массовая регистрация — шаг 5 из 5</b>\n\n"
+            f"Сервер: <b>{server}</b> · аккаунтов: <b>{count}</b> · "
+            f"задача: <code>{task}</code>\n\n"
+            f"Какой прокси дать новым аккаунтам?\n"
+            f"<i>«Вразброс» раздаст рабочие узлы по кругу — по несколько "
+            f"аккаунтов на узел, как при обычном запуске.</i>",
+            reply_markup=markup,
+        )
+
+    def _batch_proxy_list(self, choice: str, count: int, picks: dict):
+        """Собрать список прокси под партию. None — узел не поднялся."""
+        pool = getattr(self.manager, "proxy_pool", None)
+
+        if choice == "none":
+            return []
+
+        if choice == "random":
+            if pool is None:
+                return []
+            try:
+                spread = pool.rotate(count)
+            except Exception:
+                return []
+            return [item for item in spread if item]
+
+        pick = picks.get(choice)
+        if pick is None:
+            return None
+        kind, value = pick
+
+        if kind == "saved":
+            url = dict(load_proxy_list()).get(value, "")
+            return [url] * count if url else None
+
+        node = pool.find_node(value) if pool else None
+        if node is None:
+            return None
+        url = pool.socks_url_for(node) or ""
+        if not url:
+            return None
+        return [url] * count
+
+    def _run_batch(self, chat_id, server, count, password, task, proxies=None):
         settings = getattr(self.manager, "settings", None)
         limit = settings.batch_limit if settings else 50
         if count > limit:
@@ -511,18 +608,24 @@ class TelegramBotController:
         def _worker():
             try:
                 created = self.manager.add_bots_batch(
-                    server, count, password=password, default_task=task)
+                    server, count, password=password, default_task=task,
+                    proxies=proxies or None)
             except Exception as exc:
                 self.bot.send_message(chat_id, f"❌ Ошибка: <code>{exc}</code>")
                 return
             ok = [b for b in created if getattr(b, "nickname", None)]
             names = ", ".join(b.nickname for b in ok[:12])
             tail = f" и ещё {len(ok) - 12}" if len(ok) > 12 else ""
+            with_proxy = len([b for b in ok if getattr(b, "proxy", "")])
+            proxy_note = (
+                f"\n🌐 С прокси: <b>{with_proxy}</b> из {len(ok)}"
+                if with_proxy else "\n🌐 Прокси не назначался"
+            )
             self.bot.send_message(
                 chat_id,
                 f"✅ Создано <b>{len(ok)}</b> из {count} на <b>{server}</b> "
                 f"с задачей <code>{task}</code>.\n"
-                f"{names}{tail}\n\n"
+                f"{names}{tail}{proxy_note}\n\n"
                 f"Список и статусы — /start."
             )
 
@@ -1012,6 +1115,47 @@ class TelegramBotController:
                     "Для отмены: /cancel",
                 )
 
+            elif data.startswith("act_goal_some:"):
+                page = int(data.split(":")[1])
+                self.bot.answer_callback_query(call.id)
+                self.user_states[chat_id] = {"action": "goal_selected_bots", "page": page}
+                self.bot.send_message(
+                    chat_id,
+                    "<b>🎯 Цель по уровню для нескольких ботов</b>\n\n"
+                    "Сначала ID через пробел или диапазон:\n"
+                    "• <code>1 2 5 8</code>\n"
+                    "• <code>1-10</code>\n\n"
+                    "Дальше пришлёшь уровень. Для отмены: /cancel",
+                )
+
+            elif data.startswith("act_del_some:"):
+                page = int(data.split(":")[1])
+                self.bot.answer_callback_query(call.id)
+                self.user_states[chat_id] = {"action": "del_selected_bots", "page": page}
+                self.bot.send_message(
+                    chat_id,
+                    "<b>🗑 Удаление нескольких ботов</b>\n\n"
+                    "Введите ID через пробел или диапазон:\n"
+                    "• <code>1 2 5 8</code>\n"
+                    "• <code>1-10</code>\n\n"
+                    "Боты будут остановлены и удалены из реестра. "
+                    "Для отмены: /cancel",
+                )
+
+            elif data == "del_some_confirm":
+                ids = getattr(self, "_del_some_ids", None) or []
+                self._del_some_ids = []
+                if not ids:
+                    self.bot.answer_callback_query(call.id, "Список устарел")
+                    return
+                removed = self.manager.delete_selected(ids)
+                self.bot.answer_callback_query(call.id, f"Удалено: {len(removed)}")
+                self.bot.send_message(
+                    chat_id,
+                    f"🗑 Удалено аккаунтов: <b>{len(removed)}</b>\n"
+                    + (", ".join(f"#{i}" for i in removed[:20]) if removed else "—"),
+                )
+
             elif data.startswith("act_proxy_some:"):
                 page = int(data.split(":")[1])
                 self.bot.answer_callback_query(call.id)
@@ -1145,11 +1289,28 @@ class TelegramBotController:
                 if state.get("action") != "batch_task":
                     self.bot.answer_callback_query(call.id, "Шаг устарел, начни заново")
                     return
-                del self.user_states[chat_id]
                 self.bot.answer_callback_query(call.id, f"Задача {task}")
-                self._run_batch(
+                self._ask_batch_proxy(
                     chat_id, state["server"], state["count"],
                     state["password"], task)
+
+            elif data.startswith("batch_px:"):
+                choice = data.split(":", 1)[1]
+                state = self.user_states.get(chat_id) or {}
+                if state.get("action") != "batch_proxy":
+                    self.bot.answer_callback_query(call.id, "Шаг устарел, начни заново")
+                    return
+                del self.user_states[chat_id]
+                proxies = self._batch_proxy_list(
+                    choice, state["count"], getattr(self, "_batch_px_picks", None) or {})
+                if proxies is None:
+                    self.bot.answer_callback_query(
+                        call.id, "Узел не поднялся — выбери другой", show_alert=True)
+                    return
+                self.bot.answer_callback_query(call.id, "Создаю")
+                self._run_batch(
+                    chat_id, state["server"], state["count"],
+                    state["password"], state["task"], proxies)
 
             elif data == "batch_cancel":
                 self.user_states.pop(chat_id, None)
@@ -1936,7 +2097,8 @@ class TelegramBotController:
                 self._render_settings(message.chat.id)
 
             elif action in ("start_selected_bots", "stop_selected_bots",
-                            "proxy_selected_bots"):
+                            "proxy_selected_bots", "goal_selected_bots",
+                            "del_selected_bots"):
                 page = state.get("page", 1)
                 del self.user_states[message.chat.id]
                 selected_list = self._parse_ids(message.text)
@@ -1959,6 +2121,47 @@ class TelegramBotController:
                     self._ask_bulk_proxy(message.chat.id, selected_list, page)
                     return
 
+                if action == "goal_selected_bots":
+                    self._goal_ids = selected_list
+                    self.user_states[message.chat.id] = {
+                        "action": "goal_level", "page": page}
+                    self.bot.reply_to(
+                        message,
+                        f"<b>🎯 Цель для {len(selected_list)} бот(ов)</b>\n\n"
+                        f"Пришли уровень, до которого качаться "
+                        f"(например <code>10</code>).\n"
+                        f"<code>0</code> — снять цель.\n\n"
+                        f"Для отмены: /cancel",
+                    )
+                    return
+
+                if action == "del_selected_bots":
+                    known = [i for i in selected_list if i in self.manager.bots]
+                    if not known:
+                        self.bot.reply_to(message, "⚠️ Таких ботов нет.")
+                        return
+                    self._del_some_ids = known
+                    markup = types.InlineKeyboardMarkup(row_width=2)
+                    markup.row(
+                        types.InlineKeyboardButton(
+                            f"🗑 Удалить {len(known)}",
+                            callback_data="del_some_confirm", style="danger"),
+                        types.InlineKeyboardButton(
+                            "↩️ Отмена", callback_data=f"page:{page}", style="primary"),
+                    )
+                    names = ", ".join(
+                        f"#{i} {self.manager.bots[i].nickname}" for i in known[:12])
+                    tail = f" и ещё {len(known) - 12}" if len(known) > 12 else ""
+                    self.bot.reply_to(
+                        message,
+                        f"<b>🗑 Удалить {len(known)} аккаунт(ов)?</b>\n\n"
+                        f"{names}{tail}\n\n"
+                        f"<i>Аккаунты будут остановлены и убраны из реестра. "
+                        f"Отменить это нельзя.</i>",
+                        reply_markup=markup,
+                    )
+                    return
+
                 ids_to_start = set(selected_list)
                 started = self.manager.start_selected(selected_list)
                 if started:
@@ -1971,6 +2174,27 @@ class TelegramBotController:
                     )
                 else:
                     self.bot.reply_to(message, "⚠️ Выбранные боты не найдены или уже запущены/забанены.")
+
+            elif action == "goal_level":
+                page = state.get("page", 1)
+                del self.user_states[message.chat.id]
+                ids = getattr(self, "_goal_ids", None) or []
+                self._goal_ids = []
+                raw = (message.text or "").strip().lower()
+                if not raw.isdigit():
+                    self.bot.reply_to(message, "❌ Нужно число. Например <code>10</code>.")
+                    return
+                level = int(raw)
+                changed = self.manager.set_target_level(ids, level)
+                if level <= 0:
+                    self.bot.reply_to(
+                        message,
+                        f"🎯 Цель снята у <b>{len(changed)}</b> аккаунт(ов).")
+                else:
+                    self.bot.reply_to(
+                        message,
+                        f"🎯 Цель <b>{level} lvl</b> поставлена "
+                        f"<b>{len(changed)}</b> аккаунт(ам).")
 
             elif action == "set_bot_goal":
                 bid = state.get("bid")
