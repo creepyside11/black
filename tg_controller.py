@@ -1034,7 +1034,9 @@ class TelegramBotController:
                     return
 
                 if token == "none":
-                    proxy = ""
+                    # Токен, а не пустая строка: set_bot_proxy различает
+                    # «сбросить» и «прокси не годится».
+                    proxy = "none"
                 else:
                     pick = (getattr(self, "_bulk_px_picks", None) or {}).get(token)
                     if pick is None:

@@ -350,5 +350,36 @@ class ReplaceProxyTests(unittest.TestCase):
             manager.proxy_for_replacement(old), "socks5://1.2.3.4:1080")
 
 
+class ProxyResetTests(unittest.TestCase):
+    """Сброс прокси идёт токеном "none", а не пустой строкой.
+
+    set_bot_proxy("") уходит в resolve_proxy и возвращает отказ: бот
+    остаётся на прежнем прокси, хотя человек нажал «свой IP».
+    """
+
+    def test_none_token_clears_proxy(self):
+        from unittest.mock import MagicMock
+        manager = botmod.BotManager.__new__(botmod.BotManager)
+        manager._lock = __import__("threading").RLock()
+        fake = MagicMock()
+        fake.proxy = SOCKS
+        manager.bots = {7: fake}
+        manager.save_accounts = lambda *a, **k: None
+        self.assertTrue(manager.set_bot_proxy(7, "none"))
+        self.assertEqual(fake.proxy, "")
+
+    def test_empty_string_is_rejected(self):
+        from unittest.mock import MagicMock
+        manager = botmod.BotManager.__new__(botmod.BotManager)
+        manager._lock = __import__("threading").RLock()
+        fake = MagicMock()
+        fake.proxy = SOCKS
+        manager.bots = {7: fake}
+        manager.save_accounts = lambda *a, **k: None
+        manager.resolve_proxy = lambda raw: ""
+        self.assertFalse(manager.set_bot_proxy(7, ""))
+        self.assertEqual(fake.proxy, SOCKS, "прокси не должен слетать")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

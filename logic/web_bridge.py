@@ -425,9 +425,6 @@ class WebBridge:
         if not raw:
             raise ValueError("не указан прокси")
 
-        if raw in ("none", "off", "reset"):
-            raw = ""
-
         def run():
             for bot_id in ids:
                 try:
