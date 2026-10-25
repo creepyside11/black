@@ -24,6 +24,10 @@ import time
 PROOF_TIMEOUT = 40.0
 # Сколько ждать саму игру (соединение и позицию).
 ENTER_TIMEOUT = 90.0
+# Сколько ждать разрешения на спавн. Своё окно, а не остаток от входа:
+# на медленном прокси вход съедает почти весь enter_timeout, и на спавн
+# не остаётся времени — бот застревал на «мир не подтверждён».
+SPAWN_WAIT = 45.0
 POLL = 1.0
 
 
@@ -179,6 +183,27 @@ def warp_to_station(bot, *, log=None) -> dict:
     return {"ok": result.get("status") == "arrived", "station": name, **result}
 
 
+def _wait_spawn_allowed(bot, deadline: float, *, log=None) -> str:
+    """Дождаться, пока сервер разрешит спавн, и отправить его один раз.
+
+    Возвращает то же, что finish_spawn: sent / already / not_allowed /
+    offline / failed. Ждём до deadline, но не бесконечно: если сервер так
+    и не выставил spawn_response (например, бот уже был в мире), просто
+    отдаём последний ответ и идём проверять стрим.
+    """
+    last = "not_allowed"
+    while True:
+        state = finish_spawn(bot)
+        if state in ("sent", "already"):
+            return state
+        if state == "offline":
+            return state
+        last = state
+        if time.monotonic() >= deadline:
+            return last
+        time.sleep(0.5)
+
+
 def ensure(bot, *, timeout: float = PROOF_TIMEOUT, enter_timeout: float = ENTER_TIMEOUT,
            fallback_warp: bool = True, log=None) -> dict:
     """Довести бота до общего мира. Возвращает отчёт, а не молчание."""
@@ -200,7 +225,16 @@ def ensure(bot, *, timeout: float = PROOF_TIMEOUT, enter_timeout: float = ENTER_
     # 2. Финальное подтверждение после меню. Это единственный Spawn RPC
     # после реального ответа вокзала; request_class-хендшейк по-прежнему
     # выключен в logic.spawn.py.
-    spawn_state = finish_spawn(bot)
+    #
+    # Ждём РАЗРЕШЕНИЯ, а не первую попавшуюся позицию. Раньше здесь стоял
+    # один вызов сразу после появления координат: сервер к этому моменту
+    # ещё не выставил spawn_response, finish_spawn отвечал not_allowed,
+    # и второго шанса не было. Стрим оставался пустым навсегда, и бот
+    # честно рапортовал «мир не подтверждён», хотя ему просто не отправили
+    # Spawn. Опрос безопасен: отправка внутри защищена _rpc_spawn_queued,
+    # поэтому RPC уходит ровно один раз за вход.
+    spawn_state = _wait_spawn_allowed(
+        bot, time.monotonic() + SPAWN_WAIT, log=log)
     if spawn_state == "sent":
         _log(log, "[МИР] финальный Spawn отправлен после меню")
 

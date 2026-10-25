@@ -5,6 +5,7 @@
 другие игроки в стриме — не собственный игрок и не NPC.
 """
 
+import time
 import unittest
 from unittest import mock
 
@@ -222,6 +223,58 @@ class StatsTests(unittest.TestCase):
         out = stats.refresh(bot, timeout=2.0)
         self.assertTrue(out["ok"])
         self.assertEqual(out["level_num"], 5)
+
+
+class SpawnPermissionTests(unittest.TestCase):
+    """Спавн ждёт разрешения сервера, а не первую позицию.
+
+    Раньше ensure звал finish_spawn один раз сразу после появления
+    координат. Сервер к этому моменту ещё не выставил spawn_response,
+    ответ был not_allowed, и второго шанса не было: стрим оставался
+    пустым, бот писал «мир не подтверждён».
+    """
+
+    def test_retries_until_allowed(self):
+        bot = FakeBot()
+        states = ["not_allowed", "not_allowed", "sent"]
+
+        def fake_finish(_bot):
+            return states.pop(0) if states else "sent"
+
+        with mock.patch.object(real_world, "finish_spawn", fake_finish):
+            state = real_world._wait_spawn_allowed(
+                bot, time.monotonic() + 5.0)
+        self.assertEqual(state, "sent")
+        self.assertEqual(states, [], "должен был дойти до разрешения")
+
+    def test_gives_up_when_server_never_allows(self):
+        bot = FakeBot()
+        with mock.patch.object(real_world, "finish_spawn",
+                               return_value="not_allowed"):
+            started = time.monotonic()
+            state = real_world._wait_spawn_allowed(
+                bot, time.monotonic() + 0.3)
+        self.assertEqual(state, "not_allowed")
+        self.assertLess(time.monotonic() - started, 3.0)
+
+    def test_offline_returns_immediately(self):
+        bot = FakeBot()
+        with mock.patch.object(real_world, "finish_spawn",
+                               return_value="offline"):
+            started = time.monotonic()
+            state = real_world._wait_spawn_allowed(
+                bot, time.monotonic() + 30.0)
+        self.assertEqual(state, "offline")
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    def test_already_queued_is_not_resent(self):
+        bot = FakeBot()
+        with mock.patch.object(real_world, "finish_spawn",
+                               return_value="already") as finish:
+            state = real_world._wait_spawn_allowed(
+                bot, time.monotonic() + 5.0)
+        self.assertEqual(state, "already")
+        self.assertEqual(finish.call_count, 1)
 
 
 if __name__ == "__main__":
