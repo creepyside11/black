@@ -29,10 +29,13 @@ import time
 from dataclasses import replace
 
 from .vpn_probe import (
+    GAME_TARGET_HOST,
+    GAME_TARGET_PORT,
     ProbeResult,
     STATUS_BANNED,
     STATUS_DEAD,
     STATUS_NEEDS_CLIENT,
+    STATUS_NO_GAME,
     STATUS_OK,
     probe_many,
     probe_node,
@@ -107,6 +110,8 @@ class ProxyPool:
         # прокси — получался ложный «мёртвый» на живом прокси. Проверяем
         # TCP на обычном порту, UDP — отдельно, через STUN.
         target_port: int = 443,
+        game_host: str = GAME_TARGET_HOST,
+        game_port: int = GAME_TARGET_PORT,
         prober=None,
         loader=None,
         clock=_now,
@@ -124,6 +129,10 @@ class ProxyPool:
         self.timeout = float(timeout)
         self.target_host = target_host
         self.target_port = int(target_port)
+        # Игровой сервер, до которого обязан доставать прокси. Все игровые
+        # адреса в 80.66.82.0/24, поэтому одного достаточно как признака.
+        self.game_host = game_host
+        self.game_port = int(game_port)
         self._prober = prober or probe_many
         self._loader = loader or load_subscription
         self._clock = clock
@@ -392,6 +401,11 @@ class ProxyPool:
         kwargs = {
             "timeout": self.timeout,
             "target_port": self.target_port,
+            # Проверяем не «пускает ли в интернет», а «пускает ли в игру»:
+            # узел с выходом в США отдаёт пустоту там, где казахстанский
+            # отвечает, и без этого боты висели в «сервер не отвечает».
+            "game_host": self.game_host,
+            "game_port": self.game_port,
         }
         if self.target_host:
             kwargs["target_host"] = self.target_host
@@ -472,7 +486,8 @@ class ProxyPool:
             self.log(f"    ❌ {res.node.name} ({res.node.address}:{res.node.port}) — {res.reason}")
 
     def _probe(self, node: VpnNode) -> ProbeResult:
-        kwargs = {"timeout": self.timeout, "target_port": self.target_port}
+        kwargs = {"timeout": self.timeout, "target_port": self.target_port,
+                  "game_host": self.game_host, "game_port": self.game_port}
         if self.target_host:
             kwargs["target_host"] = self.target_host
         # Через тот же пробер, что и обновление по таймеру: тогда проверку
@@ -692,8 +707,8 @@ class ProxyPool:
         with self._lock:
             items = list(self.results.values())
             banned = dict(self.banned)
-        order = {STATUS_OK: 0, STATUS_NEEDS_CLIENT: 1, STATUS_DEAD: 2,
-                 STATUS_BANNED: 3}
+        order = {STATUS_OK: 0, STATUS_NEEDS_CLIENT: 1, STATUS_NO_GAME: 2,
+                 STATUS_DEAD: 3, STATUS_BANNED: 4}
 
         # Копируем, а не правим на месте: результат лежит в кэше, и если
         # испортить его здесь, снятие бана не вернёт узел в работу —

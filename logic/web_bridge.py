@@ -514,6 +514,8 @@ class WebBridge:
         return self._vpn_payload(
             page=int(args.get("page") or 1),
             per_page=int(args.get("per_page") or 24),
+            search=str(args.get("search") or ""),
+            only_usable=bool(args.get("only_usable")),
         )
 
     def _cmd_vpn_refresh(self, args):
@@ -632,7 +634,8 @@ class WebBridge:
         bots.sort(key=lambda b: b["id"])
         return bots
 
-    def _vpn_payload(self, page: int = 1, per_page: int = 24) -> dict:
+    def _vpn_payload(self, page: int = 1, per_page: int = 24,
+                     search: str = "", only_usable: bool = False) -> dict:
         """Узлы с постраничной выдачей.
 
         Раньше отдавались все разом, и на большом пуле панель рисовала
@@ -649,6 +652,21 @@ class WebBridge:
             statuses = pool.statuses()
         except Exception:
             statuses = []
+        # Поиск и фильтр применяются до нарезки на страницы: иначе поиск
+        # искал бы только внутри открытой страницы и «не находил» узлы,
+        # которые на других страницах.
+        needle = str(search or "").strip().lower()
+        if needle:
+            statuses = [
+                res for res in statuses
+                if needle in (res.node.name or "").lower()
+                or needle in (res.node.address or "").lower()
+                or needle in f"{res.node.address}:{res.node.port}".lower()
+                or needle in (res.node.protocol or "").lower()
+            ]
+        if only_usable:
+            statuses = [res for res in statuses if res.usable]
+
         total = len(statuses)
         per_page = max(1, int(per_page))
         pages = max(1, (total + per_page - 1) // per_page)

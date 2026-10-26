@@ -20,6 +20,12 @@ class InterfaceID:
     SHOP_FOOD = 3
     DIALOG_MENU = 10
     PASSWORD = 50
+    # Мини-игры: GUIMiniGameEventsGame, режим выбирается ключом "g".
+    # Ответы: {"s":1} попадание, {"s":0} промах, {"t":1} таймаут, {"c":1} закрыть.
+    MINIGAME = 31
+    # Капча: BrNewCaptcha, картинка приходит URL'ом в ключе "u",
+    # ответ {"t":0,"s":"<текст>"}.
+    CAPTCHA = 26
 
 
 INTERFACE_PARSERS = {

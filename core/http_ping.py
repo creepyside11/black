@@ -139,23 +139,48 @@ class HttpPrePing:
             if str(host).strip() and str(name).strip()
         }
         self._lock = threading.RLock()
-        self._session_user_agent: str | None = None
+        # Устройство фиксируется на аккаунт, а не на сессию.
+        #
+        # Раньше тут стоял None и reset_session() обнулял его на каждом
+        # коннекте: один и тот же ник заходил с новой модели телефона и
+        # новым Build ID при каждом переподключении. Со стороны сервера
+        # это не «аккаунт переехал на другой телефон» — это десяток разных
+        # устройств на один ник в час, то есть готовая метка мультиаккаунта.
+        self._user_agent: str | None = None
+
+    def pin_user_agent(self, user_agent: str | None) -> None:
+        """Жёстко задать устройство аккаунта (берётся из accounts.json)."""
+        ua = str(user_agent or "").strip()
+        with self._lock:
+            if not ua:
+                return
+            if self._user_agent != ua:
+                self._user_agent = ua
+                print(f"[HTTP UA] pinned: {ua}", flush=True)
+
+    def device_profile(self) -> str:
+        """Текущее устройство аккаунта — его надо сохранить в accounts.json."""
+        return self.user_agent()
 
     def reset_session(self) -> None:
-        with self._lock:
-            self._session_user_agent = None
+        """Переподключение НЕ меняет устройство.
+
+        Метод остался, потому что его зовут на каждом коннекте; сама
+        сессия при этом сбрасывается, а устройство — нет.
+        """
+        return None
 
     def user_agent(self) -> str:
         with self._lock:
-            if self._session_user_agent is None:
-                self._session_user_agent = generate_http_user_agent()
+            if self._user_agent is None:
+                self._user_agent = generate_http_user_agent()
                 print(
                     "[HTTP UA] generated for current session: "
-                    f"{self._session_user_agent}",
+                    f"{self._user_agent}",
                     flush=True,
                 )
 
-            return self._session_user_agent
+            return self._user_agent
 
     def _http_host_for_server(self, host: str) -> str:
         host = str(host or "").strip()

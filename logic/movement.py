@@ -432,6 +432,33 @@ class CoordMovementController:
             last_percent,
         )
 
+    def _ground_z(self, state: dict) -> float:
+        """Высота дороги под машиной.
+
+        Приоритет: позиция нашего транспорта из стрима (её ведёт сервер),
+        иначе текущая высота игрока. Целевую Z не используем — она задана
+        вручную и обычно висит на 10-20см выше асфальта.
+        """
+        try:
+            session = getattr(self.player, "session", None)
+            stream = getattr(session, "stream", None) if session else None
+            if stream is not None:
+                vid = int(getattr(self.player, "vehicle_id", 0) or 0)
+                rec = stream.get_vehicle(vid) if vid else None
+                if rec is not None:
+                    # Запись о своём транспорте часто устаревшая: сервер
+                    # присылает её редко. Берём высоту, только если запись
+                    # действительно про эту точку, иначе смотрим на землю.
+                    dx = float(getattr(rec, "x", 0.0)) - float(self.player.x)
+                    dy = float(getattr(rec, "y", 0.0)) - float(self.player.y)
+                    if math.hypot(dx, dy) <= 5.0:
+                        z = float(getattr(rec, "z", 0.0))
+                        if abs(z) > 0.01:
+                            return z
+        except Exception:
+            pass
+        return float(self.player.z)
+
     def _apply_movement_keys(self, state: dict) -> None:
         mode_str = state.get("movement_keys_mode", "off:0")
         mode, key_value = _parse_movement_keys_mode(mode_str)
@@ -501,6 +528,8 @@ class CoordMovementController:
             brake_time = _sample_motion_value(
                 base_brake_time, "brake_time", randomization, last_percent,
             )
+
+            avoid_obstacles = bool(settings.get("avoid_obstacles", True))
 
             direction_control = normalize_movement_direction_control(
                 supplied.get(
@@ -608,6 +637,12 @@ class CoordMovementController:
                 "direction_deviation_next_check": started + 1.0,
                 "direction_deviation_updated_at": started,
                 "movement_keys_mode": movement_keys_mode,
+                "avoid_obstacles": avoid_obstacles,
+                "turn_radius": max(0.5, float(settings.get("turn_radius", 4.5))),
+                "max_steer": max(5.0, float(settings.get("max_steer", 35.0))),
+                "walk_turn_radius": max(0.05, float(settings.get("walk_turn_radius", 0.35))),
+                "steer_model": bool(settings.get("steer_model", True)),
+                "v_speed": 0.0,
                 "stop_on_dialog": bool(
                     (randomization or {}).get("stop_on_dialog", False)
                     if settings.get("stop_on_dialog") is None
@@ -738,6 +773,102 @@ class CoordMovementController:
         max_change = 360.0 * (percent / 100.0) * max(0.0, float(dt))
         return (float(current) + _clamp(error, -max_change, max_change)) % 360.0
 
+    def _arrive_vehicle_locked(self, state: dict, now: float) -> dict:
+        """Финиш машины: XY в цель, высота остаётся дорожной."""
+        target = state["target_position"]
+        self.player._set_position_internal(
+            target[0], target[1], self.player.z, update_velocity=False,
+        )
+        self.player.clear_position_target()
+        self.player.reset_velocity()
+        self.player.set_control_axes(0, 0)
+        return {"completed": self._finish_locked(state, "arrived")}
+
+    def _step_vehicle(self, state: dict, now: float) -> dict | None:
+        """Движение машины: руль и курс, а не сдвиг позиции к цели.
+
+        Модель велосипеда: корпус доворачивается ровно на проеханный путь,
+        скорость падает на повороте и у цели, высота берётся с дороги.
+        Из-за этого машина не может ехать боком или задом, не крутится
+        на месте и не всплывает в воздух.
+        """
+        player = self.player
+        target = state["target_position"]
+
+        dx = target[0] - player.x
+        dy = target[1] - player.y
+        flat = math.hypot(dx, dy)
+        completion = max(0.35, min(float(state["completion_distance"]), 0.8))
+        if flat <= completion:
+            return self._arrive_vehicle_locked(state, now)
+
+        nominal = max(0.001, float(state["nominal_interval"]))
+        last_step = state["last_step_at"]
+        dt = nominal if last_step is None else max(0.001, now - last_step)
+        dt = min(dt, MAX_STEP_DT)
+
+        bearing = math.degrees(math.atan2(-dx, dy)) % 360.0
+        error = (bearing - player.rotation + 180.0) % 360.0 - 180.0
+
+        max_steer = max(5.0, float(state.get("max_steer", 35.0)))
+        steer = _clamp(error, -max_steer, max_steer)
+        if abs(error) <= 1.0:
+            steer = 0.0
+
+        base_speed = max(0.5, float(state["coord_delay"]) / nominal)
+        factor = math.cos(math.radians(abs(steer))) ** 1.2
+        if flat < 12.0:
+            factor *= max(0.22, flat / 12.0)
+        wanted = base_speed * max(0.18, factor)
+
+        speed = float(state.get("v_speed", 0.0))
+        if wanted > speed:
+            speed = min(wanted, speed + 7.0 * dt)
+        else:
+            speed = max(wanted, speed - 11.0 * dt)
+        state["v_speed"] = speed
+
+        step_distance = max(0.0, speed * dt)
+
+        radius = max(1.2, float(state.get("turn_radius", 4.5)))
+        ratio = (steer / max_steer) if max_steer > 0.0 else 0.0
+        yaw = (step_distance / radius) * ratio
+        if step_distance > 1e-9:
+            player.set_rotation((player.rotation + math.degrees(yaw)) % 360.0)
+
+        heading = math.radians(player.rotation)
+        move_x = -math.sin(heading) * step_distance
+        move_y = math.cos(heading) * step_distance
+
+        player._set_position_internal(
+            player.x + move_x,
+            player.y + move_y,
+            player.z,
+            update_velocity=False,
+            now=time.time(),
+        )
+
+        per_interval = step_distance * (nominal / max(dt, 1e-9))
+        player.update_movement_velocity(
+            move_x, move_y, 0.0,
+            coord_delay=per_interval,
+            nominal_interval=nominal,
+        )
+        player.set_coord_delay(per_interval)
+        state["last_step_at"] = now
+        state["last_move_direction"] = (move_x, move_y, 0.0)
+
+        if state.get("update_lr_ud"):
+            magnitude = 127.0 * min(1.0, abs(steer) / max_steer)
+            lr = int(round(math.copysign(magnitude, steer))) if abs(steer) > 0.5 else 0
+            ud = int(round(127.0 * min(1.0, speed / max(base_speed, 1e-6))))
+            player.set_control_axes(lr, ud)
+        self._apply_movement_keys(state)
+
+        if step_distance >= flat and abs(error) < 35.0:
+            return self._arrive_vehicle_locked(state, now)
+        return None
+
     def _arrive_at_target_locked(self, state: dict, now: float) -> dict:
         target = state["target_position"]
         self.player._set_position_internal(*target, update_velocity=False)
@@ -844,6 +975,8 @@ class CoordMovementController:
             dy = target[1] - self.player.y
             dz = target[2] - self.player.z
             distance = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if state["mode"] == "vehicle" and state.get("steer_model", True):
+                return self._step_vehicle(state, now)
             if distance <= state["completion_distance"]:
                 return self._arrive_at_target_locked(state, now)
 
@@ -906,6 +1039,16 @@ class CoordMovementController:
             dt = nominal if last_step is None else max(0.001, now - last_step)
             dt = min(dt, MAX_STEP_DT)
             step_distance = sent_delay * (dt / nominal)
+
+            # Поворот не мгновенный: пока корпус не довернулся, скорость режем.
+            # Иначе транспорт летит боком и разворачивается рывком на месте.
+            turn_error = 0.0
+            heading = None
+            if state["movement_direction_control"][0] and (dx or dy):
+                heading = math.degrees(math.atan2(-dx, dy)) % 360.0
+                turn_error = abs((heading - self.player.rotation + 180.0) % 360.0 - 180.0)
+                if turn_error > 25.0:
+                    step_distance *= max(0.12, 1.0 - (turn_error - 25.0) / 155.0)
             reached = step_distance >= distance
             if reached:
                 new_position = target
@@ -913,7 +1056,12 @@ class CoordMovementController:
                 scale = step_distance / distance
                 # Авто-объезд препятствий на дороге (чужие авто, игроки)
                 lateral_ox, lateral_oy = 0.0, 0.0
-                if state["mode"] == "vehicle" and hasattr(self.player, "session") and getattr(self.player.session, "stream", None):
+                if (
+                    state.get("avoid_obstacles", True)
+                    and state["mode"] == "vehicle"
+                    and hasattr(self.player, "session")
+                    and getattr(self.player.session, "stream", None)
+                ):
                     stream_vehs = getattr(self.player.session.stream, "vehicles", {})
                     my_x, my_y, my_z = self.player.x, self.player.y, self.player.z
                     for oid, ov in stream_vehs.items():
@@ -943,9 +1091,10 @@ class CoordMovementController:
 
             target_rotation = None
             if dx != 0.0 or dy != 0.0:
-                target_rotation = (
-                    math.degrees(math.atan2(dy, dx)) + 90.0
-                ) % 360.0
+                # Конвенция GTA: 0 = север (+Y). Формула atan2(dy,dx)+90
+                # давала разворот на 180° — транспорт ехал задом/боком.
+                # Та же формула, что в delta_teleport, где поворот рабочий.
+                target_rotation = math.degrees(math.atan2(-dx, dy)) % 360.0
 
             face_movement = state["movement_direction_control"][0]
             update_lr_ud = state["update_lr_ud"]
@@ -957,19 +1106,42 @@ class CoordMovementController:
 
             if face_movement and target_rotation is not None:
                 rotation = target_rotation + direction_offset
-                self.player.set_rotation(
-                    self._smooth_rotation(
-                        self.player.rotation,
-                        rotation,
-                        dt,
-                        state.get("turn_speed_percent", 100.0),
-                    )
+                desired = self._smooth_rotation(
+                    self.player.rotation,
+                    rotation,
+                    dt,
+                    state.get("turn_speed_percent", 100.0),
                 )
+                # Поворот привязан к пройденному пути, а не к времени:
+                # корпус доворачивается не больше, чем позволяет радиус.
+                # Пешеход разворачивается на месте вокруг себя (радиус ~0.35м),
+                # машина описывает дугу. Стоит на месте — не крутится.
+                radius = float(
+                    state.get("turn_radius", 4.5)
+                    if state["mode"] == "vehicle"
+                    else state.get("walk_turn_radius", 0.35)
+                )
+                allowed = math.degrees(
+                    max(0.0, step_distance) / max(0.05, radius)
+                )
+                delta = (desired - self.player.rotation + 180.0) % 360.0 - 180.0
+                desired = (
+                    self.player.rotation + _clamp(delta, -allowed, allowed)
+                ) % 360.0
+                self.player.set_rotation(desired)
             if target_rotation is not None:
                 control_rotation = target_rotation
                 if not face_movement:
                     control_rotation += direction_offset
                 self._update_direction_controls(state, control_rotation)
+            if state["mode"] == "vehicle" and not reached:
+                # Машина едет по земле. Тянуть Z к целевой высоте нельзя:
+                # цель может быть на 10-20см выше дороги, и транспорт
+                # начинает "лететь". Берём высоту из стрима, если сервер её
+                # уже прислал, иначе оставляем текущую.
+                ground_z = self._ground_z(state)
+                new_position = (new_position[0], new_position[1], ground_z)
+
             self.player._set_position_internal(
                 *new_position,
                 update_velocity=False,

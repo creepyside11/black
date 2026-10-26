@@ -42,6 +42,7 @@ SPAWNS: dict[str, tuple[float, float, float]] = {
     "Батырево": (1795.375, 2518.425, 14.538),
     "Лыткарино": (-2428.754, 203.862, 26.134),
     "Южный": (2745.431, -2436.016, 21.813),
+    "Арзамас": (841.293, 802.963, 13.308),
 }
 
 # Точка преавторизации: тут висят все, кто ещё не выбрал спавн.
@@ -273,8 +274,20 @@ def kick_stream(bot) -> None:
 MENU_TIMEOUT = 20.0
 
 
-def wait_spawn_menu(bot, timeout: float = MENU_TIMEOUT, *, poll: float = 0.2) -> list:
-    """Ждать от сервера список вокзалов. Возвращает [] если не пришёл."""
+def wait_spawn_menu(
+    bot,
+    timeout: float = MENU_TIMEOUT,
+    *,
+    poll: float = 0.2,
+    stop_if_spawned: bool = True,
+) -> list:
+    """Ждать от сервера список вокзалов. Возвращает [] если не пришёл.
+
+    Если сервер уже поставил бота на вокзал сам (у аккаунта сохранена
+    прошлая позиция), меню не придёт вовсе — ждать его полный таймаут
+    бессмысленно. Раньше здесь крутились все 30 секунд на каждый вход,
+    и на трёхстах аккаунтах это складывалось в часы простоя.
+    """
     items = available_spawns(bot)
     if items:
         return items
@@ -285,6 +298,9 @@ def wait_spawn_menu(bot, timeout: float = MENU_TIMEOUT, *, poll: float = 0.2) ->
         if items:
             return items
         if not _connected(bot):
+            return []
+        if stop_if_spawned and is_spawned_position(_getpos(bot)):
+            # Меню не будет: сервер уже выставил персонажа.
             return []
         time.sleep(poll)
     return []
@@ -578,8 +594,25 @@ class SpawnWatchdog:
                     # античитом кодом 25. Ждём меню до MENU_WAIT секунд,
                     # отвечаем — и всё. Не пришло — сообщаем, где стоим,
                     # и на этом останавливаемся.
+                    # Отсчёт для лога ниже. Объявлен ДО ветки: строка про
+                    # "меню не пришло" пишется и тогда, когда ветка не
+                    # выполнялась, и без инициализации это NameError.
+                    menu_started = time.monotonic()
                     if not menu_received_recent(self.bot) and not menu_answer_recent(self.bot):
                         items = wait_spawn_menu(self.bot, self.menu_wait)
+                        # wait_spawn_menu выходит раньше, если сервер уже
+                        # выставил персонажа. Перепроверяем позицию, иначе
+                        # стоящий на вокзале бот получал отчёт "меню не
+                        # пришло" и лог про тридцать секунд, которых не было.
+                        pos_now = _getpos(self.bot)
+                        if is_spawned_position(pos_now):
+                            self.report = {
+                                "status": "spawned",
+                                "position": pos_now,
+                                "reason": "сервер выставил позицию без меню",
+                            }
+                            self._mark_spawned(pos_now)
+                            return
                         if items:
                             select_spawn(self.bot, menu_choice(items, self.bot))
                             ok, pos = wait_spawned(
@@ -596,9 +629,11 @@ class SpawnWatchdog:
                         "position": pos,
                         "reason": "меню вокзалов не пришло",
                     }
+                    waited = time.monotonic() - menu_started
                     self._log(
-                        f"[SPAWN] меню не пришло за {self.menu_wait:.0f}с, "
-                        f"хендшейк не трогаю. Стою: {pos}"
+                        f"[SPAWN] меню не пришло за {waited:.0f}с "
+                        f"(лимит {self.menu_wait:.0f}с), хендшейк не трогаю. "
+                        f"Стою: {pos}"
                     )
                     return
 
@@ -643,6 +678,17 @@ def ensure_spawn(bot, *, timeout: float = 60.0, log=None, on_success=None,
         )
         if report.get("status") in ("spawned", "already_spawned"):
             break
+
+        # Меню могло не прийти потому, что сервер уже поставил бота на
+        # вокзал сам (у аккаунта сохранена прошлая позиция). Раньше на
+        # "no_menu" выходили сразу, не перепроверив позицию, и бот, уже
+        # стоящий на вокзале, получал отчёт "меню не пришло" — а вместе с
+        # ним и лишние 30 секунд ожидания в вызывающем коде.
+        after = _getpos(bot)
+        if is_spawned_position(after):
+            report.update(status="already_spawned", position=after)
+            break
+
         if report.get("status") == "no_menu":
             # Меню не будет — дальше ждать нечего, сообщаем где стоим.
             break

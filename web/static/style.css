@@ -291,6 +291,62 @@ body::after {
 
 /* ---------- VPN ---------- */
 
+/* Выбор прокси: модальный список с поиском и страницами. */
+.picker-overlay {
+  position: fixed; inset: 0; z-index: 60;
+  background: rgba(8,8,12,.72);
+  display: flex; align-items: center; justify-content: center;
+  padding: 18px;
+  backdrop-filter: blur(6px);
+}
+.picker-overlay.hidden { display: none; }
+.picker {
+  width: min(560px, 100%); max-height: min(78vh, 720px);
+  display: flex; flex-direction: column; gap: 11px;
+  padding: 16px 17px; border-radius: 18px;
+}
+.picker-head { display: flex; align-items: center; gap: 10px; }
+.picker-head h3 { margin: 0; font-size: 15px; }
+.picker-search {
+  width: 100%; padding: 10px 13px; border-radius: 11px;
+  background: rgba(255,255,255,.05);
+  border: 1px solid rgba(255,255,255,.1);
+  color: inherit; font: inherit; font-size: 13px;
+}
+.picker-search:focus {
+  outline: none; border-color: rgba(255,59,74,.55);
+  background: rgba(255,255,255,.08);
+}
+.picker-list {
+  flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 6px;
+  min-height: 120px;
+}
+.pick-row {
+  display: flex; align-items: center; gap: 10px; width: 100%;
+  padding: 10px 12px; border-radius: 11px; cursor: pointer;
+  background: rgba(255,255,255,.035);
+  border: 1px solid rgba(255,255,255,.07);
+  color: inherit; font: inherit; text-align: left;
+  transition: border-color .14s, background .14s;
+}
+.pick-row:hover:not([disabled]) {
+  border-color: rgba(255,59,74,.4); background: rgba(255,255,255,.07);
+}
+.pick-row[disabled] { opacity: .42; cursor: not-allowed; }
+.pick-row[data-on="1"] {
+  border-color: rgba(80,220,140,.55);
+  background: rgba(80,220,140,.1);
+}
+.pick-main { flex: 1; display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.pick-name {
+  font-size: 13px; font-weight: 500;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.pick-sub { font-size: 11px; opacity: .6; }
+.pick-check { opacity: 0; font-size: 13px; color: #4ade80; }
+.pick-row[data-on="1"] .pick-check { opacity: 1; }
+.proxy-pick.active { border-color: rgba(255,59,74,.5); }
+
 /* Страницы узлов и кнопки бана. */
 .pager {
   display: flex; align-items: center; justify-content: center;

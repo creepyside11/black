@@ -22,7 +22,8 @@ const TASKS = {
 
 /* ---------- состояние ---------- */
 
-let state = { bots: [], vpn: {}, live: false, vpnPage: 1 };
+let state = { bots: [], vpn: {}, live: false, vpnPage: 1,
+              pickBulk: "", pickCreate: "spread", picker: null };
 let filter = "";
 let pollTimer = null;
 let busy = new Set();
@@ -131,7 +132,18 @@ document.addEventListener("visibilitychange", () => {
 
 async function loadState(quiet = false) {
   try {
-    state = await api("state");
+    const fresh = await api("state");
+    // Состояние интерфейса живёт между опросами. Раньше state
+    // перезаписывался целиком, и всё, что выбрал руками — прокси,
+    // открытая страница узлов — слетало на следующем опросе.
+    state = {
+      ...fresh,
+      vpnPage: state.vpnPage,
+      pickBulk: state.pickBulk,
+      pickCreate: state.pickCreate,
+      pickLabels: state.pickLabels,
+      picker: state.picker,
+    };
     render();
     if (!quiet && state.live === false) {
       toast("Бот не отвечает — показан последний снимок", "bad");
@@ -324,176 +336,187 @@ function shortProxy(url) {
 // Выпадашка «прокси для выбранных»: сохранённые вручную плюс узлы пула.
 // Узлы с мостом тоже годятся — сервер сам поднимет sing-box и отдаст
 // локальный socks5.
-function renderBulkProxy(vpn) {
-  const sel = $("#bulk-proxy");
-  if (!sel) return;
-  const keep = sel.value;
-  const saved = vpn.saved || [];
-  const nodes = (vpn.nodes || []).filter((n) => n.usable || n.alive);
-  const parts = ['<option value="">— прокси —</option>'];
-  if (saved.length) {
-    parts.push('<optgroup label="Сохранённые">');
-    for (const item of saved) {
-      parts.push(`<option value="px:${escapeHtml(item.name)}">${escapeHtml(item.name)}</option>`);
-    }
-    parts.push('</optgroup>');
-  }
-  if (nodes.length) {
-    parts.push('<optgroup label="Узлы пула">');
-    for (const node of nodes) {
-      const mark = node.usable ? "🟢" : "🟡";
-      parts.push(`<option value="node:${escapeHtml(node.key)}">${mark} ${escapeHtml(node.name)}</option>`);
-    }
-    parts.push('</optgroup>');
-  }
-  parts.push('<option value="none">🚫 Свой IP (сбросить)</option>');
-  sel.innerHTML = parts.join("");
-  if (keep) sel.value = keep;
+// Выбор прокси: один модальный список на оба места (массовая полоса и
+// форма создания). Раньше это были <select>, и на большом пуле они
+// превращались в простыню без поиска — а после пагинации узлов вообще
+// показывали только открытую страницу. Теперь список тянется с сервера
+// страницами, с поиском по имени, адресу и протоколу.
+const PICKER_LABELS = {
+  "": "— прокси не выбран —",
+  spread: "🎲 Рабочие из пула (вразброс)",
+  none: "🚫 Своё IP (сбросить)",
+};
+
+function pickerValue(target) {
+  return target === "create"
+    ? (state.pickCreate ?? "spread")
+    : (state.pickBulk ?? "");
 }
 
-// Прокси для формы создания: рабочие вразброс, своё IP, сохранённые
-// и узлы пула. Тот же набор, что в полосе массовых действий.
-function renderCreateProxy(vpn) {
-  const sel = $("#c-proxy");
-  if (!sel) return;
-  const keep = sel.value || "spread";
-  const saved = vpn.saved || [];
-  const nodes = (vpn.nodes || []).filter((n) => n.usable || n.alive);
-  const parts = [
-    '<option value="spread">🎲 Рабочие из пула (вразброс)</option>',
-    '<option value="none">🚫 Своё IP</option>',
-  ];
-  if (saved.length) {
-    parts.push('<optgroup label="Сохранённые">');
-    for (const item of saved) {
-      parts.push(`<option value="px:${escapeHtml(item.name)}">⚡️ ${escapeHtml(item.name)}</option>`);
-    }
-    parts.push('</optgroup>');
+function pickerLabel(value) {
+  if (value in PICKER_LABELS) return PICKER_LABELS[value];
+  if (value.startsWith("px:")) return `⚡️ ${value.slice(3)}`;
+  if (value.startsWith("node:")) {
+    const known = (state.pickLabels || {})[value];
+    if (known) return known;
+    const node = ((state.vpn || {}).nodes || [])
+      .find((n) => n.key === value.slice(5));
+    return node ? `🟢 ${node.name}` : "🟢 узел пула";
   }
-  if (nodes.length) {
-    parts.push('<optgroup label="Узлы пула">');
-    for (const node of nodes) {
-      const mark = node.usable ? "🟢" : "🟡";
-      parts.push(`<option value="node:${escapeHtml(node.key)}">${mark} ${escapeHtml(node.name)}</option>`);
-    }
-    parts.push('</optgroup>');
-  }
-  sel.innerHTML = parts.join("");
-  if (keep) sel.value = keep;
+  return value;
 }
 
-function renderVpn(vpn) {
+function rememberLabel(value, label) {
+  state.pickLabels = { ...(state.pickLabels || {}), [value]: label };
+}
+
+function syncProxyButtons() {
+  const bulk = $("#bulk-proxy-btn");
+  if (bulk) {
+    const v = pickerValue("bulk");
+    bulk.textContent = v ? pickerLabel(v) : "🌐 Прокси";
+    bulk.classList.toggle("active", Boolean(v));
+  }
+  const create = $("#c-proxy-btn");
+  if (create) create.textContent = pickerLabel(pickerValue("create"));
+}
+
+// Заглушки под старые вызовы: узлы теперь живут в выборщике, а не в
+// выпадашке, но шапка панели по-прежнему обновляет счётчики.
+function renderBulkProxy() {
+  syncProxyButtons();
+}
+
+function renderCreateProxy() {
+  syncProxyButtons();
+}
+
+function openPicker(target) {
+  state.picker = { target, page: 1, search: "" };
+  $("#picker").classList.remove("hidden");
+  $("#picker-title").textContent = target === "create"
+    ? "Прокси для новых аккаунтов"
+    : "Прокси для выбранных";
+  $("#picker-search").value = "";
+  loadPicker();
+}
+
+function closePicker() {
+  $("#picker").classList.add("hidden");
+  state.picker = null;
+}
+
+async function loadPicker() {
+  const pick = state.picker;
+  if (!pick) return;
+  const list = $("#picker-list");
+  list.innerHTML = `<div class="empty">Загружаю…</div>`;
+  try {
+    const res = await post("vpn_status", {
+      page: pick.page,
+      per_page: 12,
+      search: pick.search,
+    });
+    renderPicker(res.result || {});
+  } catch (exc) {
+    list.innerHTML = `<div class="empty">${escapeHtml(exc.message)}</div>`;
+  }
+}
+
+function renderPicker(vpn) {
+  const pick = state.picker;
+  if (!pick) return;
   const nodes = vpn.nodes || [];
-  const summary = vpn.summary || {};
-  const total = vpn.total ?? nodes.length;
+  const saved = vpn.saved || [];
+  const current = pickerValue(pick.target);
+  const parts = [];
+
+  // Базовые варианты — только на первой странице без поиска: в поиске
+  // они мешают и не относятся к запросу.
+  if (pick.page === 1 && !pick.search) {
+    const base = pick.target === "create"
+      ? ["spread", "none"]
+      : ["none"];
+    for (const value of base) {
+      parts.push(pickerRow(value, PICKER_LABELS[value], "", current));
+    }
+    for (const item of saved) {
+      parts.push(pickerRow(`px:${item.name}`, `⚡️ ${item.name}`,
+        "сохранённый", current));
+    }
+  }
+
+  for (const node of nodes) {
+    const banned = node.status === "banned";
+    const label = node.usable ? "рабочий" : banned ? "забанен"
+      : node.alive ? "нужен клиент" : "мёртвый";
+    const kind = node.usable ? "ok" : node.alive && !banned ? "warn" : "bad";
+    const dis = node.usable && !banned ? "" : "disabled";
+    parts.push(`
+      <button class="pick-row" type="button" data-pick-node="${escapeHtml(node.key)}"
+              ${dis} ${current === `node:${node.key}` ? 'data-on="1"' : ""}>
+        <span class="dot ${kind === "ok" ? "on" : kind === "warn" ? "wait" : "bad"}"></span>
+        <span class="pick-main">
+          <span class="pick-name">${escapeHtml(node.name || "без имени")}</span>
+          <span class="pick-sub">${escapeHtml(node.address || "")}${
+            node.latency ? ` · ${node.latency}мс` : ""
+          }</span>
+        </span>
+        <span class="badge ${kind}">${label}</span>
+      </button>`);
+  }
+
+  if (!parts.length) {
+    parts.push(`<div class="empty">${
+      pick.search ? "Ничего не нашлось" : "Узлов нет"
+    }</div>`);
+  }
+  $("#picker-list").innerHTML = parts.join("");
+  renderPickerPager(vpn);
+}
+
+function pickerRow(value, label, hint, current) {
+  return `
+    <button class="pick-row" type="button" data-pick-value="${escapeHtml(value)}"
+            ${current === value ? 'data-on="1"' : ""}>
+      <span class="pick-main">
+        <span class="pick-name">${escapeHtml(label)}</span>
+        ${hint ? `<span class="pick-sub">${escapeHtml(hint)}</span>` : ""}
+      </span>
+      <span class="pick-check">✓</span>
+    </button>`;
+}
+
+function renderPickerPager(vpn) {
+  const box = $("#picker-pager");
   const page = vpn.page || 1;
   const pages = vpn.pages || 1;
-  state.vpnPage = page;
-
-  $("#vpn-count").textContent =
-    `${summary.usable || 0} рабочих из ${total}`;
-
-  $("#vpn-stats").innerHTML = [
-    ["Всего узлов", total, ""],
-    ["Рабочих", summary.usable || 0, "ok"],
-    ["Живых", summary.alive || 0, ""],
-    ["Мёртвых", summary.dead || 0, "bad"],
-    ["Забанено", summary.banned || 0, "bad"],
-  ].map(([k, v, cls]) =>
-    `<div class="stat glass"><div class="k">${k}</div><div class="v ${cls}">${v}</div></div>`
-  ).join("");
-
-  if (!nodes.length) {
-    $("#nodes").innerHTML = `<div class="empty">${
-      vpn.available === false ? "Пул прокси не запущен" : "Узлов нет"
-    }</div>`;
-    $("#nodes-pager").innerHTML = "";
-    return;
-  }
-
-  $("#nodes").innerHTML = nodes.map((n) => {
-    const banned = n.status === "banned";
-    const kind = banned ? "bad" : n.usable ? "ok" : n.alive ? "warn" : "bad";
-    const label = banned
-      ? "забанен"
-      : n.usable ? "рабочий" : n.alive ? "нужен клиент" : "мёртвый";
-    const dis = n.usable && !banned ? "" : "disabled";
-    const note = n.reason
-      ? `<div class="why">${escapeHtml(n.reason)}</div>`
-      : "";
-    const banBtn = banned
-      ? `<button class="btn btn-sm" data-unban="${escapeHtml(n.key)}">Разбанить</button>`
-      : `<button class="btn btn-sm" data-ban="${escapeHtml(n.key)}">В бан</button>`;
-    return `
-      <div class="node">
-        <div class="top">
-          <span class="dot ${kind === "ok" ? "on" : kind === "warn" ? "wait" : "bad"}"></span>
-          <span class="name">${escapeHtml(n.name || "без имени")}</span>
-        </div>
-        <div class="addr">${escapeHtml(n.address || "")} · ${escapeHtml(n.protocol || "")}${
-          n.latency ? ` · ${n.latency}мс` : ""
-        }</div>
-        ${note}
-        <div class="row">
-          <span class="badge ${kind}">${label}</span>
-          <button class="btn btn-sm" data-cluster="${escapeHtml(n.key)}" ${dis}>Раздать</button>
-          ${banBtn}
-        </div>
-      </div>`;
-  }).join("");
-
-  renderPager(page, pages, total);
-}
-
-// Обновить только счётчики, не трогая список: так опрос не сбивает
-// открытую страницу узлов.
-function renderVpnStatsOnly(vpn) {
-  const summary = vpn.summary || {};
-  const total = vpn.total ?? (vpn.nodes || []).length;
-  const el = $("#vpn-count");
-  if (el) el.textContent = `${summary.usable || 0} рабочих из ${total}`;
-  const stats = $("#vpn-stats");
-  if (!stats) return;
-  stats.innerHTML = [
-    ["Всего узлов", total, ""],
-    ["Рабочих", summary.usable || 0, "ok"],
-    ["Живых", summary.alive || 0, ""],
-    ["Мёртвых", summary.dead || 0, "bad"],
-    ["Забанено", summary.banned || 0, "bad"],
-  ].map(([k, v, cls]) =>
-    `<div class="stat glass"><div class="k">${k}</div><div class="v ${cls}">${v}</div></div>`
-  ).join("");
-}
-
-// Страницы узлов. Раньше панель рисовала весь пул одним куском, и на
-// сотне узлов это был один длинный ползунок без ориентиров.
-function renderPager(page, pages, total) {
-  const box = $("#nodes-pager");
-  if (!box) return;
+  const total = vpn.total ?? 0;
   if (pages <= 1) {
-    box.innerHTML = total
-      ? `<span class="pager-info">Всего ${total}</span>`
-      : "";
+    box.innerHTML = total ? `<span class="pager-info">Узлов: ${total}</span>` : "";
     return;
   }
   const btn = (p, label, dis) =>
-    `<button class="btn btn-sm" data-nodepage="${p}" ${dis ? "disabled" : ""}>${label}</button>`;
+    `<button class="btn btn-sm" type="button" data-pickpage="${p}" ${
+      dis ? "disabled" : ""
+    }>${label}</button>`;
   box.innerHTML = [
     btn(1, "«", page === 1),
     btn(page - 1, "‹", page === 1),
-    `<span class="pager-info">${page} / ${pages} · всего ${total}</span>`,
+    `<span class="pager-info">${page} / ${pages} · узлов ${total}</span>`,
     btn(page + 1, "›", page === pages),
     btn(pages, "»", page === pages),
   ].join("");
 }
 
-async function loadVpnPage(page) {
-  try {
-    const res = await post("vpn_status", { page });
-    renderVpn(res.result || {});
-  } catch (exc) {
-    toast(exc.message, "bad");
-  }
+function choosePickerValue(value, label) {
+  const pick = state.picker;
+  if (!pick) return;
+  if (label) rememberLabel(value, label);
+  if (pick.target === "create") state.pickCreate = value;
+  else state.pickBulk = value;
+  syncProxyButtons();
+  closePicker();
 }
 
 function renderSettings() {
@@ -549,7 +572,7 @@ document.addEventListener("click", async (e) => {
     let payload = { ids };
     let cmd;
     if (act === "proxy") {
-      const value = ($("#bulk-proxy") || {}).value || "";
+      const value = state.pickBulk || "";
       if (!value) {
         toast("Выбери прокси в списке", "bad");
         return;
@@ -679,6 +702,55 @@ document.addEventListener("click", async (e) => {
 
 $("#refresh").addEventListener("click", () => loadState());
 
+/* ---------- выборщик прокси ---------- */
+
+document.addEventListener("click", (e) => {
+  const open = e.target.closest("[data-pick]");
+  if (open) {
+    e.preventDefault();
+    openPicker(open.dataset.pick);
+    return;
+  }
+  if (e.target.id === "picker-close" || e.target.id === "picker") {
+    closePicker();
+    return;
+  }
+  const val = e.target.closest("[data-pick-value]");
+  if (val) {
+    choosePickerValue(val.dataset.pickValue);
+    return;
+  }
+  const node = e.target.closest("[data-pick-node]");
+  if (node) {
+    const name = (node.querySelector(".pick-name") || {}).textContent || "";
+    choosePickerValue(`node:${node.dataset.pickNode}`,
+      `🟢 ${name.trim()}`.trim());
+    return;
+  }
+  const page = e.target.closest("[data-pickpage]");
+  if (page && state.picker) {
+    state.picker.page = Number(page.dataset.pickpage) || 1;
+    loadPicker();
+  }
+});
+
+let pickerSearchTimer = null;
+document.addEventListener("input", (e) => {
+  if (e.target.id !== "picker-search" || !state.picker) return;
+  clearTimeout(pickerSearchTimer);
+  const text = e.target.value;
+  pickerSearchTimer = setTimeout(() => {
+    if (!state.picker) return;
+    state.picker.search = text;
+    state.picker.page = 1;
+    loadPicker();
+  }, 260);
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && state.picker) closePicker();
+});
+
 $("#vpn-refresh").addEventListener("click", async (e) => {
   const btn = e.target;
   btn.disabled = true;
@@ -722,7 +794,7 @@ $("#create-form").addEventListener("submit", async (e) => {
   e.preventDefault();
   const btn = $("#c-submit");
   const count = Math.max(1, Number($("#c-count").value) || 1);
-  const choice = $("#c-proxy").value || "spread";
+  const choice = state.pickCreate || "spread";
   // Значение из выпадашки переводим в то, что понимает сервер:
   // px:<имя> -> строка сохранённого, node:<ключ> -> узел пула.
   const payloadProxy = { proxy: choice };

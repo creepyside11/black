@@ -48,6 +48,21 @@ STUN_HOST = "stun.l.google.com"
 STUN_PORT = 19302
 STUN_MAGIC = 0x2112A442
 
+# Проверка ДО ИГРЫ, а не до интернета.
+#
+# Прокси может прекрасно пускать в интернет и при этом не пускать на
+# игровые сервера: Black Russia отвечает не всем адресам, и узел с
+# выходом в США или Нидерландах отдаёт пустоту там, где казахстанский
+# отдаёт нормальный ответ. Без этой проверки пул считал такие узлы
+# рабочими, раздавал их ботам, и те висели в «сервер не отвечает»,
+# хотя прокси был жив.
+#
+# Все игровые сервера лежат в 80.66.82.0/24, поэтому одного адреса
+# достаточно как признака «этот выход до игры дотягивается».
+GAME_TARGET_HOST = "80.66.82.20"
+GAME_TARGET_PORT = 80
+GAME_TIMEOUT = 6.0
+
 STATUS_OK = "ok"
 # Прокси забанен сервером: с этого адреса сервер не пускает никого.
 # Это не «мёртвый» — прокси технически работает, но играть через него
@@ -55,6 +70,9 @@ STATUS_OK = "ok"
 STATUS_BANNED = "banned"
 STATUS_DEAD = "dead"
 STATUS_NEEDS_CLIENT = "needs_client"
+# Прокси живой, UDP идёт, но игровой сервер через него не отвечает.
+# Для бота это то же самое, что мёртвый: он не зайдёт.
+STATUS_NO_GAME = "no_game"
 STATUS_BAD_UDP = "no_udp"
 STATUS_UNKNOWN = "unknown"
 
@@ -227,6 +245,8 @@ def verify_socks5(
     target_port: int = DEFAULT_TARGET_PORT,
     timeout: float = 8.0,
     check_udp: bool = True,
+    game_host: str = "",
+    game_port: int = GAME_TARGET_PORT,
 ) -> tuple[bool, bool, str, float | None]:
     """Сквозная проверка SOCKS5: TCP до цели и UDP через STUN.
 
@@ -286,7 +306,54 @@ def verify_socks5(
 
     if not external:
         return True, False, "socks5: UDP через прокси не проходит", latency
+
+    # Прокси пускает в интернет — но пустит ли он в игру? Это отдельный
+    # вопрос, и без него бот входит в «сервер не отвечает».
+    if game_host:
+        reachable, why = _game_reachable(
+            host, port, login=login, password=password,
+            game_host=game_host, game_port=game_port, timeout=timeout,
+        )
+        if not reachable:
+            return True, False, why, latency
+
     return True, True, f"выход {external}", latency
+
+
+def _game_reachable(host, port, *, login="", password="", game_host="",
+                    game_port=GAME_TARGET_PORT, timeout=GAME_TIMEOUT):
+    """Отвечает ли игровой сервер через этот прокси.
+
+    Делаем то же, что делает бот перед входом: CONNECT на игровой порт и
+    короткий HTTP-запрос. Пустой ответ — сервер нас не видит, и бот
+    дальше не пройдёт. Возвращает (дошло, причина).
+    """
+    if not game_host:
+        return True, ""
+    sock = None
+    try:
+        sock = socket.create_connection((host, int(port)), timeout=timeout)
+        sock.settimeout(timeout)
+        if not _socks5_handshake(sock, login, password):
+            return False, "игра: отказ авторизации"
+        if not _socks5_connect(sock, game_host, int(game_port)):
+            return False, "игра: CONNECT не прошёл"
+        sock.sendall(
+            f"GET / HTTP/1.1\r\nHost: {game_host}\r\n"
+            "Connection: close\r\nUser-Agent: Dalvik/2.1.0\r\n\r\n".encode()
+        )
+        data = sock.recv(64)
+        if not data:
+            return False, "игра не отвечает через этот узел"
+        return True, ""
+    except OSError as exc:
+        return False, f"игра: {type(exc).__name__}"
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 def verify_http(
@@ -352,6 +419,8 @@ def probe_node(
     target_host: str = DEFAULT_TARGET_HOST,
     target_port: int = DEFAULT_TARGET_PORT,
     check_udp: bool = True,
+    game_host: str = "",
+    game_port: int = GAME_TARGET_PORT,
 ) -> ProbeResult:
     """Проверить один узел."""
     result = ProbeResult(node=node, checked_at=time.time())
@@ -376,6 +445,8 @@ def probe_node(
             target_port=target_port,
             timeout=timeout,
             check_udp=check_udp,
+            game_host=game_host,
+            game_port=game_port,
         )
         result.alive = alive
         result.usable = usable
@@ -383,6 +454,8 @@ def probe_node(
         result.reason = reason
         if usable:
             result.status = STATUS_OK
+        elif reason.startswith("игра"):
+            result.status = STATUS_NO_GAME
         elif alive:
             result.status = STATUS_BAD_UDP
         else:
@@ -439,6 +512,8 @@ def probe_many(
     target_host: str = DEFAULT_TARGET_HOST,
     target_port: int = DEFAULT_TARGET_PORT,
     workers: int = 8,
+    game_host: str = "",
+    game_port: int = GAME_TARGET_PORT,
 ) -> list[ProbeResult]:
     """Проверить пачку узлов параллельно."""
     if not nodes:
@@ -454,6 +529,8 @@ def probe_many(
                 timeout=timeout,
                 target_host=target_host,
                 target_port=target_port,
+                game_host=game_host,
+                game_port=game_port,
             )
             for node in nodes
         ]

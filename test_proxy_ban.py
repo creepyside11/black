@@ -225,6 +225,54 @@ class VpnPaginationTests(unittest.TestCase):
             import shutil
             shutil.rmtree(d, ignore_errors=True)
 
+    def test_search_finds_node_on_other_page(self):
+        """Поиск идёт по всему пулу, а не по открытой странице.
+
+        Раньше фильтр применялся после нарезки: искал бы только внутри
+        24 карточек и «не находил» узел, который лежит на третьей.
+        """
+        d = tempfile.mkdtemp()
+        try:
+            path = os.path.join(d, "pool.json")
+            pool = ProxyPool(path, prober=lambda n, **k: [], clock=lambda: 1.0)
+            for i in range(50):
+                node = _node(f"10.0.0.{i}", name=f"узел-{i}")
+                pool.results[node.key] = _ok(node)
+            bridge = self._bridge(pool)
+
+            found = bridge._vpn_payload(page=1, per_page=12, search="узел-47")
+            self.assertEqual(found["total"], 1)
+            self.assertEqual(found["pages"], 1)
+            self.assertIn("узел-47", found["nodes"][0]["name"])
+
+            by_addr = bridge._vpn_payload(search="10.0.0.33")
+            self.assertEqual(by_addr["total"], 1)
+
+            by_proto = bridge._vpn_payload(search="socks5")
+            self.assertEqual(by_proto["total"], 50)
+
+            self.assertEqual(bridge._vpn_payload(search="нет-такого")["total"], 0)
+        finally:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_only_usable_filter(self):
+        d = tempfile.mkdtemp()
+        try:
+            path = os.path.join(d, "pool.json")
+            pool = ProxyPool(path, prober=lambda n, **k: [], clock=lambda: 1.0)
+            good = _node("1.1.1.1")
+            bad = _node("2.2.2.2")
+            pool.results[good.key] = _ok(good)
+            pool.results[bad.key] = ProbeResult(node=bad, alive=False,
+                                                usable=False, status="dead")
+            bridge = self._bridge(pool)
+            self.assertEqual(bridge._vpn_payload(only_usable=True)["total"], 1)
+            self.assertEqual(bridge._vpn_payload()["total"], 2)
+        finally:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
     def test_banned_reason_reaches_panel(self):
         d = tempfile.mkdtemp()
         try:

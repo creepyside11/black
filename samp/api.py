@@ -949,10 +949,13 @@ class BotAPI(JsonAPI):
         result = self.session.players.bot.coord_movement.handle_dialog(dialog_type)
         if result is None:
             return False
+        # Без flush: у core.logger.info сигнатура (message) — лишний
+        # аргумент роняет вызов TypeError. А падало это ПЕРВЫМ, до эмита
+        # onShowDialog, поэтому любой диалог, пришедший во время ходьбы,
+        # исчезал целиком: ни в лог, ни в обработчик.
         logger.info(
             f"Move stopped by incoming dialog | "
-            f"id={result.get('movement_id')} | type={dialog_type}",
-            flush=True,
+            f"id={result.get('movement_id')} | type={dialog_type}"
         )
         self._emit_coord_move_end(result)
         return True
@@ -974,6 +977,8 @@ class BotAPI(JsonAPI):
         movement_direction_control: tuple | None = None,
         movement_keys_mode: str | None = None,
         stop_on_dialog: bool | None = None,
+        avoid_obstacles: bool | None = None,
+        coord_fluctuation_max: float | None = None,
     ) -> int:
         def fail(message: str):
             logger.error(message)
@@ -999,6 +1004,8 @@ class BotAPI(JsonAPI):
             "movement_direction_control": movement_direction_control,
             "movement_keys_mode": movement_keys_mode,
             "stop_on_dialog": stop_on_dialog,
+            "avoid_obstacles": avoid_obstacles,
+            "coord_fluctuation_max": coord_fluctuation_max,
         }
         effective_settings = {
             key: value

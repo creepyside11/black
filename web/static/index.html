@@ -78,10 +78,9 @@
         <button class="btn btn-sm" data-bulk="stats">↻ Статистика</button>
         <button class="btn btn-sm" data-bulk="real_world">◎ В мир</button>
         <button class="btn btn-sm red" data-bulk="delete">✕ Удалить</button>
-        <select class="bulk-proxy" id="bulk-proxy" title="Прокси для выбранных">
-          <option value="">— прокси —</option>
-        </select>
-        <button class="btn btn-sm" data-bulk="proxy">🌐 Прокси</button>
+        <button class="btn btn-sm proxy-pick" id="bulk-proxy-btn"
+                data-pick="bulk" title="Прокси для выбранных">🌐 Прокси</button>
+        <button class="btn btn-sm" data-bulk="proxy">Применить</button>
         <input class="bulk-goal" id="bulk-goal" type="number" min="0" max="200"
                placeholder="цель" title="Целевой уровень, 0 — снять">
         <button class="btn btn-sm" data-bulk="goal">🎯 Цель</button>
@@ -92,6 +91,21 @@
       <div class="bots" id="bots"></div>
     </div>
   </section>
+
+  <!-- Выбор прокси: поиск и страницы вместо простыни в select -->
+  <div class="picker-overlay hidden" id="picker">
+    <div class="picker glass">
+      <div class="picker-head">
+        <h3 id="picker-title">Прокси</h3>
+        <div class="spacer"></div>
+        <button class="btn btn-sm" id="picker-close" type="button">✕</button>
+      </div>
+      <input class="picker-search" id="picker-search" type="search"
+             placeholder="Поиск по имени, адресу или протоколу…" autocomplete="off">
+      <div class="picker-list" id="picker-list"></div>
+      <div class="pager" id="picker-pager"></div>
+    </div>
+  </div>
 
   <!-- VPN -->
   <section id="tab-vpn" class="hidden">
@@ -142,10 +156,8 @@
         </div>
         <div class="field">
           <label for="c-proxy">Прокси для новых</label>
-          <select id="c-proxy">
-            <option value="spread">🎲 Рабочие из пула (вразброс)</option>
-            <option value="none">🚫 Своё IP</option>
-          </select>
+          <button class="btn btn-block proxy-pick" id="c-proxy-btn"
+                  data-pick="create" type="button">🎲 Рабочие из пула (вразброс)</button>
         </div>
         <div class="field" style="align-self:end">
           <button class="btn btn-red btn-block" type="submit" id="c-submit">Создать</button>
