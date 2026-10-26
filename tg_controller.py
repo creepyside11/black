@@ -35,6 +35,11 @@ def save_proxy_to_file(name: str, proxy_str: str):
     except Exception:
         pass
 
+# Сколько узлов на одной странице раздела «Прокси и VPN». Раньше список
+# обрезался, и до дальних узлов было не добраться.
+VPN_PAGE_SIZE = 8
+
+
 class TelegramBotController:
     def __init__(self, token: str, manager, admin_id=None):
         self.token = token.strip()
@@ -931,10 +936,17 @@ class TelegramBotController:
         self._live_thread = threading.Thread(target=_loop, daemon=True)
         self._live_thread.start()
 
-    def _render_vpn_menu(self, chat_id, message_id=None, callback_id=None, quiet=False):
-        """Раздел «Прокси и VPN»: узлы цветом, добавление, проверка, раздача."""
+    def _render_vpn_menu(self, chat_id, message_id=None, callback_id=None,
+                         quiet=False, page: int = 1):
+        """Раздел «Прокси и VPN»: узлы цветом, добавление, проверка, раздача.
+
+        Узлы листаются страницами. Раньше в тексте было 12 узлов, а
+        кнопок 16 — остальные просто не показывались, и при пуле больше
+        полутора десятков добраться до них было нельзя.
+        """
         pool = getattr(self.manager, "proxy_pool", None)
         markup = types.InlineKeyboardMarkup(row_width=1)
+        vpn_page = max(1, int(page or 1))
 
         if pool is None:
             text = "<b>🌐 Прокси и VPN</b>\n\n<i>Пул прокси не запущен.</i>"
@@ -952,9 +964,16 @@ class TelegramBotController:
                     stamp = time.strftime("%H:%M:%S", time.localtime(summary["last_refresh"]))
                     lines.append(f"Обновлено: {stamp}")
                 lines.append("")
-                for res in statuses[:12]:
+                pages = max(1, (len(statuses) + VPN_PAGE_SIZE - 1) // VPN_PAGE_SIZE)
+                vpn_page = max(1, min(vpn_page, pages))
+                start = (vpn_page - 1) * VPN_PAGE_SIZE
+                window = statuses[start:start + VPN_PAGE_SIZE]
+
+                for res in window:
                     node = res.node
-                    if res.usable:
+                    if getattr(res, "status", "") == "banned":
+                        mark = "⛔️"
+                    elif res.usable:
                         mark = "🟢"
                     elif res.alive:
                         mark = "🟡"
@@ -967,10 +986,11 @@ class TelegramBotController:
                         f"     <code>{node.address}:{node.port}</code> "
                         f"[{node.protocol}]{latency}{note}"
                     )
-                if len(statuses) > 12:
-                    lines.append(f"<i>…и ещё {len(statuses) - 12}</i>")
+                if pages > 1:
+                    lines.append("")
+                    lines.append(f"<i>Страница {vpn_page} из {pages}</i>")
                 lines.append("")
-                lines.append("🟢 рабочий · 🟡 нужен клиент · 🔴 мёртвый")
+                lines.append("🟢 рабочий · 🟡 нужен клиент · 🔴 мёртвый · ⛔️ забанен")
                 # Без моста узлы vless/vmess/trojan/ss применить некуда:
                 # бот умеет только SOCKS5. Говорим прямо, что сделать.
                 bridge = getattr(pool, "bridge", None)
@@ -1001,9 +1021,11 @@ class TelegramBotController:
                 # кнопка «Прокси и VPN» просто не открывалась.
                 # В кнопку кладём короткий номер, а ключ держим рядом.
                 self._vpn_picks = {}
-                for index, res in enumerate(statuses[:16]):
+                for index, res in enumerate(window):
                     node = res.node
-                    if res.usable:
+                    if getattr(res, "status", "") == "banned":
+                        mark, style = "⛔️", "danger"
+                    elif res.usable:
                         mark, style = "🟢", "success"
                     elif res.alive:
                         mark, style = "🟡", "primary"
@@ -1014,6 +1036,27 @@ class TelegramBotController:
                     self._vpn_picks[token] = node.key
                     markup.add(types.InlineKeyboardButton(
                         label, callback_data=f"vpn_pick:{token}", style=style))
+
+                # Листалка: по краям — в начало и в конец.
+                if pages > 1:
+                    nav = []
+                    if vpn_page > 1:
+                        nav.append(types.InlineKeyboardButton(
+                            "«", callback_data="vpn_page:1", style="primary"))
+                        nav.append(types.InlineKeyboardButton(
+                            "‹", callback_data=f"vpn_page:{vpn_page - 1}",
+                            style="primary"))
+                    nav.append(types.InlineKeyboardButton(
+                        f"{vpn_page}/{pages}", callback_data="vpn_noop",
+                        style="primary"))
+                    if vpn_page < pages:
+                        nav.append(types.InlineKeyboardButton(
+                            "›", callback_data=f"vpn_page:{vpn_page + 1}",
+                            style="primary"))
+                        nav.append(types.InlineKeyboardButton(
+                            "»", callback_data=f"vpn_page:{pages}",
+                            style="primary"))
+                    markup.row(*nav)
 
             if summary["usable"]:
                 markup.add(types.InlineKeyboardButton(
@@ -1882,6 +1925,10 @@ class TelegramBotController:
             elif data in ("vpn_menu", "act_proxies_list"):
                 self._render_vpn_menu(chat_id, message_id, call.id)
 
+            elif data.startswith("vpn_page:"):
+                page = int(data.split(":", 1)[1] or 1)
+                self._render_vpn_menu(chat_id, message_id, call.id, page=page)
+
             elif data == "vpn_refresh":
                 pool = getattr(self.manager, "proxy_pool", None)
                 if pool is None:
@@ -1956,6 +2003,13 @@ class TelegramBotController:
                 if node is None:
                     self.bot.answer_callback_query(
                         call.id, "Меню устарело, открой заново", show_alert=True)
+                    return
+                if pool.is_banned(key):
+                    self.bot.answer_callback_query(
+                        call.id,
+                        f"{node.name}: адрес забанен сервером, раздавать нельзя",
+                        show_alert=True,
+                    )
                     return
                 url = pool.socks_url_for(node)
                 if not url:

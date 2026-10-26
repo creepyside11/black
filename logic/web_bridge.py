@@ -511,14 +511,42 @@ class WebBridge:
         return {"queued": ids, "count": len(ids)}
 
     def _cmd_vpn_status(self, args):
-        return self._vpn_payload()
+        return self._vpn_payload(
+            page=int(args.get("page") or 1),
+            per_page=int(args.get("per_page") or 24),
+        )
 
     def _cmd_vpn_refresh(self, args):
         pool = getattr(self.manager, "proxy_pool", None)
         if pool is None:
             raise ValueError("пул прокси не запущен")
         pool.refresh()
-        return self._vpn_payload()
+        return self._vpn_payload(
+            page=int(args.get("page") or 1),
+            per_page=int(args.get("per_page") or 24),
+        )
+
+    def _cmd_vpn_ban(self, args):
+        """Пометить адрес забаненным вручную."""
+        pool = getattr(self.manager, "proxy_pool", None)
+        if pool is None:
+            raise ValueError("пул прокси не запущен")
+        target = str(args.get("key") or args.get("proxy") or "")
+        if not target:
+            raise ValueError("не указан узел")
+        keys = pool.mark_banned(target, reason=str(args.get("reason") or "вручную"))
+        return {"banned": keys, "count": len(keys)}
+
+    def _cmd_vpn_unban(self, args):
+        """Снять бан вручную: адрес мог смениться или бан был ошибкой."""
+        pool = getattr(self.manager, "proxy_pool", None)
+        if pool is None:
+            raise ValueError("пул прокси не запущен")
+        target = str(args.get("key") or args.get("proxy") or "")
+        ok = pool.unban(target)
+        if not ok:
+            raise ValueError("этот адрес не забанен")
+        return {"unbanned": target}
 
     def _cmd_vpn_use(self, args):
         pool = getattr(self.manager, "proxy_pool", None)
@@ -604,17 +632,31 @@ class WebBridge:
         bots.sort(key=lambda b: b["id"])
         return bots
 
-    def _vpn_payload(self) -> dict:
+    def _vpn_payload(self, page: int = 1, per_page: int = 24) -> dict:
+        """Узлы с постраничной выдачей.
+
+        Раньше отдавались все разом, и на большом пуле панель рисовала
+        сотни карточек одним куском. Теперь страницами: счётчик и номера
+        страниц считаются по всему пулу, а в ответ едет только текущая.
+        """
         pool = getattr(self.manager, "proxy_pool", None)
         if pool is None:
-            return {"available": False, "nodes": [], "summary": {}}
+            return {"available": False, "nodes": [], "summary": {},
+                    "page": 1, "pages": 0, "total": 0}
         nodes = []
         summary = {}
         try:
             statuses = pool.statuses()
         except Exception:
             statuses = []
-        for res in statuses:
+        total = len(statuses)
+        per_page = max(1, int(per_page))
+        pages = max(1, (total + per_page - 1) // per_page)
+        page = max(1, min(int(page or 1), pages))
+        start = (page - 1) * per_page
+        window = statuses[start:start + per_page]
+
+        for res in window:
             node = res.node
             nodes.append({
                 "key": node.key,
@@ -624,6 +666,8 @@ class WebBridge:
                 "usable": bool(res.usable),
                 "alive": bool(res.alive),
                 "status": getattr(res, "status", ""),
+                "reason": str(getattr(res, "reason", "") or ""),
+                "latency": round(res.latency_ms) if res.latency_ms else None,
             })
         try:
             summary = pool.summary()
@@ -644,7 +688,8 @@ class WebBridge:
             except Exception:
                 continue
         return {"available": True, "nodes": nodes, "summary": summary,
-                "saved": saved}
+                "saved": saved, "page": page, "pages": pages,
+                "total": total, "per_page": per_page}
 
     def _snapshot(self) -> None:
         """Снимок для панели, когда её нет или бот занят."""

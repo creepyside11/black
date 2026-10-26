@@ -49,6 +49,10 @@ STUN_PORT = 19302
 STUN_MAGIC = 0x2112A442
 
 STATUS_OK = "ok"
+# Прокси забанен сервером: с этого адреса сервер не пускает никого.
+# Это не «мёртвый» — прокси технически работает, но играть через него
+# нельзя никогда, поэтому он не должен попадать в раздачу.
+STATUS_BANNED = "banned"
 STATUS_DEAD = "dead"
 STATUS_NEEDS_CLIENT = "needs_client"
 STATUS_BAD_UDP = "no_udp"

@@ -291,6 +291,14 @@ body::after {
 
 /* ---------- VPN ---------- */
 
+/* Страницы узлов и кнопки бана. */
+.pager {
+  display: flex; align-items: center; justify-content: center;
+  gap: 8px; margin-top: 14px; flex-wrap: wrap;
+}
+.pager .pager-info { font-size: 12px; color: var(--muted, #8a8a92); }
+.node .why { font-size: 11px; color: #e06b72; margin-bottom: 7px; }
+
 .nodes { display: grid; grid-template-columns: repeat(auto-fill, minmax(255px, 1fr)); gap: 11px; }
 .node {
   padding: 14px 15px; border-radius: 14px;

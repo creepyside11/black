@@ -73,7 +73,7 @@ class ControllerHarness(unittest.TestCase):
 class ServerStepTests(ControllerHarness):
     def test_first_step_lists_servers_with_pagination(self):
         self.ctrl._render_batch_servers(1, 1)
-        self.assertIn("шаг 1 из 4", self.last_text)
+        self.assertIn("шаг 1 из 5", self.last_text)
         buttons = self._buttons()
         self.assertTrue(any(b.callback_data.startswith("batch_srv:") for b in buttons))
         self.assertTrue(any(b.callback_data.startswith("batch_page:") for b in buttons))
@@ -119,13 +119,13 @@ class WizardFlowTests(ControllerHarness):
 
     def test_count_step_asks_number(self):
         self.ctrl._ask_batch_count(1, "TOLYATTI")
-        self.assertIn("шаг 2 из 4", self.last_text)
+        self.assertIn("шаг 2 из 5", self.last_text)
         self.assertIn("TOLYATTI", self.last_text)
         self.assertEqual(self.ctrl.user_states[1]["action"], "batch_count")
 
     def test_password_step_offers_base_password(self):
         self.ctrl._ask_batch_password(1, "TOLYATTI", 5)
-        self.assertIn("шаг 3 из 4", self.last_text)
+        self.assertIn("шаг 3 из 5", self.last_text)
         buttons = [b for row in self.last_markup.keyboard for b in row]
         self.assertTrue(any(b.callback_data == "batch_pwd_base" for b in buttons))
 
@@ -137,7 +137,7 @@ class WizardFlowTests(ControllerHarness):
 
     def test_task_step_lists_tasks(self):
         self.ctrl._ask_batch_task(1, "TOLYATTI", 5, "pass123")
-        self.assertIn("шаг 4 из 4", self.last_text)
+        self.assertIn("шаг 4 из 5", self.last_text)
         buttons = [b for row in self.last_markup.keyboard for b in row]
         tasks = {b.callback_data for b in buttons if b.callback_data.startswith("batch_task:")}
         self.assertEqual(len(tasks), 7)

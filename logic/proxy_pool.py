@@ -26,8 +26,11 @@ import os
 import threading
 import time
 
+from dataclasses import replace
+
 from .vpn_probe import (
     ProbeResult,
+    STATUS_BANNED,
     STATUS_DEAD,
     STATUS_NEEDS_CLIENT,
     STATUS_OK,
@@ -99,7 +102,11 @@ class ProxyPool:
         interval: float = DEFAULT_INTERVAL,
         timeout: float = DEFAULT_TIMEOUT,
         target_host: str = "",
-        target_port: int = 5125,
+        # Порт для TCP-проверки. 5125 сюда ставить НЕЛЬЗЯ: игровой сервер
+        # слушает там только UDP, TCP-коннект туда не проходит ни у одного
+        # прокси — получался ложный «мёртвый» на живом прокси. Проверяем
+        # TCP на обычном порту, UDP — отдельно, через STUN.
+        target_port: int = 443,
         prober=None,
         loader=None,
         clock=_now,
@@ -125,6 +132,11 @@ class ProxyPool:
         self.subscriptions: list[dict] = []
         self.manual: list[dict] = []
         self.results: dict[str, ProbeResult] = {}
+        # Забаненные адреса: key -> {"name", "address", "reason", "ts"}.
+        # Это отдельный от «мёртвых» список: мёртвый прокси может ожить,
+        # а забаненный сервером не оживёт никогда. Храним на диске, иначе
+        # после перезапуска бот снова возьмёт тот же адрес и словит бан.
+        self.banned: dict[str, dict] = {}
         self._cached_nodes: list[VpnNode] = []
         self.last_refresh: float = 0.0
         self.last_error: str = ""
@@ -165,6 +177,12 @@ class ProxyPool:
                 if isinstance(item, dict) and item.get("proxy")
             ]
             self.hwid = str(data.get("hwid") or "")
+            banned = data.get("banned") or {}
+            if isinstance(banned, dict):
+                self.banned = {
+                    str(k): dict(v) for k, v in banned.items()
+                    if isinstance(v, dict)
+                }
         if not self.hwid:
             self.hwid = _new_hwid()
             self.save()
@@ -175,6 +193,7 @@ class ProxyPool:
                 "subscriptions": list(self.subscriptions),
                 "manual": list(self.manual),
                 "hwid": self.hwid,
+                "banned": dict(self.banned),
             }
         try:
             directory = os.path.dirname(self.path)
@@ -546,6 +565,13 @@ class ProxyPool:
         node = parse_link(proxy)
         if node is None:
             return False, f"не понял прокси {proxy!r}"
+        # Забаненный адрес не проверяем вовсе: сервер его уже отверг, и
+        # запускать с него бота — гарантированный бан нового аккаунта.
+        with self._lock:
+            entry = self.banned.get(node.key)
+        if entry is not None:
+            why = entry.get("reason") or "забанен сервером"
+            return False, f"адрес забанен: {why}"
         if not node.is_direct:
             return False, f"{node.protocol} не поддерживается напрямую"
 
@@ -567,22 +593,143 @@ class ProxyPool:
             return True, f"прокси живой ({latency}{detail})"
         return False, result.reason or "прокси не прошёл проверку"
 
+    # ---------- забаненные адреса ----------
+    #
+    # Античит умеет банить по IP: сервер отвечает «connection banned» и не
+    # пускает никого с этого адреса. Такой прокси нельзя просто пометить
+    # мёртвым — проверка покажет его живым, и пул выдаст его снова, а
+    # каждый следующий бот словит тот же бан. Поэтому ведём отдельный
+    # список и в раздачу его не пускаем никогда.
+
+    def mark_banned(self, proxy: str, reason: str = "") -> list[str]:
+        """Пометить адрес забаненным. Принимает URL, ключ узла или адрес.
+
+        Возвращает ключи, которые реально попали в список.
+        """
+        keys: list[str] = []
+        node = self.find_node(proxy)
+        candidates: list[str] = []
+        if node is not None:
+            candidates.append(node.key)
+        # Строка может быть socks5://host:port — из неё тоже достаём адрес.
+        parsed = parse_link(proxy) if "://" in str(proxy) else None
+        if parsed is not None and parsed.key not in candidates:
+            candidates.append(parsed.key)
+        if not candidates:
+            candidates.append(str(proxy).strip())
+
+        with self._lock:
+            for key in candidates:
+                if not key:
+                    continue
+                entry = {
+                    "reason": str(reason or "бан по IP"),
+                    "ts": float(self._clock()),
+                    "address": getattr(node, "address", "") or "",
+                    "name": getattr(node, "name", "") or "",
+                }
+                self.banned[key] = entry
+                keys.append(key)
+        if keys:
+            self.save()
+            names = ", ".join(keys)
+            self.log(f"[ПРОКСИ] забанен и больше не выдаётся: {names}")
+        return keys
+
+    def unban(self, proxy: str) -> bool:
+        """Снять бан вручную: адрес мог смениться или бан был ошибкой."""
+        node = self.find_node(proxy)
+        keys = []
+        if node is not None:
+            keys.append(node.key)
+        parsed = parse_link(proxy) if "://" in str(proxy) else None
+        if parsed is not None:
+            keys.append(parsed.key)
+        keys.append(str(proxy).strip())
+        removed = False
+        with self._lock:
+            for key in keys:
+                if key in self.banned:
+                    del self.banned[key]
+                    removed = True
+        if removed:
+            self.save()
+        return removed
+
+    def is_banned(self, proxy: str) -> bool:
+        """Забанен ли адрес. Понимает URL, ключ и голый host:port."""
+        text = str(proxy or "").strip()
+        if not text:
+            return False
+        with self._lock:
+            if text in self.banned:
+                return True
+        node = self.find_node(text)
+        if node is not None:
+            with self._lock:
+                return node.key in self.banned
+        parsed = parse_link(text) if "://" in text else None
+        if parsed is not None:
+            with self._lock:
+                if parsed.key in self.banned:
+                    return True
+            with self._lock:
+                return f"{parsed.address}:{parsed.port}" in self.banned
+        return False
+
+    def banned_keys(self) -> list[str]:
+        with self._lock:
+            return list(self.banned)
+
     # ---------- выдача ----------
 
     def statuses(self) -> list[ProbeResult]:
-        """Все известные статусы, отсортированные: рабочие, живые, мёртвые."""
+        """Все известные статусы: рабочие, живые, мёртвые, забаненные.
+
+        Забаненные помечаются поверх всего: технически адрес может быть
+        живым, но играть через него нельзя, и путать его с рабочим нельзя.
+        """
         with self._lock:
             items = list(self.results.values())
-        order = {STATUS_OK: 0, STATUS_NEEDS_CLIENT: 1, STATUS_DEAD: 2}
+            banned = dict(self.banned)
+        order = {STATUS_OK: 0, STATUS_NEEDS_CLIENT: 1, STATUS_DEAD: 2,
+                 STATUS_BANNED: 3}
+
+        # Копируем, а не правим на месте: результат лежит в кэше, и если
+        # испортить его здесь, снятие бана не вернёт узел в работу —
+        # он останется помеченным забаненным до следующей проверки.
+        patched: list[ProbeResult] = []
+        for res in items:
+            entry = banned.get(res.node.key)
+            if entry is None:
+                patched.append(res)
+                continue
+            copy = replace(
+                res,
+                status=STATUS_BANNED,
+                usable=False,
+                reason=entry.get("reason") or "забанен сервером",
+            )
+            patched.append(copy)
+        items = patched
 
         def sort_key(res: ProbeResult):
-            return (order.get(res.status, 3), res.latency_ms or 1e9, res.node.name)
+            return (order.get(res.status, 4), res.latency_ms or 1e9, res.node.name)
 
         return sorted(items, key=sort_key)
 
     def usable(self) -> list[ProbeResult]:
-        """Только те, с которыми бот реально может работать."""
-        return [res for res in self.statuses() if res.usable]
+        """Только те, с которыми бот реально может работать.
+
+        Забаненные исключены: иначе следующая раздача снова даст адрес,
+        с которого сервер уже не пускает.
+        """
+        with self._lock:
+            banned = set(self.banned)
+        return [
+            res for res in self.statuses()
+            if res.usable and res.node.key not in banned
+        ]
 
     def usable_proxies(self) -> list[str]:
         """Готовые строки прокси для ботов.
@@ -669,13 +816,17 @@ class ProxyPool:
     def summary(self) -> dict:
         with self._lock:
             items = list(self.results.values())
+            banned = set(self.banned)
+        usable = [r for r in items if r.usable and r.node.key not in banned]
+        banned_items = [r for r in items if r.node.key in banned]
         return {
             "subscriptions": len(self.subscriptions),
             "manual": len(self.manual),
             "total": len(items),
-            "usable": sum(1 for r in items if r.usable),
+            "usable": len(usable),
             "alive": sum(1 for r in items if r.alive),
-            "dead": sum(1 for r in items if not r.alive),
+            "dead": sum(1 for r in items if not r.alive and r.node.key not in banned),
+            "banned": len(banned_items),
             "last_refresh": self.last_refresh,
             "last_error": self.last_error,
             "interval": self.interval,

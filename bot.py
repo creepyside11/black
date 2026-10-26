@@ -69,6 +69,13 @@ MAX_NICKNAME_LEN = 20
 # Сервер пишет о бане дважды: строкой в чат и диалогом на входе.
 BAN_ALERT_DEDUPE = 300.0
 
+# Сторож прокси: как часто проверять, жив ли прокси у работающего бота,
+# и как долго не трогать одного и того же бота после замены. Без паузы
+# падение всего пула превращалось бы в шторм перезаходов — сервер на
+# такое отвечает блокировкой за частые подключения.
+PROXY_WATCH_INTERVAL = float(os.environ.get("BR_PROXY_WATCH", "120"))
+PROXY_SWAP_COOLDOWN = float(os.environ.get("BR_PROXY_SWAP_COOLDOWN", "300"))
+
 # Пауза между созданием аккаунтов-замен.
 #
 # При волне банов замена запускается на каждый забаненный аккаунт сразу.
@@ -853,6 +860,8 @@ class BotInstance:
         # Один общий поток статистики на всех ботов вместо потока на каждого.
         if self.manager and hasattr(self.manager, "_ensure_stats_scheduler"):
             self.manager._ensure_stats_scheduler()
+        if self.manager and hasattr(self.manager, "_ensure_proxy_watchdog"):
+            self.manager._ensure_proxy_watchdog()
 
         return True
 
@@ -1447,6 +1456,13 @@ class BotManager:
         # CONNECTION_BANNED). Он на адрес, а не на аккаунт — новый ник с
         # того же IP забанят так же, и регистрация сгорит впустую.
         ip_banned = "connection_banned" in (reason or "").lower()
+        if ip_banned:
+            # Бан по IP: сервер не пускает никого с этого адреса. Помечаем
+            # прокси непригодным навсегда и переносим на него метку всем,
+            # кто с него сидел. Иначе следующий бот возьмёт тот же адрес
+            # из пула и словит тот же бан — а мы будем думать, что дело
+            # в аккаунтах.
+            self.handle_ip_ban(bot, reason=reason or "connection banned")
         if not ip_banned and not getattr(bot, "_replaced", False):
             bot._replaced = True
 
@@ -2631,6 +2647,167 @@ class BotManager:
 
         threading.Thread(target=_starter, daemon=True).start()
         return bots_to_start
+
+    def handle_ip_ban(self, bot, reason: str = "") -> dict:
+        """Сервер забанил IP: адрес в мусор, все аккаунты с него — тоже.
+
+        Смысл в том, что бан тут не про аккаунт. Пока адрес не помечен,
+        пул выдаст его следующему боту, тот зайдёт и словит то же самое,
+        и это будет выглядеть как «аккаунты плохие». Поэтому адрес уходит
+        в забаненные навсегда, а все, кто с него сидел, помечаются
+        забаненными — они уже не зайдут, даже если сервер пустит.
+        """
+        proxy = (bot.proxy or "").strip()
+        pool = getattr(self, "proxy_pool", None)
+        banned_keys: list[str] = []
+        if proxy and pool is not None:
+            try:
+                banned_keys = pool.mark_banned(proxy, reason=reason)
+            except Exception as exc:
+                print(f"[!] Не смог пометить прокси забаненным: {exc!r}")
+
+        affected: list[int] = []
+        if proxy:
+            for other in list(self.bots.values()):
+                if (other.proxy or "").strip() != proxy:
+                    continue
+                if other.is_banned:
+                    continue
+                other.is_banned = True
+                other.ban_reason = f"IP забанен ({reason or 'connection banned'})"
+                other.ban_kind = "ip"
+                other.banned_at = time.time()
+                other.status = "ЗАБАНЕН (IP)"
+                try:
+                    other.cancel_reconnect()
+                    other.stop(banned=True)
+                except Exception:
+                    pass
+                other.add_log(
+                    f"[!] Адрес {proxy} забанен сервером — аккаунт тоже помечен")
+                affected.append(other.bot_id)
+        if affected:
+            self.save_accounts()
+            print(f"[!] IP-бан: помечено аккаунтов {len(affected)}, "
+                  f"адрес исключён из пула")
+
+        # Сообщаем в Telegram: это событие на весь адрес, а не на один бот.
+        try:
+            tg = getattr(self, "tg_controller", None)
+            if tg is not None and getattr(tg, "bot", None) is not None:
+                owner = getattr(tg, "owner_id", None)
+                if owner:
+                    lines = [
+                        "🚫 <b>БАН ПО IP</b>",
+                        "",
+                        f"Адрес: <code>{proxy or 'свой IP'}</code>",
+                        f"Причина: <code>{reason or 'connection banned'}</code>",
+                    ]
+                    if affected:
+                        names = ", ".join(
+                            self.bots[i].nickname for i in affected
+                            if i in self.bots)
+                        lines.append(f"Помечены забаненными: <b>{len(affected)}</b>")
+                        lines.append(f"<i>{names[:300]}</i>")
+                    lines.append("")
+                    lines.append("Адрес исключён из пула и больше не выдаётся.")
+                    tg.bot.send_message(owner, "\n".join(lines))
+        except Exception as exc:
+            print(f"[!] Не смог отправить отчёт об IP-бане: {exc!r}")
+
+        return {"proxy": proxy, "banned_keys": banned_keys,
+                "accounts": affected}
+
+    def swap_proxy(self, bot, *, reason: str = "") -> str:
+        """Заменить боту прокси на рабочий и перезайти.
+
+        Возвращает новый прокси или пустую строку, если менять не на что.
+        """
+        pool = getattr(self, "proxy_pool", None)
+        if pool is None:
+            return ""
+        current = (bot.proxy or "").strip()
+        try:
+            candidates = pool.usable_proxies()
+        except Exception:
+            candidates = []
+        fresh = [url for url in candidates if url and url != current]
+        if not fresh:
+            return ""
+        new_proxy = fresh[0]
+        bot.add_log(
+            f"[ПРОКСИ] меняю {current or 'свой IP'} → {new_proxy}"
+            + (f" ({reason})" if reason else ""))
+        try:
+            bot.cancel_reconnect()
+            bot.stop()
+        except Exception:
+            pass
+        bot.proxy = new_proxy
+        bot._auto_proxy_tried = False
+        try:
+            self.save_accounts()
+        except Exception:
+            pass
+        time.sleep(1.0)
+        try:
+            bot.start()
+        except Exception as exc:
+            bot.add_log(f"[ПРОКСИ] перезаход не удался: {exc!r}")
+        return new_proxy
+
+    def _ensure_proxy_watchdog(self) -> None:
+        """Фон: упал прокси у работающего бота — меняем и перезаходим.
+
+        Проверка идёт по тем же результатам пула, что и раздача, поэтому
+        лишних запросов нет: пул и так обновляет статусы по таймеру.
+        """
+        if getattr(self, "_proxy_watch", None) is not None:
+            return
+        stop = threading.Event()
+
+        def _loop():
+            while not stop.is_set():
+                stop.wait(PROXY_WATCH_INTERVAL)
+                if stop.is_set():
+                    break
+                try:
+                    self._proxy_watch_pass()
+                except Exception as exc:
+                    print(f"[!] Сторож прокси: {exc!r}")
+
+        thread = threading.Thread(target=_loop, name="proxy-watch", daemon=True)
+        self._proxy_watch = {"thread": thread, "stop": stop}
+        thread.start()
+
+    def _proxy_watch_pass(self) -> None:
+        pool = getattr(self, "proxy_pool", None)
+        if pool is None:
+            return
+        now = time.time()
+        for bot in list(self.bots.values()):
+            if bot.is_banned or bot.stopping:
+                continue
+            proxy = (bot.proxy or "").strip()
+            if not proxy:
+                continue
+            # Не дёргаем одного бота чаще раза в PROXY_SWAP_COOLDOWN:
+            # иначе при общем падении пула начнётся шторм перезаходов.
+            last = getattr(bot, "_proxy_swap_at", 0.0)
+            if now - last < PROXY_SWAP_COOLDOWN:
+                continue
+            try:
+                if pool.is_banned(proxy):
+                    bot._proxy_swap_at = now
+                    self.swap_proxy(bot, reason="адрес забанен")
+                    continue
+                ok, why = pool.verify_before_connect(proxy)
+            except Exception:
+                continue
+            if ok:
+                continue
+            bot._proxy_swap_at = now
+            self.swap_proxy(bot, reason=why or "прокси не отвечает")
 
     def delete_selected(self, bot_ids: list[int]) -> list[int]:
         """Удалить выбранные аккаунты. Возвращает те, что реально удалены.

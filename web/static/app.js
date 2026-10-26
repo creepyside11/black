@@ -22,7 +22,7 @@ const TASKS = {
 
 /* ---------- состояние ---------- */
 
-let state = { bots: [], vpn: {}, live: false };
+let state = { bots: [], vpn: {}, live: false, vpnPage: 1 };
 let filter = "";
 let pollTimer = null;
 let busy = new Set();
@@ -181,7 +181,13 @@ function render() {
   ).join("");
 
   renderBots(bots);
-  renderVpn(vpn);
+  // Опрос приходит раз в 4с и всегда с первой страницей. Если открыта
+  // другая — не сбиваем её, иначе пагинация сама себя закрывает.
+  if ((state.vpnPage || 1) <= 1) {
+    renderVpn(vpn);
+  } else {
+    renderVpnStatsOnly(vpn);
+  }
   renderBulkProxy(vpn);
   renderCreateProxy(vpn);
   renderSettings();
@@ -379,13 +385,20 @@ function renderCreateProxy(vpn) {
 function renderVpn(vpn) {
   const nodes = vpn.nodes || [];
   const summary = vpn.summary || {};
-  $("#vpn-count").textContent = `${summary.usable || 0} рабочих из ${nodes.length}`;
+  const total = vpn.total ?? nodes.length;
+  const page = vpn.page || 1;
+  const pages = vpn.pages || 1;
+  state.vpnPage = page;
+
+  $("#vpn-count").textContent =
+    `${summary.usable || 0} рабочих из ${total}`;
 
   $("#vpn-stats").innerHTML = [
-    ["Всего узлов", nodes.length, ""],
+    ["Всего узлов", total, ""],
     ["Рабочих", summary.usable || 0, "ok"],
     ["Живых", summary.alive || 0, ""],
     ["Мёртвых", summary.dead || 0, "bad"],
+    ["Забанено", summary.banned || 0, "bad"],
   ].map(([k, v, cls]) =>
     `<div class="stat glass"><div class="k">${k}</div><div class="v ${cls}">${v}</div></div>`
   ).join("");
@@ -394,26 +407,93 @@ function renderVpn(vpn) {
     $("#nodes").innerHTML = `<div class="empty">${
       vpn.available === false ? "Пул прокси не запущен" : "Узлов нет"
     }</div>`;
+    $("#nodes-pager").innerHTML = "";
     return;
   }
 
   $("#nodes").innerHTML = nodes.map((n) => {
-    const kind = n.usable ? "ok" : n.alive ? "warn" : "bad";
-    const label = n.usable ? "рабочий" : n.alive ? "нужен клиент" : "мёртвый";
-    const dis = n.usable ? "" : "disabled";
+    const banned = n.status === "banned";
+    const kind = banned ? "bad" : n.usable ? "ok" : n.alive ? "warn" : "bad";
+    const label = banned
+      ? "забанен"
+      : n.usable ? "рабочий" : n.alive ? "нужен клиент" : "мёртвый";
+    const dis = n.usable && !banned ? "" : "disabled";
+    const note = n.reason
+      ? `<div class="why">${escapeHtml(n.reason)}</div>`
+      : "";
+    const banBtn = banned
+      ? `<button class="btn btn-sm" data-unban="${escapeHtml(n.key)}">Разбанить</button>`
+      : `<button class="btn btn-sm" data-ban="${escapeHtml(n.key)}">В бан</button>`;
     return `
       <div class="node">
         <div class="top">
           <span class="dot ${kind === "ok" ? "on" : kind === "warn" ? "wait" : "bad"}"></span>
           <span class="name">${escapeHtml(n.name || "без имени")}</span>
         </div>
-        <div class="addr">${escapeHtml(n.address || "")} · ${escapeHtml(n.protocol || "")}</div>
+        <div class="addr">${escapeHtml(n.address || "")} · ${escapeHtml(n.protocol || "")}${
+          n.latency ? ` · ${n.latency}мс` : ""
+        }</div>
+        ${note}
         <div class="row">
           <span class="badge ${kind}">${label}</span>
           <button class="btn btn-sm" data-cluster="${escapeHtml(n.key)}" ${dis}>Раздать</button>
+          ${banBtn}
         </div>
       </div>`;
   }).join("");
+
+  renderPager(page, pages, total);
+}
+
+// Обновить только счётчики, не трогая список: так опрос не сбивает
+// открытую страницу узлов.
+function renderVpnStatsOnly(vpn) {
+  const summary = vpn.summary || {};
+  const total = vpn.total ?? (vpn.nodes || []).length;
+  const el = $("#vpn-count");
+  if (el) el.textContent = `${summary.usable || 0} рабочих из ${total}`;
+  const stats = $("#vpn-stats");
+  if (!stats) return;
+  stats.innerHTML = [
+    ["Всего узлов", total, ""],
+    ["Рабочих", summary.usable || 0, "ok"],
+    ["Живых", summary.alive || 0, ""],
+    ["Мёртвых", summary.dead || 0, "bad"],
+    ["Забанено", summary.banned || 0, "bad"],
+  ].map(([k, v, cls]) =>
+    `<div class="stat glass"><div class="k">${k}</div><div class="v ${cls}">${v}</div></div>`
+  ).join("");
+}
+
+// Страницы узлов. Раньше панель рисовала весь пул одним куском, и на
+// сотне узлов это был один длинный ползунок без ориентиров.
+function renderPager(page, pages, total) {
+  const box = $("#nodes-pager");
+  if (!box) return;
+  if (pages <= 1) {
+    box.innerHTML = total
+      ? `<span class="pager-info">Всего ${total}</span>`
+      : "";
+    return;
+  }
+  const btn = (p, label, dis) =>
+    `<button class="btn btn-sm" data-nodepage="${p}" ${dis ? "disabled" : ""}>${label}</button>`;
+  box.innerHTML = [
+    btn(1, "«", page === 1),
+    btn(page - 1, "‹", page === 1),
+    `<span class="pager-info">${page} / ${pages} · всего ${total}</span>`,
+    btn(page + 1, "›", page === pages),
+    btn(pages, "»", page === pages),
+  ].join("");
+}
+
+async function loadVpnPage(page) {
+  try {
+    const res = await post("vpn_status", { page });
+    renderVpn(res.result || {});
+  } catch (exc) {
+    toast(exc.message, "bad");
+  }
 }
 
 function renderSettings() {
@@ -540,6 +620,44 @@ document.addEventListener("click", async (e) => {
     } finally {
       busy.delete(id);
       render();
+    }
+    return;
+  }
+
+  const pageBtn = e.target.closest("[data-nodepage]");
+  if (pageBtn) {
+    pageBtn.disabled = true;
+    await loadVpnPage(Number(pageBtn.dataset.nodepage) || 1);
+    pageBtn.disabled = false;
+    return;
+  }
+
+  const banBtn = e.target.closest("[data-ban]");
+  if (banBtn) {
+    banBtn.disabled = true;
+    try {
+      await post("vpn_ban", { key: banBtn.dataset.ban, reason: "вручную" });
+      toast("Адрес забанен и больше не выдаётся", "ok");
+      await loadVpnPage(state.vpnPage || 1);
+    } catch (exc) {
+      toast(exc.message, "bad");
+    } finally {
+      banBtn.disabled = false;
+    }
+    return;
+  }
+
+  const unbanBtn = e.target.closest("[data-unban]");
+  if (unbanBtn) {
+    unbanBtn.disabled = true;
+    try {
+      await post("vpn_unban", { key: unbanBtn.dataset.unban });
+      toast("Бан снят", "ok");
+      await loadVpnPage(state.vpnPage || 1);
+    } catch (exc) {
+      toast(exc.message, "bad");
+    } finally {
+      unbanBtn.disabled = false;
     }
     return;
   }
