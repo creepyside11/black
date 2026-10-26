@@ -684,3 +684,18 @@ class VpnBridge:
     def port_of(self, key: str) -> int | None:
         with self._lock:
             return self._ports.get(key)
+
+    def key_of_port(self, port: int) -> str:
+        """Обратный поиск: какой узел стоит за портом моста.
+
+        Аккаунт хранит прокси как socks5://127.0.0.1:<порт>, а банить надо
+        узел. Без обратного перевода бан по IP уходил в пустоту: помечался
+        выдуманный узел «127.0.0.1:23699», а настоящий VLESS-узел
+        продолжал раздаваться.
+        """
+        port = int(port)
+        with self._lock:
+            for key, known in self._ports.items():
+                if int(known) == port:
+                    return key
+        return ""

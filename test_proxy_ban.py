@@ -102,6 +102,172 @@ class BannedProxyTests(unittest.TestCase):
         self.assertTrue(all("1.2.3.4" not in url for url in plan))
 
 
+class IpBlockTextTests(unittest.TestCase):
+    """Текст античита про IP — это блокировка адреса, а не бан аккаунта.
+
+    Их нельзя путать: аккаунт после блокировки по IP цел и заходит с
+    другого адреса, а если пометить его забаненным — потеряем рабочий
+    аккаунт из-за чужой проблемы с IP.
+    """
+
+    def test_detects_real_anticheat_message(self):
+        from logic.baninfo import is_ip_block
+        text = ("Anti-Cheat: Ваш IP-адрес был заблокирован. Если Вы считаете "
+                "что блокировка была выдана ошибочно обратитесь в "
+                "технический раздел.")
+        self.assertTrue(is_ip_block(text))
+
+    def test_detects_with_color_codes(self):
+        from logic.baninfo import is_ip_block
+        text = "{FF0000}Anti-Cheat{FFFFFF}: Ваш {FFFF00}IP-адрес{FFFFFF} был заблокирован"
+        self.assertTrue(is_ip_block(text))
+
+    def test_detects_short_forms(self):
+        from logic.baninfo import is_ip_block
+        for text in ("Ваш IP-адрес был заблокирован",
+                     "IP адрес заблокирован",
+                     "Блокировка по IP",
+                     "Заблокирован ваш IP"):
+            self.assertTrue(is_ip_block(text), text)
+
+    def test_does_not_match_account_ban(self):
+        from logic.baninfo import is_ip_block
+        for text in ("Ваш игровой аккаунт заблокирован, вход невозможен.",
+                     "Администратор X навсегда заблокировал игрока Y. Причина: BOT",
+                     "Вы были заблокированы администратором",
+                     "Ваш аккаунт забанен за читы"):
+            self.assertFalse(is_ip_block(text), text)
+
+    def test_does_not_match_chatter(self):
+        from logic.baninfo import is_ip_block
+        for text in ("Информация о работах", "Сервер переполнен",
+                     "IP сервера: 80.66.82.20", ""):
+            self.assertFalse(is_ip_block(text), text)
+
+
+class BridgePortBanTests(unittest.TestCase):
+    """Бан по строке socks5://127.0.0.1:<порт> должен попадать в узел.
+
+    Аккаунт хранит порт моста, а не узел. Раньше пометка уходила в
+    выдуманный «127.0.0.1:23699», и настоящий VLESS-узел продолжал
+    раздаваться — то есть бан по IP не работал вообще.
+    """
+
+    def test_bridge_port_bans_underlying_node(self):
+        d = tempfile.mkdtemp()
+        try:
+            path = os.path.join(d, "pool.json")
+            pool = ProxyPool(path, prober=lambda n, **k: [], clock=lambda: 1.0)
+            node = _node("kaz.example.com", 443)
+            pool.results[node.key] = _ok(node)
+
+            class FakeBridge:
+                def key_of_port(self, port):
+                    return node.key if int(port) == 23699 else ""
+
+            pool.bridge = FakeBridge()
+            pool._cached_nodes = [node]
+
+            keys = pool.mark_banned("socks5://127.0.0.1:23699",
+                                    reason="Античит: IP заблокирован")
+            # Помечаются и узел, и сама строка порта — так надёжнее:
+            # узел выпадает из раздачи, а старый прокси в аккаунте
+            # перестаёт проходить проверку.
+            self.assertIn(node.key, keys,
+                          "должен пометиться узел, а не только порт моста")
+            self.assertTrue(pool.is_banned("socks5://127.0.0.1:23699"))
+            self.assertTrue(pool.is_banned(node.key))
+            # И сам узел выпадает из раздачи.
+            self.assertEqual(len(pool.usable()), 0)
+        finally:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+
+class BridgePortRefreshTests(unittest.TestCase):
+    """Порт моста меняется после перезапуска — аккаунт должен найти узел.
+
+    Аккаунт хранил только socks5://127.0.0.1:<порт>. После перезапуска
+    тот же узел оказывался на другом порту, и бот шёл в чужой или мёртвый
+    туннель: «сервер не отвечает» при живом узле.
+    """
+
+    def test_port_reresolved_by_node_key(self):
+        import bot as botmod
+        d = tempfile.mkdtemp()
+        try:
+            path = os.path.join(d, "pool.json")
+            pool = ProxyPool(path, prober=lambda n, **k: [], clock=lambda: 1.0)
+            # vless, а не socks5: только такие узлы живут за мостом и
+            # только у них порт меняется при перезапуске.
+            node = VpnNode(name="kaz", protocol="vless",
+                           address="kaz.example.com", port=443,
+                           source="sub")
+            pool.results[node.key] = _ok(node)
+            pool._cached_nodes = [node]
+
+            new_port = {"value": 25001}
+
+            class FakeBridge:
+                def available(self):
+                    return True
+
+                def key_of_port(self, port):
+                    return node.key if int(port) == new_port["value"] else ""
+
+                def port_of(self, key):
+                    return new_port["value"] if key == node.key else None
+
+                def start(self, key, link):
+                    # Пул поднимает мост и получает новый порт.
+                    return (f"socks5://127.0.0.1:{new_port['value']}"
+                            if key == node.key else "")
+
+            pool.bridge = FakeBridge()
+
+            class FakeBot:
+                proxy = "socks5://127.0.0.1:23699"   # старый порт
+                proxy_node = node.key
+                logs = []
+
+                def add_log(self, text):
+                    self.logs.append(text)
+
+            class Mgr:
+                proxy_pool = pool
+
+            fake = FakeBot()
+            result = botmod.BotManager.refresh_bridge_proxy(Mgr(), fake)
+            self.assertEqual(result, "socks5://127.0.0.1:25001")
+            self.assertEqual(fake.proxy, "socks5://127.0.0.1:25001")
+
+            # Порт сменился ещё раз — пересчёт должен догнать.
+            new_port["value"] = 25099
+            result = botmod.BotManager.refresh_bridge_proxy(Mgr(), fake)
+            self.assertEqual(result, "socks5://127.0.0.1:25099")
+        finally:
+            import shutil
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_manual_proxy_untouched(self):
+        import bot as botmod
+
+        class FakeBot:
+            proxy = "socks5://1.2.3.4:1080"
+            proxy_node = ""
+
+            def add_log(self, text):
+                pass
+
+        class Mgr:
+            proxy_pool = None
+
+        fake = FakeBot()
+        self.assertEqual(
+            botmod.BotManager.refresh_bridge_proxy(Mgr(), fake),
+            "socks5://1.2.3.4:1080")
+
+
 class IpBanHandlerTests(unittest.TestCase):
     """handle_ip_ban: адрес помечен, все аккаунты с него — бан."""
 
@@ -143,12 +309,13 @@ class IpBanHandlerTests(unittest.TestCase):
 
         return B()
 
-    def test_all_accounts_on_proxy_marked(self):
+    def test_only_accounts_on_that_proxy_touched(self):
         a = self._bot(1, "socks5://9.9.9.9:1080", "A")
         b = self._bot(2, "socks5://9.9.9.9:1080", "B")
         c = self._bot(3, "socks5://8.8.8.8:1080", "C")
 
         pool = self.pool
+        handled = []
 
         class Mgr:
             def __init__(self):
@@ -160,15 +327,81 @@ class IpBanHandlerTests(unittest.TestCase):
             def save_accounts(self):
                 self.saved += 1
 
+            def swap_proxy(self, bot, *, reason=""):
+                handled.append(bot.bot_id)
+                return ""
+
         mgr = Mgr()
         out = self.botmod.BotManager.handle_ip_ban(mgr, a, reason="connection banned")
 
-        self.assertTrue(a.is_banned)
-        self.assertTrue(b.is_banned, "второй аккаунт с того же адреса тоже бан")
-        self.assertFalse(c.is_banned, "аккаунт на другом адресе не трогаем")
-        self.assertEqual(sorted(out["accounts"]), [1, 2])
+        self.assertEqual(sorted(handled), [1, 2],
+                         "тронут только адрес 9.9.9.9, аккаунт на 8.8.8.8 не при чём")
+        self.assertNotIn(3, handled)
         self.assertTrue(self.pool.is_banned("socks5://9.9.9.9:1080"))
         self.assertEqual(mgr.saved, 1)
+
+    def test_accounts_moved_to_other_proxy(self):
+        """IP-бан переводит аккаунты на другой узел, а не убивает их.
+
+        Аккаунт при блокировке по IP цел — виноват адрес. Если помечать
+        аккаунт забаненным, мы теряем рабочий аккаунт из-за чужой
+        проблемы с IP.
+        """
+        a = self._bot(1, "socks5://9.9.9.9:1080", "A")
+        b = self._bot(2, "socks5://9.9.9.9:1080", "B")
+
+        spare = _node("5.5.5.5")
+        self.pool.results[spare.key] = _ok(spare)
+
+        started = []
+
+        class Mgr:
+            def __init__(self):
+                self.bots = {1: a, 2: b}
+                self.proxy_pool = self_pool
+                self.tg_controller = None
+
+            def save_accounts(self):
+                pass
+
+            def swap_proxy(self, bot, *, reason=""):
+                bot.proxy = "socks5://5.5.5.5:1080"
+                started.append(bot.bot_id)
+                return bot.proxy
+
+        self_pool = self.pool
+        mgr = Mgr()
+        out = self.botmod.BotManager.handle_ip_ban(mgr, a, reason="Античит: IP заблокирован")
+
+        self.assertEqual(sorted(out["moved"]), [1, 2])
+        self.assertEqual(out["marked"], [])
+        self.assertFalse(a.is_banned, "аккаунт не должен считаться забаненным")
+        self.assertFalse(b.is_banned)
+        self.assertEqual(a.proxy, "socks5://5.5.5.5:1080")
+        self.assertTrue(self.pool.is_banned("socks5://9.9.9.9:1080"))
+
+    def test_marked_when_no_replacement(self):
+        """Замены нет — тогда аккаунт помечается, чтобы не долбился впустую."""
+        a = self._bot(1, "socks5://9.9.9.9:1080", "A")
+
+        class Mgr:
+            def __init__(self):
+                self.bots = {1: a}
+                self.proxy_pool = self_pool
+                self.tg_controller = None
+
+            def save_accounts(self):
+                pass
+
+            def swap_proxy(self, bot, *, reason=""):
+                return ""
+
+        self_pool = self.pool
+        out = self.botmod.BotManager.handle_ip_ban(Mgr(), a, reason="ip")
+        self.assertEqual(out["moved"], [])
+        self.assertEqual(out["marked"], [1])
+        self.assertTrue(a.is_banned)
+        self.assertEqual(a.ban_kind, "ip")
 
     def test_no_proxy_does_not_crash(self):
         a = self._bot(1, "", "A")
@@ -182,7 +415,9 @@ class IpBanHandlerTests(unittest.TestCase):
                 pass
 
         out = self.botmod.BotManager.handle_ip_ban(Mgr(), a, reason="x")
-        self.assertEqual(out["accounts"], [])
+        self.assertEqual(out["moved"], [])
+        self.assertEqual(out["marked"], [])
+        self.assertEqual(out["proxy"], "")
 
 
 class VpnPaginationTests(unittest.TestCase):

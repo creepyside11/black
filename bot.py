@@ -35,6 +35,7 @@ from core.protocol import RakNetProtocol
 from samp.api import BotAPI
 from samp.session import SampSession
 from samp.sync import PlayerSyncScheduler
+from logic.baninfo import is_ip_block
 from logic.registration import RegistrationConfig
 from logic.json_ui import JsonUIConfig
 from logic.events import emitter
@@ -330,6 +331,7 @@ class BotInstance:
         is_banned: bool = False,
         default_task: str = "lvl",
         proxy: str = "",
+        proxy_node: str = "",
     ):
         self.bot_id = bot_id
         self.host = host
@@ -352,6 +354,9 @@ class BotInstance:
         self.banned_at = 0.0
         self.default_task_name = default_task
         self.proxy = proxy.strip() if proxy else ""
+        # Ключ узла пула под этим прокси. Нужен, чтобы после перезапуска
+        # найти узел заново: порт моста не постоянный.
+        self.proxy_node = str(proxy_node or "")
         # Автопереключение на прокси уже пробовали — второй раз не дёргаем.
         self._auto_proxy_tried = False
 
@@ -1642,6 +1647,15 @@ class BotManager:
                     b.enter_queue(f"Сервер переполнен: {clean_msg[:60]}")
                     return
 
+                # 0.5. Блокировка по IP. Проверяем ПЕРВОЙ: античит пишет
+                # «Ваш IP-адрес был заблокирован», и это не бан аккаунта.
+                # Аккаунт цел, а адрес — нет. Если не отличить, аккаунт
+                # уйдёт в мусор, а следующий бот возьмёт тот же IP из пула
+                # и получит то же самое.
+                if is_ip_block(clean_msg):
+                    self.handle_ip_ban(b, reason=f"Античит: {clean_msg[:120]}")
+                    return
+
                 # 1. Проверяем бан аккаунта / блокировку администратором
                 # Примеры: "Администратор X забанил Y", "Вы были заблокированы", "аккаунт забанен"
                 admin_ban_patterns = [
@@ -1804,6 +1818,16 @@ class BotManager:
                             note="статистика: закрываю", signature=signature,
                         )
                     threading.Thread(target=_close_stats, daemon=True).start()
+
+                # Блокировка по IP приходит и диалогом от античита.
+                # Проверяем раньше общего списка: иначе «IP-адрес
+                # заблокирован» попадёт под «заблокирован» и аккаунт
+                # уйдёт в бан, хотя виноват адрес.
+                if is_ip_block(f"{title} {info}"):
+                    clean_ip_info = re.sub(r'\{[0-9a-fA-F]{6}\}', '', f"{title} {info}")
+                    b.add_log(f"[IP] Античит заблокировал адрес: {clean_ip_info[:120]}")
+                    self.handle_ip_ban(b, reason=f"Античит: {clean_ip_info[:140]}")
+                    return
 
                 # Проверяем диалоговые окна на бан / лимиты входа / рестарт
                 ban_triggers = [
@@ -2129,6 +2153,7 @@ class BotManager:
                 except (TypeError, ValueError):
                     banned_at = 0.0
                 proxy = item.get("proxy") or ""
+                proxy_node = str(item.get("proxy_node") or "")
                 saved_lvl = item.get("lvl") or "-"
                 try:
                     saved_money = int(item.get("money") or 0)
@@ -2196,6 +2221,7 @@ class BotManager:
                         is_banned=is_banned,
                         default_task=task,
                         proxy=proxy,
+                        proxy_node=proxy_node,
                     )
                     b.ban_admin = ban_admin
                     b.ban_reason = ban_reason
@@ -2264,6 +2290,10 @@ class BotManager:
                     "ban_duration": getattr(b, "ban_duration", "") or "",
                     "banned_at": getattr(b, "banned_at", 0.0) or 0.0,
                     "proxy": b.proxy,
+                    # Ключ узла под мостом. Порт моста меняется после
+                    # перезапуска, и одного порта мало: аккаунт начинал
+                    # смотреть в чужой или мёртвый туннель.
+                    "proxy_node": getattr(b, "proxy_node", "") or "",
                     "lvl": b.level_str,
                     "money": b.money,
                     "target_lvl": b.target_lvl,
@@ -2649,13 +2679,18 @@ class BotManager:
         return bots_to_start
 
     def handle_ip_ban(self, bot, reason: str = "") -> dict:
-        """Сервер забанил IP: адрес в мусор, все аккаунты с него — тоже.
+        """Античит заблокировал IP: адрес в мусор, аккаунты — на другой.
 
-        Смысл в том, что бан тут не про аккаунт. Пока адрес не помечен,
-        пул выдаст его следующему боту, тот зайдёт и словит то же самое,
-        и это будет выглядеть как «аккаунты плохие». Поэтому адрес уходит
-        в забаненные навсегда, а все, кто с него сидел, помечаются
-        забаненными — они уже не зайдут, даже если сервер пустит.
+        Блокировка по IP — это не бан аккаунта. С этого адреса сервер не
+        пускает никого, но сам аккаунт цел: с другого IP он заходит
+        нормально. Поэтому аккаунт не убиваем, а переводим на рабочий
+        узел и перезаходим.
+
+        Адрес при этом помечается забаненным навсегда. Без этого пул
+        выдаст его следующему боту, тот зайдёт и получит ту же надпись,
+        и будет выглядеть, будто сломались аккаунты.
+
+        Возвращает, что сделано: какие ключи забанены, кого перевели.
         """
         proxy = (bot.proxy or "").strip()
         pool = getattr(self, "proxy_pool", None)
@@ -2666,49 +2701,58 @@ class BotManager:
             except Exception as exc:
                 print(f"[!] Не смог пометить прокси забаненным: {exc!r}")
 
-        affected: list[int] = []
+        # Все, кто сидел на этом адресе, переезжают на другой. Иначе они
+        # будут биться в ту же стену при каждом перезаходе.
+        moved: list[int] = []
+        marked: list[int] = []
         if proxy:
             for other in list(self.bots.values()):
                 if (other.proxy or "").strip() != proxy:
                     continue
                 if other.is_banned:
                     continue
-                other.is_banned = True
-                other.ban_reason = f"IP забанен ({reason or 'connection banned'})"
-                other.ban_kind = "ip"
-                other.banned_at = time.time()
-                other.status = "ЗАБАНЕН (IP)"
                 try:
                     other.cancel_reconnect()
-                    other.stop(banned=True)
+                    other.stop()
                 except Exception:
                     pass
-                other.add_log(
-                    f"[!] Адрес {proxy} забанен сервером — аккаунт тоже помечен")
-                affected.append(other.bot_id)
-        if affected:
+                new_proxy = self.swap_proxy(other, reason="IP заблокирован античитом")
+                if new_proxy:
+                    moved.append(other.bot_id)
+                else:
+                    # Менять не на что: рабочих узлов нет. Тогда честно
+                    # помечаем аккаунт, чтобы он не долбился впустую.
+                    other.is_banned = True
+                    other.ban_reason = f"IP заблокирован, замена не найдена"
+                    other.ban_kind = "ip"
+                    other.banned_at = time.time()
+                    other.status = "ЗАБАНЕН (IP)"
+                    other.add_log("[!] Адрес забанен, рабочих узлов для замены нет")
+                    marked.append(other.bot_id)
+        if moved or marked:
             self.save_accounts()
-            print(f"[!] IP-бан: помечено аккаунтов {len(affected)}, "
-                  f"адрес исключён из пула")
+        print(f"[!] IP-бан: забанен адрес {proxy or '—'}, "
+              f"переведено {len(moved)}, помечено {len(marked)}")
 
-        # Сообщаем в Telegram: это событие на весь адрес, а не на один бот.
+        # Отчёт в Telegram: событие на весь адрес, а не на один бот.
         try:
             tg = getattr(self, "tg_controller", None)
             if tg is not None and getattr(tg, "bot", None) is not None:
                 owner = getattr(tg, "owner_id", None)
                 if owner:
                     lines = [
-                        "🚫 <b>БАН ПО IP</b>",
+                        "🚫 <b>АНТИЧИТ ЗАБЛОКИРОВАЛ IP</b>",
                         "",
                         f"Адрес: <code>{proxy or 'свой IP'}</code>",
-                        f"Причина: <code>{reason or 'connection banned'}</code>",
+                        f"Причина: <code>{reason or 'блокировка по IP'}</code>",
                     ]
-                    if affected:
+                    if moved:
                         names = ", ".join(
-                            self.bots[i].nickname for i in affected
-                            if i in self.bots)
-                        lines.append(f"Помечены забаненными: <b>{len(affected)}</b>")
+                            self.bots[i].nickname for i in moved if i in self.bots)
+                        lines.append(f"Переведены на другой узел: <b>{len(moved)}</b>")
                         lines.append(f"<i>{names[:300]}</i>")
+                    if marked:
+                        lines.append(f"Без замены, помечены: <b>{len(marked)}</b>")
                     lines.append("")
                     lines.append("Адрес исключён из пула и больше не выдаётся.")
                     tg.bot.send_message(owner, "\n".join(lines))
@@ -2716,7 +2760,7 @@ class BotManager:
             print(f"[!] Не смог отправить отчёт об IP-бане: {exc!r}")
 
         return {"proxy": proxy, "banned_keys": banned_keys,
-                "accounts": affected}
+                "moved": moved, "marked": marked}
 
     def swap_proxy(self, bot, *, reason: str = "") -> str:
         """Заменить боту прокси на рабочий и перезайти.
@@ -2734,7 +2778,15 @@ class BotManager:
         fresh = [url for url in candidates if url and url != current]
         if not fresh:
             return ""
-        new_proxy = fresh[0]
+        # Берём узел с наименьшей загрузкой. Если всем ботам с одного
+        # адреса выдать fresh[0], они переедут на один узел, и сервер
+        # увидит ту же кучу аккаунтов с одного IP — только другой.
+        load: dict[str, int] = {}
+        for other in list(self.bots.values()):
+            key = (other.proxy or "").strip()
+            if key and key != current:
+                load[key] = load.get(key, 0) + 1
+        new_proxy = min(fresh, key=lambda url: load.get(url, 0))
         bot.add_log(
             f"[ПРОКСИ] меняю {current or 'свой IP'} → {new_proxy}"
             + (f" ({reason})" if reason else ""))
@@ -2744,6 +2796,7 @@ class BotManager:
         except Exception:
             pass
         bot.proxy = new_proxy
+        bot.proxy_node = self._node_key_for(new_proxy)
         bot._auto_proxy_tried = False
         try:
             self.save_accounts()
@@ -2911,6 +2964,14 @@ class BotManager:
         threading.Thread(target=_starter, daemon=True).start()
 
     def start_bot(self, bot_id: int):
+        # Порт моста мог смениться после перезапуска — берём актуальный,
+        # иначе бот пойдёт в чужой туннель.
+        try:
+            bot = self.bots.get(bot_id)
+            if bot is not None and getattr(bot, "proxy_node", ""):
+                self.refresh_bridge_proxy(bot)
+        except Exception as exc:
+            print(f"[!] Не смог обновить порт моста для #{bot_id}: {exc!r}")
         with self._lock:
             bot = self.bots.get(bot_id)
         if not bot:
@@ -2982,9 +3043,50 @@ class BotManager:
                 if not resolved:
                     return False
                 bot.proxy = resolved
+                bot.proxy_node = self._node_key_for(resolved)
 
-        self.save_accounts()
+        # force: смену прокси нельзя терять. save_accounts дебаунсится на
+        # 10 секунд, и при перезапуске сразу после раздачи ключи узлов не
+        # успевали записаться — аккаунты оставались с одним портом.
+        self.save_accounts(force=True)
         return True
+
+    def _node_key_for(self, proxy: str) -> str:
+        """Ключ узла пула за строкой прокси (пусто для ручных прокси)."""
+        pool = getattr(self, "proxy_pool", None)
+        if pool is None or not proxy:
+            return ""
+        try:
+            node = pool.node_for_proxy(proxy)
+        except Exception:
+            return ""
+        return node.key if node is not None else ""
+
+    def refresh_bridge_proxy(self, bot) -> str:
+        """Пересчитать порт моста по ключу узла.
+
+        Порт моста не постоянный: он зависит от того, какие узлы поднялись
+        раньше. После перезапуска аккаунт со старым портом смотрел в чужой
+        или мёртвый туннель, и бот висел в «сервер не отвечает», хотя узел
+        живой. Возвращает актуальную строку прокси.
+        """
+        key = getattr(bot, "proxy_node", "") or ""
+        if not key:
+            return bot.proxy or ""
+        pool = getattr(self, "proxy_pool", None)
+        if pool is None:
+            return bot.proxy or ""
+        try:
+            node = pool.find_node(key)
+            if node is None:
+                return bot.proxy or ""
+            fresh = pool.socks_url_for(node)
+        except Exception:
+            return bot.proxy or ""
+        if fresh and fresh != bot.proxy:
+            bot.add_log(f"[ПРОКСИ] порт моста сменился: {bot.proxy} → {fresh}")
+            bot.proxy = fresh
+        return bot.proxy or ""
 
     def apply_proxy_to_bots(self, proxy_str: str, bot_ids: list[int] | None = None) -> dict:
         """Раздать прокси пачке ботов. Пустой список — всем.
@@ -3008,11 +3110,15 @@ class BotManager:
                 if bot_ids
                 else list(self.bots.values())
             )
+            node_key = self._node_key_for(resolved)
             for bot in targets:
                 bot.proxy = resolved
+                bot.proxy_node = node_key
             applied = [bot.bot_id for bot in targets]
 
-        self.save_accounts()
+        # force: ключи узлов должны лечь на диск сразу, иначе перезапуск
+        # сразу после раздачи оставит аккаунты со старыми портами.
+        self.save_accounts(force=True)
         return {"ok": True, "reason": resolved, "applied": applied}
 
     def proxy_report(self) -> str:

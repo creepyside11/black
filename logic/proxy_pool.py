@@ -616,13 +616,42 @@ class ProxyPool:
     # каждый следующий бот словит тот же бан. Поэтому ведём отдельный
     # список и в раздачу его не пускаем никогда.
 
+    def node_for_proxy(self, proxy: str) -> VpnNode | None:
+        """Какой узел стоит за строкой прокси бота.
+
+        Аккаунт хранит socks5://127.0.0.1:<порт> — это порт моста, а не
+        узел. Банить надо узел, иначе пометка уходит в выдуманный
+        «127.0.0.1:23699», а настоящий VLESS-узел продолжает раздаваться.
+        """
+        text = str(proxy or "").strip()
+        if not text:
+            return None
+        node = self.find_node(text)
+        if node is not None:
+            return node
+        # Порт моста -> ключ узла -> сам узел.
+        parsed = parse_link(text) if "://" in text else None
+        if parsed is not None and parsed.address in ("127.0.0.1", "localhost"):
+            bridge = self.bridge
+            key_of_port = getattr(bridge, "key_of_port", None)
+            if key_of_port is not None:
+                try:
+                    key = key_of_port(parsed.port)
+                except Exception:
+                    key = ""
+                if key:
+                    for known in self.nodes():
+                        if known.key == key:
+                            return known
+        return None
+
     def mark_banned(self, proxy: str, reason: str = "") -> list[str]:
         """Пометить адрес забаненным. Принимает URL, ключ узла или адрес.
 
         Возвращает ключи, которые реально попали в список.
         """
         keys: list[str] = []
-        node = self.find_node(proxy)
+        node = self.node_for_proxy(proxy)
         candidates: list[str] = []
         if node is not None:
             candidates.append(node.key)
@@ -653,7 +682,7 @@ class ProxyPool:
 
     def unban(self, proxy: str) -> bool:
         """Снять бан вручную: адрес мог смениться или бан был ошибкой."""
-        node = self.find_node(proxy)
+        node = self.node_for_proxy(proxy)
         keys = []
         if node is not None:
             keys.append(node.key)
@@ -679,7 +708,7 @@ class ProxyPool:
         with self._lock:
             if text in self.banned:
                 return True
-        node = self.find_node(text)
+        node = self.node_for_proxy(text)
         if node is not None:
             with self._lock:
                 return node.key in self.banned
