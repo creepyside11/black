@@ -94,3 +94,4 @@ _web/
 !test_lvl_engine.py
 !test_real_world.py
 !test_immortal.py
+!test_proxy_ban.py
