@@ -1,877 +1,774 @@
-/* RakCRMP — логика панели. Без сборки и без зависимостей. */
+/* RakCRMP Mini App.
+   Вход — подписанный initData от Telegram. Пароль остаётся запасным
+   входом для обычного браузера: панель открывают и с компьютера. */
 
-const $ = (sel) => document.querySelector(sel);
+const $  = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 
-const SERVERS = [
-  "ARKHANGELSK", "ASTRAKHAN", "BATYREVO", "BELGOROD", "BRATSK", "BRYANSK",
-  "CHELYABINSK", "CHITA", "EKATERINBURG", "IRKUTSK", "IZHEVSK", "KALUGA",
-  "KAZAN", "KEMEROVO", "KHABAROVSK", "KIROV", "KOSTROMA", "KRASNODAR",
-  "KRASNOYARSK", "KURGAN", "KURSK", "LIPETSK", "MAGNITOGORSK", "MOSCOW",
-  "MURMANSK", "NABEREZHNYE", "NIZHNY", "NORILSK", "NOVGOROD", "NOVOSIBIRSK",
-  "OMSK", "OREL", "ORENBURG", "PENZA", "PERM", "PETROZAVODSK", "PSKOV",
-  "ROSTOV", "RYAZAN", "SAMARA", "SARATOV", "SMOLENSK", "SOCHI",
-  "STAVROPOL", "SURGUT", "TAMBOV", "TOMSK", "TULA", "TVER", "TYUMEN",
-  "UFA", "ULYANOVSK", "VLADIVOSTOK", "VLADIMIR", "VOLGOGRAD", "VOLOGDA",
-  "VORONEZH", "YAKUTSK", "YAROSLAVL", "YOSHKAR", "ZABAYKALSK",
-];
+const TG = window.Telegram && window.Telegram.WebApp ? window.Telegram.WebApp : null;
 
-const TASKS = {
-  lvl: "Прокачка", quest: "Квесты", mine: "Шахта",
-  factory: "Завод", bus: "Автобус", stop: "Без задачи",
+const S = {
+  token: null,
+  user: null,
+  config: null,
+  bots: [],
+  vpn: { nodes: [], summary: {}, page: 1, pages: 1, total: 0, saved: [] },
+  filter: 'all',
+  query: '',
+  selectMode: false,
+  picked: new Set(),
+  vpnQuery: '',
+  vpnUsable: false,
+  vpnPage: 1,
+  timer: null,
 };
-
-/* ---------- состояние ---------- */
-
-let state = { bots: [], vpn: {}, live: false, vpnPage: 1,
-              pickBulk: "", pickCreate: "spread", picker: null };
-let filter = "";
-let pollTimer = null;
-let busy = new Set();
-// Выделенные аккаунты. Живут между опросами: панель перерисовывается
-// каждые 4 секунды, и сбрасывать галочки на каждой перерисовке нельзя.
-let selected = new Set();
 
 /* ---------- сеть ---------- */
 
-async function api(path, opts = {}) {
-  const res = await fetch("/api/" + path, {
-    credentials: "same-origin",
-    headers: { "Content-Type": "application/json" },
-    ...opts,
-  });
-  let data = {};
-  try { data = await res.json(); } catch { data = {}; }
-  if (res.status === 401) {
-    showLogin();
-    throw new Error("нужен вход");
+async function api(path, body) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (S.token) headers['X-Rak-Token'] = S.token;
+  let res;
+  try {
+    res = await fetch('/api/' + path, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body || {}),
+      credentials: 'same-origin',
+    });
+  } catch (e) {
+    throw new Error('сеть недоступна');
   }
-  if (!res.ok) throw new Error(data.error || `ошибка ${res.status}`);
+  let data = {};
+  try { data = await res.json(); } catch (e) { data = {}; }
+  if (!res.ok) throw new Error(data.error || ('ошибка ' + res.status));
   return data;
 }
 
-const post = (path, body) =>
-  api(path, { method: "POST", body: JSON.stringify(body || {}) });
+async function getJSON(path) {
+  const headers = {};
+  if (S.token) headers['X-Rak-Token'] = S.token;
+  const res = await fetch(path, { headers, credentials: 'same-origin' });
+  let data = {};
+  try { data = await res.json(); } catch (e) { data = {}; }
+  if (!res.ok) throw new Error(data.error || ('ошибка ' + res.status));
+  return data;
+}
 
 /* ---------- тосты ---------- */
 
-function toast(text, kind = "") {
-  const el = document.createElement("div");
-  el.className = "toast " + kind;
+function toast(text, kind = '') {
+  const el = document.createElement('div');
+  el.className = 'toast ' + kind;
   el.textContent = text;
-  $("#toasts").appendChild(el);
+  $('#toasts').appendChild(el);
   setTimeout(() => {
-    el.style.opacity = "0";
-    el.style.transition = "opacity .3s";
-    setTimeout(() => el.remove(), 320);
-  }, 3600);
+    el.style.transition = 'opacity .25s, transform .25s';
+    el.style.opacity = '0';
+    el.style.transform = 'translateY(-8px)';
+    setTimeout(() => el.remove(), 260);
+  }, 2600);
+}
+
+const fail = (e) => toast(e && e.message ? e.message : 'не вышло', 'bad');
+const good = (t) => toast(t, 'ok');
+
+/* ---------- модалка ---------- */
+
+function closeSheet() {
+  $('#sheet-wrap').hidden = true;
+  $('#sheet').innerHTML = '';
+}
+
+function openSheet(html) {
+  const sheet = $('#sheet');
+  sheet.innerHTML = html;
+  $('#sheet-wrap').hidden = false;
+  return sheet;
+}
+
+function choose(title, options) {
+  return new Promise((resolve) => {
+    const sheet = openSheet(`<h3>${esc(title)}</h3>`);
+    options.forEach((opt) => {
+      const el = document.createElement('div');
+      el.className = 'opt';
+      el.innerHTML = `${esc(opt.label)}${opt.note ? `<small>${esc(opt.note)}</small>` : ''}`;
+      el.onclick = () => { closeSheet(); resolve(opt.value); };
+      sheet.appendChild(el);
+    });
+    const cancel = document.createElement('div');
+    cancel.className = 'opt';
+    cancel.style.textAlign = 'center';
+    cancel.style.color = 'var(--ink-mute)';
+    cancel.textContent = 'Отмена';
+    cancel.onclick = () => { closeSheet(); resolve(null); };
+    sheet.appendChild(cancel);
+  });
+}
+
+function askForm(title, fields) {
+  return new Promise((resolve) => {
+    const sheet = openSheet(`<h3>${esc(title)}</h3><div class="form" id="ask-form"></div>`);
+    const form = $('#ask-form', sheet);
+    fields.forEach((f) => {
+      const wrap = document.createElement('label');
+      wrap.className = 'fld';
+      wrap.innerHTML = `<span>${esc(f.label)}</span>
+        <input id="ask-${f.name}" type="${f.type || 'text'}"
+               value="${f.value != null ? esc(String(f.value)) : ''}"
+               placeholder="${f.placeholder ? esc(f.placeholder) : ''}">`;
+      form.appendChild(wrap);
+    });
+    const ok = document.createElement('button');
+    ok.className = 'btn btn-solid btn-block';
+    ok.textContent = 'Готово';
+    ok.type = 'button';
+    ok.onclick = () => {
+      const out = {};
+      fields.forEach((f) => { out[f.name] = $('#ask-' + f.name, sheet).value.trim(); });
+      closeSheet();
+      resolve(out);
+    };
+    form.appendChild(ok);
+    const cancel = document.createElement('button');
+    cancel.className = 'btn btn-block';
+    cancel.textContent = 'Отмена';
+    cancel.type = 'button';
+    cancel.onclick = () => { closeSheet(); resolve(null); };
+    form.appendChild(cancel);
+    setTimeout(() => {
+      const first = $('input', form);
+      if (first && !TG) first.focus();
+    }, 60);
+  });
+}
+
+function esc(v) {
+  return String(v == null ? '' : v).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
 }
 
 /* ---------- вход ---------- */
 
-function showLogin() {
-  stopPolling();
-  $("#app").classList.add("hidden");
-  $("#login").classList.remove("hidden");
-  $("#login-name").focus();
-}
+async function boot() {
+  if (TG) {
+    TG.ready();
+    TG.expand();
+    try { TG.setHeaderColor('#08090b'); } catch (e) {}
+  }
 
-function showApp() {
-  $("#login").classList.add("hidden");
-  $("#app").classList.remove("hidden");
-  startPolling();
-  loadState();
-}
+  const initData = TG && TG.initData ? TG.initData : '';
 
-$("#login-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const btn = $("#login-btn");
-  const err = $("#login-err");
-  err.textContent = "";
-  btn.disabled = true;
-  btn.textContent = "Проверяю…";
+  if (initData) {
+    $('#gate-sub').textContent = 'Проверяю вход через Telegram…';
+    try {
+      const r = await api('tg', { initData });
+      S.token = r.token;
+      S.user = r.user;
+      return enter();
+    } catch (e) {
+      $('#gate-sub').textContent = 'Telegram не подтвердил вход';
+      $('#gate-err').textContent = e.message;
+      return showPassword();
+    }
+  }
+
   try {
-    await post("login", {
-      login: $("#login-name").value.trim(),
-      password: $("#login-pass").value,
+    const s = await getJSON('/api/session');
+    if (s.authed) return enter();
+  } catch (e) {}
+
+  $('#gate-sub').textContent = 'Вход в панель';
+  showPassword();
+}
+
+function showPassword() {
+  $('#login-form').hidden = false;
+}
+
+async function doPassword(ev) {
+  ev.preventDefault();
+  $('#gate-err').textContent = '';
+  const btn = $('#in-submit');
+  btn.disabled = true;
+  try {
+    await api('login', {
+      login: $('#in-login').value,
+      password: $('#in-pass').value,
     });
-    $("#login-pass").value = "";
-    showApp();
-  } catch (exc) {
-    err.textContent = exc.message;
+    return enter();
+  } catch (e) {
+    $('#gate-err').textContent = e.message;
   } finally {
     btn.disabled = false;
-    btn.textContent = "Войти";
   }
-});
+}
 
-$("#logout").addEventListener("click", async () => {
-  try { await post("logout"); } catch { /* всё равно уходим */ }
-  showLogin();
-});
+async function enter() {
+  $('#gate').hidden = true;
+  $('#app').hidden = false;
 
-/* ---------- опрос ---------- */
+  try {
+    S.config = await getJSON('/api/config');
+  } catch (e) {
+    S.config = { servers: [], tasks: [], tg: false };
+  }
+  fillForms();
+  renderWho();
+  await refresh();
+  startPolling();
+}
+
+function renderWho() {
+  const u = S.user;
+  const name = u ? (u.first_name || u.username || '') : (S.config && S.config.login) || '';
+  $('#who').textContent = name;
+  $('#m-login').textContent = (S.config && S.config.login) || '—';
+  $('#m-tg').textContent = u ? (u.username ? '@' + u.username : String(u.id)) : 'пароль';
+  $('#m-servers').textContent = String((S.config && S.config.servers || []).length);
+}
+
+/* ---------- формы ---------- */
+
+function fillForms() {
+  const servers = (S.config && S.config.servers) || [];
+  const tasks = (S.config && S.config.tasks) || ['lvl', 'quest', 'mine', 'factory', 'bus', 'farm', 'stop'];
+  const taskNames = {
+    lvl: 'Прокачка', quest: 'Квесты', mine: 'Шахта', factory: 'Завод',
+    bus: 'Автобус', farm: 'Ферма', stop: 'Без задачи',
+  };
+
+  const serverSel = $('#c-server');
+  serverSel.innerHTML = servers.length
+    ? servers.map((s) => `<option value="${esc(s)}">${esc(s)}</option>`).join('')
+    : '<option value="">нет списка серверов</option>';
+
+  const taskOpts = tasks.map(
+    (t) => `<option value="${esc(t)}">${esc(taskNames[t] || t)}</option>`
+  ).join('');
+  $('#c-task').innerHTML = taskOpts;
+  $('#s-task').innerHTML = taskOpts;
+
+  fillProxySelect();
+}
+
+function fillProxySelect() {
+  const saved = (S.vpn && S.vpn.saved) || [];
+  const nodes = (S.vpn && S.vpn.nodes) || [];
+  const opts = ['<option value="">Своё IP — без прокси</option>'];
+  saved.forEach((p) => {
+    opts.push(`<option value="${esc(p.proxy)}">${esc(p.name || p.proxy)}</option>`);
+  });
+  nodes.filter((n) => n.usable).forEach((n) => {
+    opts.push(`<option value="node:${esc(n.key)}">${esc(n.name)}</option>`);
+  });
+  $('#c-proxy').innerHTML = opts.join('');
+}
+
+/* ---------- обновление ---------- */
+
+async function refresh() {
+  try {
+    const st = await getJSON('/api/state');
+    S.bots = st.bots || [];
+    if (st.vpn && st.vpn.nodes) S.vpn = st.vpn;
+    setLive(true, st.live);
+    renderBots();
+    renderStats();
+    renderVpn();
+  } catch (e) {
+    setLive(false, false);
+  }
+}
+
+function setLive(on, live) {
+  const el = $('#live');
+  el.classList.toggle('dead', !on);
+  $('em', el).textContent = on ? (live ? 'живой' : 'снимок') : 'нет связи';
+}
 
 function startPolling() {
-  stopPolling();
-  // Живо, но не в лоб: 4 секунды — боту хватает, сети тоже.
-  pollTimer = setInterval(() => {
-    if (document.visibilityState === "visible") loadState(true);
+  if (S.timer) clearInterval(S.timer);
+  S.timer = setInterval(() => {
+    if (document.hidden) return;
+    refresh();
   }, 4000);
 }
 
-function stopPolling() {
-  if (pollTimer) clearInterval(pollTimer);
-  pollTimer = null;
-}
+/* ---------- отрисовка аккаунтов ---------- */
 
-document.addEventListener("visibilitychange", () => {
-  if (document.visibilityState === "visible" && !$("#app").classList.contains("hidden")) {
-    loadState(true);
-  }
-});
-
-async function loadState(quiet = false) {
-  try {
-    const fresh = await api("state");
-    // Состояние интерфейса живёт между опросами. Раньше state
-    // перезаписывался целиком, и всё, что выбрал руками — прокси,
-    // открытая страница узлов — слетало на следующем опросе.
-    state = {
-      ...fresh,
-      vpnPage: state.vpnPage,
-      pickBulk: state.pickBulk,
-      pickCreate: state.pickCreate,
-      pickLabels: state.pickLabels,
-      picker: state.picker,
-    };
-    render();
-    if (!quiet && state.live === false) {
-      toast("Бот не отвечает — показан последний снимок", "bad");
-    }
-  } catch (exc) {
-    if (exc.message !== "нужен вход") toast(exc.message, "bad");
-  }
-}
-
-/* ---------- отрисовка ---------- */
-
-const STATUS = {
-  on: ["В игре", "заспавн", "авторизован"],
-  wait: ["Ожидание", "Подключение", "очередь", "Очередь"],
-  bad: ["ЗАБАНЕН", "Забанен", "бан"],
-};
-
+/* Статусы бота — русские строки: «В игре (заспавнен)», «Очередь #3»,
+   «Подключение…», «Остановлен», «ЗАБАНЕН». Проверяем по подстрокам,
+   а не по точному равенству: строку с таймером целиком не сравнить. */
 function statusKind(bot) {
-  if (bot.banned) return "bad";
-  const s = String(bot.status || "");
-  if (STATUS.bad.some((k) => s.includes(k))) return "bad";
-  if (STATUS.on.some((k) => s.includes(k))) return "on";
-  if (STATUS.wait.some((k) => s.includes(k))) return "wait";
-  return "off";
+  if (bot.banned) return 'bad';
+  const s = String(bot.status || '').toLowerCase();
+  if (s.includes('бан')) return 'bad';
+  if (s.includes('в игре') || s.includes('игр')) return 'work';
+  if (s.includes('очеред') || s.includes('подключ') || s.includes('ожидан')) return 'online';
+  if (s.includes('ошибк') || s.includes('прокси не')) return 'bad';
+  return '';
 }
 
-function escapeHtml(text) {
-  return String(text ?? "").replace(/[&<>"']/g, (c) => (
-    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
-  ));
-}
-
-function render() {
-  const bots = state.bots || [];
-  const online = bots.filter((b) => statusKind(b) === "on").length;
-  const banned = bots.filter((b) => b.banned).length;
-  const vpn = state.vpn || {};
-  const usable = (vpn.summary && vpn.summary.usable) || 0;
-
-  $("#stats").innerHTML = [
-    ["Всего", bots.length, ""],
-    ["Онлайн", online, "ok"],
-    ["В бане", banned, banned ? "bad" : ""],
-    ["Узлов VPN", usable, usable ? "ok" : "warn"],
-  ].map(([k, v, cls]) =>
-    `<div class="stat glass"><div class="k">${k}</div><div class="v ${cls}">${v}</div></div>`
-  ).join("");
-
-  renderBots(bots);
-  // Опрос приходит раз в 4с и всегда с первой страницей. Если открыта
-  // другая — не сбиваем её, иначе пагинация сама себя закрывает.
-  if ((state.vpnPage || 1) <= 1) {
-    renderVpn(vpn);
-  } else {
-    renderVpnStatsOnly(vpn);
-  }
-  renderBulkProxy(vpn);
-  renderCreateProxy(vpn);
-  renderSettings();
-  pruneSelection();
-  renderBulk();
-}
-
-function renderBots(bots) {
-  const needle = filter.trim().toLowerCase();
-  const shown = needle
-    ? bots.filter((b) =>
-        String(b.nickname).toLowerCase().includes(needle) ||
-        String(b.server).toLowerCase().includes(needle) ||
-        String(b.id) === needle)
-    : bots;
-
-  $("#bots-count").textContent = `${shown.length} из ${bots.length}`;
-
-  if (!shown.length) {
-    $("#bots").innerHTML = `<div class="empty">${
-      bots.length ? "Ничего не найдено" : "Аккаунтов пока нет"
-    }</div>`;
-    return;
-  }
-
-  $("#bots").innerHTML = shown.map((b) => {
-    const kind = statusKind(b);
-    const running = kind === "on" || kind === "wait";
-    const id = Number(b.id);
-    const dis = busy.has(id) ? "disabled" : "";
-    const proxy = b.proxy ? shortProxy(b.proxy) : "свой IP";
-    const picked = selected.has(id) ? "checked" : "";
-
-    // Уровень и опыт. Опыт «до следующего» считается на сервере, здесь
-    // только показываем: цифры приходят из меню статистики, а не из
-    // реестра, поэтому всегда свежие.
-    const hasExp = b.exp_cur !== null && b.exp_cur !== undefined && b.exp_next;
-    const lvl = b.level_num ? `lvl ${b.level_num}` : "—";
-    const pct = hasExp ? Math.max(0, Math.min(100, Number(b.exp_percent) || 0)) : 0;
-    const expTitle = hasExp
-      ? `Опыт ${b.exp_cur} из ${b.exp_next}, до следующего уровня ${b.exp_left}`
-      : "Статистика ещё не запрашивалась";
-
-    return `
-      <div class="bot ${b.banned ? "banned" : ""} ${picked ? "picked" : ""}">
-        <label class="pick"><input type="checkbox" data-pick="${id}" ${picked} ${dis}></label>
-        <div class="id">${id}</div>
-        <div class="nick">${escapeHtml(b.nickname)}
-          <small>${escapeHtml(b.server || "")}</small></div>
-        <div class="cell"><span class="dot ${kind}"></span>${escapeHtml(b.status || "—")}</div>
-        <div class="cell lvl" title="${escapeHtml(expTitle)}">
-          <b>${escapeHtml(lvl)}</b>
-          ${hasExp ? `<small>${b.exp_cur}/${b.exp_next} · осталось ${b.exp_left}</small>
-          <i class="xp"><s style="width:${pct}%"></s></i>` : ""}
-        </div>
-        <div class="cell" title="${escapeHtml(lvlTitle(b))}">
-          ${escapeHtml(TASKS[b.task] || b.task || "—")}
-          ${lvlLine(b)}
-        </div>
-        <div class="cell" title="${escapeHtml(b.proxy || "")}">${escapeHtml(proxy)}</div>
-        <div class="acts">
-          ${b.banned
-            ? `<button class="icon-btn green" data-act="unban" data-id="${id}" ${dis} title="Снять бан">↺</button>`
-            : running
-              ? `<button class="icon-btn red" data-act="stop" data-id="${id}" ${dis} title="Стоп">■</button>`
-              : `<button class="icon-btn green" data-act="start" data-id="${id}" ${dis} title="Запустить">▶</button>`}
-          <button class="icon-btn" data-act="restart" data-id="${id}" ${dis} title="Перезапустить">⟳</button>
-          <button class="icon-btn red" data-act="delete" data-id="${id}" ${dis} title="Удалить">✕</button>
-        </div>
-      </div>`;
-  }).join("");
-}
-
-/* ---------- выделение ---------- */
-
-// Куда движок качки поставил бота. Показываем вокзал и точку, чтобы по
-// одной строке было видно, кто где стоит, а не просто «качается».
-function lvlPoint(b) {
-  const lvl = b.lvl || {};
-  const point = lvl.target;
-  if (!Array.isArray(point) || point.length < 2) return null;
-  return {
-    station: lvl.station || "",
-    index: Number.isInteger(lvl.target_index) ? lvl.target_index + 1 : null,
-    coords: `${Number(point[0]).toFixed(1)}, ${Number(point[1]).toFixed(1)}`,
-  };
-}
-
-function lvlLine(b) {
-  const p = lvlPoint(b);
-  if (!p) return "";
-  const num = p.index ? `точка ${p.index} · ` : "";
-  return `<small class="lvlpoint">${escapeHtml(num + p.coords)}</small>`;
-}
-
-function lvlTitle(b) {
-  const p = lvlPoint(b);
-  if (!p) return "";
-  return `${p.station}${p.index ? `, точка ${p.index}` : ""} (${p.coords})`;
+function isRunning(bot) {
+  const s = String(bot.status || '').toLowerCase();
+  if (!s) return false;
+  return !(s.includes('остановлен') || s.includes('отключен') || s.includes('бан'));
 }
 
 function visibleBots() {
-  const needle = filter.trim().toLowerCase();
-  const bots = state.bots || [];
-  return needle
-    ? bots.filter((b) =>
-        String(b.nickname).toLowerCase().includes(needle) ||
-        String(b.server).toLowerCase().includes(needle) ||
-        String(b.id) === needle)
-    : bots;
+  const q = S.query.toLowerCase();
+  return S.bots.filter((b) => {
+    if (S.filter === 'online' && !isRunning(b)) return false;
+    if (S.filter === 'offline' && isRunning(b)) return false;
+    if (S.filter === 'banned' && !b.banned) return false;
+    if (!q) return true;
+    return String(b.nickname || '').toLowerCase().includes(q)
+        || String(b.server || '').toLowerCase().includes(q);
+  });
 }
 
-function renderBulk() {
-  const bar = $("#bulk");
-  const count = selected.size;
-  bar.classList.toggle("hidden", count === 0);
-  $("#bulk-count").textContent = `Выбрано: ${count}`;
-  $("#pick-all").checked = count > 0 && count === visibleBots().length;
-  $("#pick-all").indeterminate = count > 0 && count < visibleBots().length;
+function renderStats() {
+  const all = S.bots.length;
+  const online = S.bots.filter((b) => isRunning(b)).length;
+  const banned = S.bots.filter((b) => b.banned).length;
+  $('#stat-row').innerHTML = `
+    <div class="stat"><b>${all}</b><span>всего</span></div>
+    <div class="stat"><b>${online}</b><span>в игре</span></div>
+    <div class="stat"><b>${banned}</b><span>бан</span></div>`;
 }
 
-function pruneSelection() {
-  const alive = new Set((state.bots || []).map((b) => Number(b.id)));
-  for (const id of Array.from(selected)) {
-    if (!alive.has(id)) selected.delete(id);
-  }
-}
+function renderBots() {
+  const list = $('#bots');
+  const bots = visibleBots();
+  $('#bots-empty').hidden = bots.length > 0;
+  list.innerHTML = '';
 
-function shortProxy(url) {
-  const m = String(url).match(/@?([\d.]+):(\d+)/);
-  return m ? `${m[1]}:${m[2]}` : String(url).slice(0, 24);
-}
+  bots.forEach((bot) => {
+    const kind = statusKind(bot);
+    const picked = S.picked.has(bot.id);
+    const el = document.createElement('div');
+    el.className = 'bot' + (picked ? ' picked' : '');
 
-// Выпадашка «прокси для выбранных»: сохранённые вручную плюс узлы пула.
-// Узлы с мостом тоже годятся — сервер сам поднимет sing-box и отдаст
-// локальный socks5.
-// Выбор прокси: один модальный список на оба места (массовая полоса и
-// форма создания). Раньше это были <select>, и на большом пуле они
-// превращались в простыню без поиска — а после пагинации узлов вообще
-// показывали только открытую страницу. Теперь список тянется с сервера
-// страницами, с поиском по имени, адресу и протоколу.
-const PICKER_LABELS = {
-  "": "— прокси не выбран —",
-  spread: "🎲 Рабочие из пула (вразброс)",
-  none: "🚫 Своё IP (сбросить)",
-};
+    const pos = Array.isArray(bot.position)
+      ? bot.position.map((v) => Number(v).toFixed(1)).join(', ')
+      : '';
+    const lvl = bot.lvl || {};
+    const line = [lvl.station, lvl.phase, lvl.report].filter(Boolean).join(' · ') || pos;
 
-function pickerValue(target) {
-  return target === "create"
-    ? (state.pickCreate ?? "spread")
-    : (state.pickBulk ?? "");
-}
+    el.innerHTML = `
+      <div class="bot-top">
+        <span class="dot ${kind}"></span>
+        <span class="bot-name">${esc(bot.nickname || '—')}</span>
+        <span class="bot-id">#${bot.id}</span>
+        <span class="bot-srv">${esc(bot.server || '')}</span>
+      </div>
+      <div class="bot-meta">
+        <span>ур. <b>${bot.level_num != null ? esc(bot.level_num) : '—'}</b>${
+          bot.exp_percent != null ? ` · ${esc(bot.exp_percent)}%` : ''}</span>
+        <span><b>${fmtMoney(bot.money)}</b></span>
+        <span>${esc(bot.task || '—')}</span>
+      </div>
+      ${line ? `<div class="bot-line">${esc(line)}</div>` : ''}
+      <div class="bot-acts">
+        <button class="btn" data-act="toggle">${isRunning(bot) ? '■ Стоп' : '▶ Старт'}</button>
+        <button class="btn" data-act="task">Задача</button>
+        <button class="btn" data-act="world">В мир</button>
+        <button class="btn" data-act="more">⋯</button>
+      </div>`;
 
-function pickerLabel(value) {
-  if (value in PICKER_LABELS) return PICKER_LABELS[value];
-  if (value.startsWith("px:")) return `⚡️ ${value.slice(3)}`;
-  if (value.startsWith("node:")) {
-    const known = (state.pickLabels || {})[value];
-    if (known) return known;
-    const node = ((state.vpn || {}).nodes || [])
-      .find((n) => n.key === value.slice(5));
-    return node ? `🟢 ${node.name}` : "🟢 узел пула";
-  }
-  return value;
-}
-
-function rememberLabel(value, label) {
-  state.pickLabels = { ...(state.pickLabels || {}), [value]: label };
-}
-
-function syncProxyButtons() {
-  const bulk = $("#bulk-proxy-btn");
-  if (bulk) {
-    const v = pickerValue("bulk");
-    bulk.textContent = v ? pickerLabel(v) : "🌐 Прокси";
-    bulk.classList.toggle("active", Boolean(v));
-  }
-  const create = $("#c-proxy-btn");
-  if (create) create.textContent = pickerLabel(pickerValue("create"));
-}
-
-// Заглушки под старые вызовы: узлы теперь живут в выборщике, а не в
-// выпадашке, но шапка панели по-прежнему обновляет счётчики.
-function renderBulkProxy() {
-  syncProxyButtons();
-}
-
-function renderCreateProxy() {
-  syncProxyButtons();
-}
-
-function openPicker(target) {
-  state.picker = { target, page: 1, search: "" };
-  $("#picker").classList.remove("hidden");
-  $("#picker-title").textContent = target === "create"
-    ? "Прокси для новых аккаунтов"
-    : "Прокси для выбранных";
-  $("#picker-search").value = "";
-  loadPicker();
-}
-
-function closePicker() {
-  $("#picker").classList.add("hidden");
-  state.picker = null;
-}
-
-async function loadPicker() {
-  const pick = state.picker;
-  if (!pick) return;
-  const list = $("#picker-list");
-  list.innerHTML = `<div class="empty">Загружаю…</div>`;
-  try {
-    const res = await post("vpn_status", {
-      page: pick.page,
-      per_page: 12,
-      search: pick.search,
+    if (S.selectMode) {
+      el.onclick = (ev) => {
+        if (ev.target.closest('button')) return;
+        togglePick(bot.id);
+      };
+    }
+    $$('button', el).forEach((btn) => {
+      btn.onclick = (ev) => {
+        ev.stopPropagation();
+        if (S.selectMode && btn.dataset.act !== 'more') {
+          togglePick(bot.id);
+          return;
+        }
+        onBotAction(bot, btn.dataset.act);
+      };
     });
-    renderPicker(res.result || {});
-  } catch (exc) {
-    list.innerHTML = `<div class="empty">${escapeHtml(exc.message)}</div>`;
-  }
+
+    list.appendChild(el);
+  });
 }
 
-function renderPicker(vpn) {
-  const pick = state.picker;
-  if (!pick) return;
-  const nodes = vpn.nodes || [];
-  const saved = vpn.saved || [];
-  const current = pickerValue(pick.target);
-  const parts = [];
-
-  // Базовые варианты — только на первой странице без поиска: в поиске
-  // они мешают и не относятся к запросу.
-  if (pick.page === 1 && !pick.search) {
-    const base = pick.target === "create"
-      ? ["spread", "none"]
-      : ["none"];
-    for (const value of base) {
-      parts.push(pickerRow(value, PICKER_LABELS[value], "", current));
-    }
-    for (const item of saved) {
-      parts.push(pickerRow(`px:${item.name}`, `⚡️ ${item.name}`,
-        "сохранённый", current));
-    }
-  }
-
-  for (const node of nodes) {
-    const banned = node.status === "banned";
-    const label = node.usable ? "рабочий" : banned ? "забанен"
-      : node.alive ? "нужен клиент" : "мёртвый";
-    const kind = node.usable ? "ok" : node.alive && !banned ? "warn" : "bad";
-    const dis = node.usable && !banned ? "" : "disabled";
-    parts.push(`
-      <button class="pick-row" type="button" data-pick-node="${escapeHtml(node.key)}"
-              ${dis} ${current === `node:${node.key}` ? 'data-on="1"' : ""}>
-        <span class="dot ${kind === "ok" ? "on" : kind === "warn" ? "wait" : "bad"}"></span>
-        <span class="pick-main">
-          <span class="pick-name">${escapeHtml(node.name || "без имени")}</span>
-          <span class="pick-sub">${escapeHtml(node.address || "")}${
-            node.latency ? ` · ${node.latency}мс` : ""
-          }</span>
-        </span>
-        <span class="badge ${kind}">${label}</span>
-      </button>`);
-  }
-
-  if (!parts.length) {
-    parts.push(`<div class="empty">${
-      pick.search ? "Ничего не нашлось" : "Узлов нет"
-    }</div>`);
-  }
-  $("#picker-list").innerHTML = parts.join("");
-  renderPickerPager(vpn);
-}
-
-function pickerRow(value, label, hint, current) {
-  return `
-    <button class="pick-row" type="button" data-pick-value="${escapeHtml(value)}"
-            ${current === value ? 'data-on="1"' : ""}>
-      <span class="pick-main">
-        <span class="pick-name">${escapeHtml(label)}</span>
-        ${hint ? `<span class="pick-sub">${escapeHtml(hint)}</span>` : ""}
-      </span>
-      <span class="pick-check">✓</span>
-    </button>`;
-}
-
-function renderPickerPager(vpn) {
-  const box = $("#picker-pager");
-  const page = vpn.page || 1;
-  const pages = vpn.pages || 1;
-  const total = vpn.total ?? 0;
-  if (pages <= 1) {
-    box.innerHTML = total ? `<span class="pager-info">Узлов: ${total}</span>` : "";
-    return;
-  }
-  const btn = (p, label, dis) =>
-    `<button class="btn btn-sm" type="button" data-pickpage="${p}" ${
-      dis ? "disabled" : ""
-    }>${label}</button>`;
-  box.innerHTML = [
-    btn(1, "«", page === 1),
-    btn(page - 1, "‹", page === 1),
-    `<span class="pager-info">${page} / ${pages} · узлов ${total}</span>`,
-    btn(page + 1, "›", page === pages),
-    btn(pages, "»", page === pages),
-  ].join("");
-}
-
-function choosePickerValue(value, label) {
-  const pick = state.picker;
-  if (!pick) return;
-  if (label) rememberLabel(value, label);
-  if (pick.target === "create") state.pickCreate = value;
-  else state.pickBulk = value;
-  syncProxyButtons();
-  closePicker();
-}
-
-function renderSettings() {
-  if (!$("#s-pass").value && state.settings) {
-    $("#s-pass").value = state.settings.base_password || "";
-  }
-  if (state.settings && $("#s-task").dataset.init !== "1") {
-    $("#s-task").value = state.settings.default_task || "lvl";
-    $("#s-task").dataset.init = "1";
-  }
+function fmtMoney(v) {
+  const n = Number(v || 0);
+  if (!n) return '0';
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(Math.round(n));
 }
 
 /* ---------- действия ---------- */
 
-/* Галочки выделения. Отдельным обработчиком: change не всплывает так,
-   как click, и вешать его на документ надёжнее, чем на каждую строку. */
-document.addEventListener("change", (e) => {
-  const pick = e.target.closest("[data-pick]");
-  if (pick) {
-    const id = Number(pick.dataset.pick);
-    if (pick.checked) selected.add(id); else selected.delete(id);
-    const row = pick.closest(".bot");
-    if (row) row.classList.toggle("picked", pick.checked);
-    renderBulk();
-    return;
-  }
-  if (e.target.id === "pick-all") {
-    const all = e.target.checked;
-    visibleBots().forEach((b) => {
-      const id = Number(b.id);
-      if (all) selected.add(id); else selected.delete(id);
-    });
-    render();
-  }
-});
-
-$("#bulk-clear").addEventListener("click", () => {
-  selected.clear();
-  render();
-});
-
-document.addEventListener("click", async (e) => {
-  const bulkBtn = e.target.closest("[data-bulk]");
-  if (bulkBtn) {
-    const act = bulkBtn.dataset.bulk;
-    const ids = Array.from(selected);
-    if (!ids.length) return;
-    if (act === "delete" && !confirm(`Удалить ${ids.length} аккаунт(ов)?`)) return;
-
-    // Прокси для выбранных берём из выпадашки: имя сохранённого или
-    // ключ узла пула. Пусто — ничего не делаем, чтобы не сбросить
-    // случайно настроенные прокси.
-    let payload = { ids };
-    let cmd;
-    if (act === "proxy") {
-      const value = state.pickBulk || "";
-      if (!value) {
-        toast("Выбери прокси в списке", "bad");
-        return;
-      }
-      cmd = "proxy_many";
-      if (value === "none") payload.proxy = "none";
-      else if (value.startsWith("node:")) payload.node = value.slice(5);
-      else if (value.startsWith("px:")) {
-        const item = ((state.vpn || {}).saved || [])
-          .find((p) => p.name === value.slice(3));
-        if (!item) {
-          toast("Сохранённый прокси не найден", "bad");
-          return;
-        }
-        payload.proxy = item.proxy;
-      }
-    } else if (act === "goal") {
-      const raw = (($("#bulk-goal") || {}).value || "").trim();
-      if (raw === "") {
-        toast("Введи целевой уровень (0 — снять)", "bad");
-        return;
-      }
-      cmd = "goal_many";
-      payload.level = Number(raw) || 0;
-    } else {
-      // Старт/стоп/удаление идут пачкой, статистика и вход в мир —
-      // своими командами: они работают в фоне и не блокируют мост.
-      cmd = act === "stats" ? "stats"
-        : act === "real_world" ? "real_world"
-        : act + "_many";
-    }
-
-    bulkBtn.disabled = true;
-    try {
-      const res = await post(cmd, payload);
-      const done = (res.result || {}).count ?? ids.length;
-      toast(
-        act === "delete" ? `Удаляю: ${done}`
-          : act === "stats" ? `Запросил статистику: ${done}`
-          : act === "proxy" ? `Прокси применяю: ${done}`
-          : act === "goal" ? `Цель ${payload.level || 0} lvl: ${done}`
-          : `В очереди: ${done}`,
-        "ok",
-      );
-      if (act === "delete") selected.clear();
-      await loadState(true);
-    } catch (exc) {
-      toast(exc.message, "bad");
-    } finally {
-      bulkBtn.disabled = false;
-    }
-    return;
-  }
-
-  const botBtn = e.target.closest("[data-act]");
-  if (botBtn) {
-    const id = Number(botBtn.dataset.id);
-    const act = botBtn.dataset.act;
-    if (act === "delete" && !confirm(`Удалить аккаунт #${id}?`)) return;
-    busy.add(id);
-    render();
-    try {
-      await post(act, { id });
-      toast("Готово", "ok");
-      await loadState(true);
-    } catch (exc) {
-      toast(exc.message, "bad");
-    } finally {
-      busy.delete(id);
-      render();
-    }
-    return;
-  }
-
-  const pageBtn = e.target.closest("[data-nodepage]");
-  if (pageBtn) {
-    pageBtn.disabled = true;
-    await loadVpnPage(Number(pageBtn.dataset.nodepage) || 1);
-    pageBtn.disabled = false;
-    return;
-  }
-
-  const banBtn = e.target.closest("[data-ban]");
-  if (banBtn) {
-    banBtn.disabled = true;
-    try {
-      await post("vpn_ban", { key: banBtn.dataset.ban, reason: "вручную" });
-      toast("Адрес забанен и больше не выдаётся", "ok");
-      await loadVpnPage(state.vpnPage || 1);
-    } catch (exc) {
-      toast(exc.message, "bad");
-    } finally {
-      banBtn.disabled = false;
-    }
-    return;
-  }
-
-  const unbanBtn = e.target.closest("[data-unban]");
-  if (unbanBtn) {
-    unbanBtn.disabled = true;
-    try {
-      await post("vpn_unban", { key: unbanBtn.dataset.unban });
-      toast("Бан снят", "ok");
-      await loadVpnPage(state.vpnPage || 1);
-    } catch (exc) {
-      toast(exc.message, "bad");
-    } finally {
-      unbanBtn.disabled = false;
-    }
-    return;
-  }
-
-  const nodeBtn = e.target.closest("[data-cluster]");
-  if (nodeBtn) {
-    nodeBtn.disabled = true;
-    try {
-      const res = await post("vpn_use", { key: nodeBtn.dataset.cluster });
-      toast("Роздано ботам: " + ((res.result || {}).applied || []).length, "ok");
-      await loadState(true);
-    } catch (exc) {
-      toast(exc.message, "bad");
-    } finally {
-      nodeBtn.disabled = false;
-    }
-  }
-});
-
-$("#refresh").addEventListener("click", () => loadState());
-
-/* ---------- выборщик прокси ---------- */
-
-document.addEventListener("click", (e) => {
-  const open = e.target.closest("[data-pick]");
-  if (open) {
-    e.preventDefault();
-    openPicker(open.dataset.pick);
-    return;
-  }
-  if (e.target.id === "picker-close" || e.target.id === "picker") {
-    closePicker();
-    return;
-  }
-  const val = e.target.closest("[data-pick-value]");
-  if (val) {
-    choosePickerValue(val.dataset.pickValue);
-    return;
-  }
-  const node = e.target.closest("[data-pick-node]");
-  if (node) {
-    const name = (node.querySelector(".pick-name") || {}).textContent || "";
-    choosePickerValue(`node:${node.dataset.pickNode}`,
-      `🟢 ${name.trim()}`.trim());
-    return;
-  }
-  const page = e.target.closest("[data-pickpage]");
-  if (page && state.picker) {
-    state.picker.page = Number(page.dataset.pickpage) || 1;
-    loadPicker();
-  }
-});
-
-let pickerSearchTimer = null;
-document.addEventListener("input", (e) => {
-  if (e.target.id !== "picker-search" || !state.picker) return;
-  clearTimeout(pickerSearchTimer);
-  const text = e.target.value;
-  pickerSearchTimer = setTimeout(() => {
-    if (!state.picker) return;
-    state.picker.search = text;
-    state.picker.page = 1;
-    loadPicker();
-  }, 260);
-});
-
-document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape" && state.picker) closePicker();
-});
-
-$("#vpn-refresh").addEventListener("click", async (e) => {
-  const btn = e.target;
-  btn.disabled = true;
-  btn.textContent = "Проверяю…";
+async function onBotAction(bot, act) {
   try {
-    await post("vpn_refresh");
-    toast("Проверка запущена", "ok");
-    await loadState(true);
-  } catch (exc) {
-    toast(exc.message, "bad");
-  } finally {
-    btn.disabled = false;
-    btn.textContent = "Перепроверить";
+    if (act === 'toggle') {
+      const running = isRunning(bot);
+      await api(running ? 'stop' : 'start', { id: bot.id });
+      good(running ? 'Остановлен' : 'Запущен');
+      return refresh();
+    }
+    if (act === 'task') {
+      const tasks = (S.config && S.config.tasks) || [];
+      const names = {
+        lvl: 'Прокачка', quest: 'Квесты', mine: 'Шахта', factory: 'Завод',
+        bus: 'Автобус', farm: 'Ферма', stop: 'Без задачи',
+      };
+      const t = await choose('Задача для ' + (bot.nickname || '#' + bot.id),
+        tasks.map((v) => ({ label: names[v] || v, value: v })));
+      if (!t) return;
+      await api('task', { id: bot.id, task: t });
+      good('Задача: ' + (names[t] || t));
+      return refresh();
+    }
+    if (act === 'world') {
+      await api('real_world', { id: bot.id });
+      good('Отправляю в мир');
+      return refresh();
+    }
+    if (act === 'more') {
+      const pick = await choose('Ещё — ' + (bot.nickname || '#' + bot.id), [
+        { label: 'Перезапустить', value: 'restart' },
+        { label: 'Сменить прокси', value: 'proxy' },
+        { label: 'Цель по уровню', value: 'goal' },
+        { label: 'Телепорт по координатам', value: 'goto' },
+        { label: 'Снять бан', value: 'unban' },
+        { label: 'Удалить аккаунт', value: 'delete' },
+      ]);
+      if (!pick) return;
+      return onBotAction(bot, pick);
+    }
+    if (act === 'restart') {
+      await api('restart', { id: bot.id });
+      good('Перезапущен');
+      return refresh();
+    }
+    if (act === 'proxy') {
+      const saved = S.vpn.saved || [];
+      const opts = [{ label: 'Своё IP — без прокси', value: 'none' }];
+      saved.forEach((p) => opts.push({ label: p.name || p.proxy, value: p.proxy }));
+      (S.vpn.nodes || []).filter((n) => n.usable).forEach(
+        (n) => opts.push({ label: n.name, note: n.address, value: 'node:' + n.key }));
+      const v = await choose('Прокси', opts);
+      if (!v) return;
+      if (v.startsWith('node:')) {
+        await api('proxy_bot', { id: bot.id, node: v.slice(5) });
+      } else {
+        await api('proxy_bot', { id: bot.id, proxy: v });
+      }
+      good('Прокси применён');
+      return refresh();
+    }
+    if (act === 'goal') {
+      const f = await askForm('Цель по уровню', [
+        { name: 'level', label: 'Уровень, 0 — снять', type: 'number', value: 0 },
+      ]);
+      if (!f) return;
+      await api('goal_many', { ids: [bot.id], level: Number(f.level) });
+      good('Цель задана');
+      return refresh();
+    }
+    if (act === 'goto') {
+      const f = await askForm('Телепорт', [
+        { name: 'x', label: 'X', type: 'number' },
+        { name: 'y', label: 'Y', type: 'number' },
+        { name: 'z', label: 'Z', type: 'number' },
+      ]);
+      if (!f) return;
+      await api('goto', { id: bot.id, x: Number(f.x), y: Number(f.y), z: Number(f.z) });
+      good('Телепорт отправлен');
+      return refresh();
+    }
+    if (act === 'unban') {
+      await api('unban', { id: bot.id });
+      good('Разбан отправлен');
+      return refresh();
+    }
+    if (act === 'delete') {
+      const sure = await choose('Удалить ' + (bot.nickname || '#' + bot.id) + '?', [
+        { label: 'Да, удалить', value: true },
+      ]);
+      if (!sure) return;
+      await api('delete', { id: bot.id });
+      S.picked.delete(bot.id);
+      good('Удалён');
+      return refresh();
+    }
+  } catch (e) {
+    fail(e);
   }
-});
+}
 
-$("#bots-search").addEventListener("input", (e) => {
-  filter = e.target.value;
-  renderBots(state.bots || []);
-});
+/* ---------- выделение и массовые ---------- */
 
-document.querySelectorAll(".tab").forEach((tab) => {
-  tab.addEventListener("click", () => {
-    document.querySelectorAll(".tab").forEach((t) => t.classList.remove("active"));
-    tab.classList.add("active");
-    ["accounts", "vpn", "create", "settings"].forEach((name) => {
-      $("#tab-" + name).classList.toggle("hidden", name !== tab.dataset.tab);
+function togglePick(id) {
+  if (S.picked.has(id)) S.picked.delete(id);
+  else S.picked.add(id);
+  renderBots();
+  renderBulk();
+}
+
+function renderBulk() {
+  const bar = $('#bulkbar');
+  const n = S.picked.size;
+  bar.hidden = !(S.selectMode && n > 0);
+  $('#bulk-count').textContent = 'Выбрано: ' + n;
+}
+
+async function bulk(action) {
+  const ids = [...S.picked];
+  if (!ids.length) return toast('Никого не выбрала', 'bad');
+  try {
+    if (action === 'goal_many') {
+      const f = await askForm('Цель по уровню', [
+        { name: 'level', label: 'Уровень, 0 — снять', type: 'number', value: 0 },
+      ]);
+      if (!f) return;
+      await api('goal_many', { ids, level: Number(f.level) });
+    } else if (action === 'delete_many') {
+      const sure = await choose(`Удалить ${ids.length} аккаунтов?`, [
+        { label: 'Да, удалить', value: true },
+      ]);
+      if (!sure) return;
+      await api('delete_many', { ids });
+      S.picked.clear();
+    } else {
+      await api(action, { ids });
+    }
+    good('Готово');
+    renderBulk();
+    refresh();
+  } catch (e) {
+    fail(e);
+  }
+}
+
+/* ---------- прокси ---------- */
+
+function renderVpn() {
+  const v = S.vpn || {};
+  const sum = v.summary || {};
+  $('#vpn-stats').innerHTML = `
+    <div class="stat"><b>${sum.total != null ? sum.total : (v.total || 0)}</b><span>узлов</span></div>
+    <div class="stat"><b>${sum.usable != null ? sum.usable : 0}</b><span>рабочих</span></div>
+    <div class="stat"><b>${(v.saved || []).length}</b><span>своих</span></div>`;
+
+  const box = $('#nodes');
+  box.innerHTML = '';
+  const nodes = v.nodes || [];
+  if (!nodes.length) {
+    box.innerHTML = '<div class="empty">Узлов нет. Добавь подписку.</div>';
+  }
+  nodes.forEach((n) => {
+    const el = document.createElement('div');
+    el.className = 'node';
+    el.innerHTML = `
+      <span class="dot ${n.usable ? 'online' : (n.alive ? 'work' : '')}"></span>
+      <div class="node-main">
+        <div class="node-name">${esc(n.name)}</div>
+        <div class="node-sub">${esc(n.protocol || '')} · ${esc(n.address || '')}</div>
+      </div>
+      <span class="node-lat">${n.latency ? n.latency + ' мс' : ''}</span>
+      <button class="icon" data-act="use">✓</button>`;
+    $$('button', el).forEach((b) => {
+      b.onclick = async () => {
+        try {
+          await api('vpn_use', { key: n.key });
+          good('Узел применён');
+        } catch (e) { fail(e); }
+      };
     });
+    box.appendChild(el);
   });
-});
+
+  const pages = v.pages || 1;
+  const page = v.page || 1;
+  const pager = $('#vpn-pager');
+  pager.innerHTML = '';
+  if (pages > 1) {
+    pager.innerHTML = `<button id="pv">←</button><span>${page} / ${pages}</span><button id="nx">→</button>`;
+    $('#pv', pager).onclick = () => { S.vpnPage = Math.max(1, page - 1); loadVpn(); };
+    $('#nx', pager).onclick = () => { S.vpnPage = Math.min(pages, page + 1); loadVpn(); };
+  }
+  fillProxySelect();
+}
+
+async function loadVpn() {
+  try {
+    const r = await api('vpn_status', {
+      page: S.vpnPage,
+      per_page: 24,
+      search: S.vpnQuery,
+      only_usable: S.vpnUsable,
+    });
+    S.vpn = (r.result && r.result.nodes) ? r.result : (r.result || S.vpn);
+    renderVpn();
+  } catch (e) {
+    fail(e);
+  }
+}
 
 /* ---------- создание ---------- */
 
-function fillServers() {
-  const sel = $("#c-server");
-  sel.innerHTML = `<option value="">— выбери сервер —</option>` +
-    SERVERS.map((s) => `<option value="${s}">${s}</option>`).join("");
-}
+async function onCreate(ev) {
+  ev.preventDefault();
+  const server = $('#c-server').value;
+  if (!server) return toast('Нет сервера', 'bad');
+  const count = Math.max(1, Math.min(50, Number($('#c-count').value) || 1));
+  const proxy = $('#c-proxy').value;
+  const body = {
+    server,
+    count,
+    password: $('#c-pass').value.trim(),
+    task: $('#c-task').value,
+  };
+  if (proxy.startsWith('node:')) body.node = proxy.slice(5);
+  else if (proxy) body.proxy = proxy;
 
-$("#create-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const btn = $("#c-submit");
-  const count = Math.max(1, Number($("#c-count").value) || 1);
-  const choice = state.pickCreate || "spread";
-  // Значение из выпадашки переводим в то, что понимает сервер:
-  // px:<имя> -> строка сохранённого, node:<ключ> -> узел пула.
-  const payloadProxy = { proxy: choice };
-  if (choice.startsWith("px:")) {
-    const item = ((state.vpn || {}).saved || [])
-      .find((p) => p.name === choice.slice(3));
-    payloadProxy.proxy = item ? item.proxy : "none";
-  } else if (choice.startsWith("node:")) {
-    payloadProxy.proxy = "";
-    payloadProxy.node = choice.slice(5);
-  }
+  const btn = $('#c-go');
   btn.disabled = true;
-  btn.textContent = "Создаю…";
+  btn.textContent = 'Создаю…';
   try {
-    if (count > 1) {
-      // Партия: ник не задаётся — при десятке одинаковых имён сервер
-      // всё равно перегенерирует занятые.
-      const res = await post("add_many", {
-        server: $("#c-server").value,
-        count,
-        password: $("#c-pass").value.trim(),
-        task: $("#c-task").value,
-        ...payloadProxy,
-      });
-      const r = res.result || {};
-      toast(
-        `Создано ${r.count ?? 0} · с прокси ${r.with_proxy ?? 0}`,
-        "ok",
-      );
-    } else {
-      const res = await post("add", {
-        server: $("#c-server").value,
-        nickname: $("#c-nick").value.trim(),
-        password: $("#c-pass").value.trim(),
-        task: $("#c-task").value,
-        ...payloadProxy,
-      });
-      const r = res.result || {};
-      toast(`Создан ${r.nickname || ""} (#${r.id ?? "?"})`, "ok");
-      $("#c-nick").value = "";
-    }
-    await loadState(true);
-  } catch (exc) {
-    toast(exc.message, "bad");
+    if (count > 1) await api('add_many', { ...body, count });
+    else await api('add', { ...body, nickname: $('#c-nick').value.trim() });
+    good(count > 1 ? `Создаю ${count}` : 'Аккаунт создан');
+    $('#c-nick').value = '';
+    refresh();
+  } catch (e) {
+    fail(e);
   } finally {
     btn.disabled = false;
-    btn.textContent = "Создать";
+    btn.textContent = 'Создать';
   }
-});
+}
 
 /* ---------- настройки ---------- */
 
-$("#settings-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const btn = $("#s-submit");
-  btn.disabled = true;
+async function onSettings(ev) {
+  ev.preventDefault();
   try {
-    await post("settings", {
-      base_password: $("#s-pass").value.trim(),
-      default_task: $("#s-task").value,
+    const r = await api('settings', {
+      base_password: $('#s-pass').value.trim(),
+      default_task: $('#s-task').value,
     });
-    toast("Сохранено", "ok");
-  } catch (exc) {
-    toast(exc.message, "bad");
-  } finally {
-    btn.disabled = false;
+    const res = r.result || {};
+    if (res.base_password) $('#s-pass').value = res.base_password;
+    good('Сохранено');
+  } catch (e) {
+    fail(e);
   }
-});
+}
 
-/* ---------- старт ---------- */
-
-(async () => {
-  fillServers();
+async function loadSettings() {
   try {
-    const s = await api("session");
-    if (s.authed) showApp(); else showLogin();
-  } catch {
-    showLogin();
-  }
-})();
+    const r = await api('settings', {});
+    const res = r.result || {};
+    if (res.base_password) $('#s-pass').value = res.base_password;
+    if (res.default_task) $('#s-task').value = res.default_task;
+  } catch (e) {}
+}
+
+/* ---------- навигация ---------- */
+
+function showView(name) {
+  $$('.view').forEach((v) => { v.hidden = v.dataset.view !== name; });
+  $$('.dock-btn').forEach((b) => b.classList.toggle('on', b.dataset.view === name));
+  if (name === 'proxy') loadVpn();
+  if (name === 'more') loadSettings();
+}
+
+/* ---------- привязки ---------- */
+
+function wire() {
+  $('#login-form').onsubmit = doPassword;
+
+  $$('.dock-btn').forEach((b) => {
+    b.onclick = () => showView(b.dataset.view);
+  });
+
+  $('#btn-refresh').onclick = () => { refresh(); toast('Обновлено'); };
+
+  $('#q').oninput = (e) => { S.query = e.target.value; renderBots(); };
+
+  $$('#filters .chip').forEach((c) => {
+    c.onclick = () => {
+      S.filter = c.dataset.filter;
+      $$('#filters .chip').forEach((x) => x.classList.toggle('on', x === c));
+      renderBots();
+    };
+  });
+
+  $('#btn-select').onclick = () => {
+    S.selectMode = !S.selectMode;
+    if (!S.selectMode) S.picked.clear();
+    $('#btn-select').classList.toggle('on', S.selectMode);
+    $('#btn-select').textContent = S.selectMode ? 'Готово' : 'Выбрать';
+    renderBots();
+    renderBulk();
+  };
+
+  $('#bulk-x').onclick = () => {
+    S.picked.clear();
+    renderBots();
+    renderBulk();
+  };
+
+  $$('[data-bulk]').forEach((b) => {
+    b.onclick = () => bulk(b.dataset.bulk);
+  });
+
+  $('#vpn-q').oninput = (e) => { S.vpnQuery = e.target.value; S.vpnPage = 1; };
+  $('#vpn-q').onchange = () => loadVpn();
+  $('#vpn-refresh').onclick = async () => {
+    try { await api('vpn_refresh', {}); good('Проверяю'); loadVpn(); }
+    catch (e) { fail(e); }
+  };
+  $('#vpn-usable').onclick = (e) => {
+    S.vpnUsable = !S.vpnUsable;
+    e.target.classList.toggle('on', S.vpnUsable);
+    S.vpnPage = 1;
+    loadVpn();
+  };
+  $('#vpn-sub').onclick = async () => {
+    const f = await askForm('Новая подписка', [
+      { name: 'name', label: 'Название', value: 'подписка' },
+      { name: 'url', label: 'Ссылка на подписку', placeholder: 'https://…' },
+    ]);
+    if (!f || !f.url) return;
+    try {
+      await api('vpn_sub_add', { name: f.name, url: f.url });
+      good('Подписка добавлена');
+      loadVpn();
+    } catch (e) { fail(e); }
+  };
+
+  $('#create-form').onsubmit = onCreate;
+  $('#settings-form').onsubmit = onSettings;
+
+  $('#btn-logout').onclick = async () => {
+    try { await api('logout', {}); } catch (e) {}
+    location.reload();
+  };
+
+  $('#sheet-wrap').onclick = (e) => {
+    if (e.target.id === 'sheet-wrap') closeSheet();
+  };
+
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) refresh();
+  });
+}
+
+wire();
+boot();

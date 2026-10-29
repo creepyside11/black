@@ -2,200 +2,204 @@
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#08060a">
-<title>RakCRMP — панель управления</title>
-<link rel="icon" href="/logo.svg" type="image/svg+xml">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0a0b0d">
+<meta name="color-scheme" content="dark">
+<title>RakCRMP</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
 
-<!-- ВХОД -->
-<div id="login" class="login-wrap hidden">
-  <form class="login-card glass" id="login-form" autocomplete="on">
-    <img src="/logo.svg" alt="Black Russia">
+<div class="aurora" aria-hidden="true"><i></i><i></i><i></i></div>
+
+<!-- ЭКРАН ВХОДА -->
+<div id="gate" class="gate">
+  <div class="gate-card glass">
+    <div class="mark">
+      <svg viewBox="0 0 32 32" aria-hidden="true">
+        <path d="M6 22V10l10 8 10-8v12" fill="none" stroke="currentColor" stroke-width="2.2"
+              stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </div>
     <h1>RakCRMP</h1>
-    <div class="sub">панель управления фермой</div>
+    <p class="gate-sub" id="gate-sub">Проверяю вход через Telegram…</p>
 
-    <div class="field">
-      <label for="login-name">Логин</label>
-      <input id="login-name" name="login" type="text" autocomplete="username"
-             spellcheck="false" autocapitalize="off" required>
-    </div>
-    <div class="field">
-      <label for="login-pass">Пароль</label>
-      <input id="login-pass" name="password" type="password"
-             autocomplete="current-password" required>
-    </div>
+    <form id="login-form" class="gate-form" hidden>
+      <label class="fld">
+        <span>Логин</span>
+        <input id="in-login" type="text" autocomplete="username"
+               spellcheck="false" autocapitalize="off" required>
+      </label>
+      <label class="fld">
+        <span>Пароль</span>
+        <input id="in-pass" type="password" autocomplete="current-password" required>
+      </label>
+      <button class="btn btn-solid" type="submit" id="in-submit">Войти</button>
+    </form>
 
-    <div class="err" id="login-err"></div>
-    <button class="btn btn-red btn-block" type="submit" id="login-btn">Войти</button>
-  </form>
+    <div class="gate-err" id="gate-err"></div>
+  </div>
 </div>
 
-<!-- ПАНЕЛЬ -->
-<div id="app" class="shell hidden">
-  <header class="topbar glass">
-    <img src="/logo.svg" alt="Black Russia">
-    <div class="brand">
+<!-- ПРИЛОЖЕНИЕ -->
+<div id="app" class="app" hidden>
+  <header class="bar glass">
+    <div class="bar-l">
       <b>RakCRMP</b>
-      <span>BLACK RUSSIA FARM</span>
+      <span class="live" id="live"><i></i><em>связь</em></span>
     </div>
-    <div class="spacer"></div>
-    <a class="tg-link" href="https://t.me/an0ym" target="_blank" rel="noopener">
-      ✈ <span>Telegram</span>
-    </a>
-    <button class="icon-btn" id="logout" title="Выйти">⏻</button>
+    <div class="bar-r">
+      <span class="who" id="who"></span>
+      <button class="icon" id="btn-refresh" title="Обновить">↻</button>
+    </div>
   </header>
 
-  <nav class="tabs">
-    <button class="tab active" data-tab="accounts">Аккаунты</button>
-    <button class="tab" data-tab="vpn">Прокси и VPN</button>
-    <button class="tab" data-tab="create">Создание</button>
-    <button class="tab" data-tab="settings">Настройки</button>
-  </nav>
+  <main id="views">
 
-  <!-- АККАУНТЫ -->
-  <section id="tab-accounts">
-    <div class="stats" id="stats"></div>
+    <!-- АККАУНТЫ -->
+    <section class="view" data-view="accounts">
+      <div class="stat-row" id="stat-row"></div>
 
-    <div class="panel glass">
-      <div class="panel-head">
-        <label class="check-all" title="Выделить всех">
-          <input type="checkbox" id="pick-all">
-        </label>
-        <h2>Аккаунты</h2>
-        <span class="count" id="bots-count"></span>
-        <div class="spacer"></div>
-        <input class="search" id="bots-search" placeholder="Поиск по нику или серверу">
-        <button class="btn btn-sm" id="refresh">Обновить</button>
+      <div class="toolbar">
+        <input class="search" id="q" type="search" placeholder="Ник или сервер" autocomplete="off">
+        <button class="chip-btn" id="btn-select" title="Выделить">Выбрать</button>
+      </div>
+      <div class="chips" id="filters">
+        <button class="chip on" data-filter="all">Все</button>
+        <button class="chip" data-filter="online">В игре</button>
+        <button class="chip" data-filter="offline">Офлайн</button>
+        <button class="chip" data-filter="banned">Бан</button>
       </div>
 
-      <div class="bulk hidden" id="bulk">
-        <span class="bulk-count" id="bulk-count">Выбрано: 0</span>
-        <button class="btn btn-sm green" data-bulk="start">▶ Запустить</button>
-        <button class="btn btn-sm" data-bulk="stop">■ Остановить</button>
-        <button class="btn btn-sm" data-bulk="stats">↻ Статистика</button>
-        <button class="btn btn-sm" data-bulk="real_world">◎ В мир</button>
-        <button class="btn btn-sm red" data-bulk="delete">✕ Удалить</button>
-        <button class="btn btn-sm proxy-pick" id="bulk-proxy-btn"
-                data-pick="bulk" title="Прокси для выбранных">🌐 Прокси</button>
-        <button class="btn btn-sm" data-bulk="proxy">Применить</button>
-        <input class="bulk-goal" id="bulk-goal" type="number" min="0" max="200"
-               placeholder="цель" title="Целевой уровень, 0 — снять">
-        <button class="btn btn-sm" data-bulk="goal">🎯 Цель</button>
-        <div class="spacer"></div>
-        <button class="btn btn-sm" id="bulk-clear">Снять</button>
+      <div id="bots" class="list"></div>
+      <div class="empty" id="bots-empty" hidden>Пусто. Создай аккаунт на вкладке «Создать».</div>
+    </section>
+
+    <!-- ПРОКСИ -->
+    <section class="view" data-view="proxy" hidden>
+      <div class="stat-row" id="vpn-stats"></div>
+
+      <div class="toolbar">
+        <input class="search" id="vpn-q" type="search" placeholder="Имя, адрес, протокол" autocomplete="off">
+        <button class="chip-btn" id="vpn-refresh">Проверить</button>
+      </div>
+      <div class="chips">
+        <button class="chip on" id="vpn-usable">Только рабочие</button>
+        <button class="chip" id="vpn-sub">Подписка</button>
       </div>
 
-      <div class="bots" id="bots"></div>
-    </div>
-  </section>
+      <div id="nodes" class="list"></div>
+      <div class="pager" id="vpn-pager"></div>
+    </section>
 
-  <!-- Выбор прокси: поиск и страницы вместо простыни в select -->
-  <div class="picker-overlay hidden" id="picker">
-    <div class="picker glass">
-      <div class="picker-head">
-        <h3 id="picker-title">Прокси</h3>
-        <div class="spacer"></div>
-        <button class="btn btn-sm" id="picker-close" type="button">✕</button>
-      </div>
-      <input class="picker-search" id="picker-search" type="search"
-             placeholder="Поиск по имени, адресу или протоколу…" autocomplete="off">
-      <div class="picker-list" id="picker-list"></div>
-      <div class="pager" id="picker-pager"></div>
-    </div>
-  </div>
-
-  <!-- VPN -->
-  <section id="tab-vpn" class="hidden">
-    <div class="stats" id="vpn-stats"></div>
-    <div class="panel glass">
-      <div class="panel-head">
-        <h2>Серверы прокси и VPN</h2>
-        <span class="count" id="vpn-count"></span>
-        <div class="spacer"></div>
-        <button class="btn btn-sm" id="vpn-refresh">Перепроверить</button>
-      </div>
-      <div class="nodes" id="nodes"></div>
-      <div class="pager" id="nodes-pager"></div>
-    </div>
-  </section>
-
-  <!-- СОЗДАНИЕ -->
-  <section id="tab-create" class="hidden">
-    <div class="panel glass">
-      <div class="panel-head"><h2>Новый аккаунт</h2></div>
-      <form id="create-form" class="form-grid">
-        <div class="field">
-          <label for="c-server">Сервер</label>
+    <!-- СОЗДАТЬ -->
+    <section class="view" data-view="create" hidden>
+      <form class="glass card form" id="create-form">
+        <h2>Новый аккаунт</h2>
+        <label class="fld"><span>Сервер</span>
           <select id="c-server" required></select>
-        </div>
-        <div class="field">
-          <label for="c-nick">Ник (пусто — сгенерировать)</label>
+        </label>
+        <label class="fld"><span>Ник — пусто, сгенерирую</span>
           <input id="c-nick" type="text" maxlength="20" spellcheck="false" autocapitalize="off">
+        </label>
+        <div class="two">
+          <label class="fld"><span>Сколько</span>
+            <input id="c-count" type="number" min="1" max="50" value="1">
+          </label>
+          <label class="fld"><span>Задача</span>
+            <select id="c-task"></select>
+          </label>
         </div>
-        <div class="field">
-          <label for="c-count">Сколько создать</label>
-          <input id="c-count" type="number" min="1" max="50" value="1">
-        </div>
-        <div class="field">
-          <label for="c-pass">Пароль (пусто — базовый)</label>
+        <label class="fld"><span>Пароль — пусто, базовый</span>
           <input id="c-pass" type="text" spellcheck="false" autocapitalize="off">
-        </div>
-        <div class="field">
-          <label for="c-task">Задача</label>
-          <select id="c-task">
-            <option value="lvl">Прокачка</option>
-            <option value="quest">Квесты</option>
-            <option value="mine">Шахта</option>
-            <option value="factory">Завод</option>
-            <option value="bus">Автобус</option>
-            <option value="stop">Без задачи</option>
-          </select>
-        </div>
-        <div class="field">
-          <label for="c-proxy">Прокси для новых</label>
-          <button class="btn btn-block proxy-pick" id="c-proxy-btn"
-                  data-pick="create" type="button">🎲 Рабочие из пула (вразброс)</button>
-        </div>
-        <div class="field" style="align-self:end">
-          <button class="btn btn-red btn-block" type="submit" id="c-submit">Создать</button>
-        </div>
+        </label>
+        <label class="fld"><span>Прокси</span>
+          <select id="c-proxy"></select>
+        </label>
+        <button class="btn btn-solid" type="submit" id="c-go">Создать</button>
       </form>
-    </div>
-  </section>
+    </section>
 
-  <!-- НАСТРОЙКИ -->
-  <section id="tab-settings" class="hidden">
-    <div class="panel glass">
-      <div class="panel-head"><h2>Базовые настройки</h2></div>
-      <form id="settings-form" class="form-grid">
-        <div class="field">
-          <label for="s-pass">Базовый пароль новых аккаунтов</label>
+    <!-- ЕЩЁ -->
+    <section class="view" data-view="more" hidden>
+      <form class="glass card form" id="settings-form">
+        <h2>Настройки</h2>
+        <label class="fld"><span>Базовый пароль новых</span>
           <input id="s-pass" type="text" spellcheck="false" autocapitalize="off">
-        </div>
-        <div class="field">
-          <label for="s-task">Задача по умолчанию</label>
-          <select id="s-task">
-            <option value="lvl">Прокачка</option>
-            <option value="quest">Квесты</option>
-            <option value="mine">Шахта</option>
-            <option value="factory">Завод</option>
-            <option value="bus">Автобус</option>
-            <option value="stop">Без задачи</option>
-          </select>
-        </div>
-        <div class="field" style="align-self:end">
-          <button class="btn btn-red btn-block" type="submit" id="s-submit">Сохранить</button>
-        </div>
+        </label>
+        <label class="fld"><span>Задача по умолчанию</span>
+          <select id="s-task"></select>
+        </label>
+        <button class="btn btn-solid" type="submit">Сохранить</button>
       </form>
-    </div>
-  </section>
 
-  <div class="foot">
-    RakCRMP · <a href="https://t.me/an0ym" target="_blank" rel="noopener">t.me/an0ym</a>
+      <div class="glass card">
+        <h2>Массовые действия</h2>
+        <p class="hint">Работает по выделенным аккаунтам на вкладке «Аккаунты».</p>
+        <div class="btn-row">
+          <button class="btn" data-bulk="start_many">Запустить</button>
+          <button class="btn" data-bulk="stop_many">Остановить</button>
+          <button class="btn" data-bulk="stats">Статистика</button>
+          <button class="btn" data-bulk="real_world">В мир</button>
+        </div>
+        <div class="btn-row">
+          <input class="search" id="goal-level" type="number" min="0" max="200" placeholder="цель, 0 — снять">
+          <button class="btn" data-bulk="goal_many">Цель</button>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-danger" data-bulk="delete_many">Удалить выделенных</button>
+        </div>
+      </div>
+
+      <div class="glass card">
+        <h2>Аккаунт</h2>
+        <div class="kv"><span>Логин</span><b id="m-login">—</b></div>
+        <div class="kv"><span>Telegram</span><b id="m-tg">—</b></div>
+        <div class="kv"><span>Серверов</span><b id="m-servers">—</b></div>
+        <button class="btn btn-danger btn-block" id="btn-logout">Выйти</button>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ПАНЕЛЬ ВЫДЕЛЕНИЯ -->
+  <div class="bulkbar glass" id="bulkbar" hidden>
+    <span id="bulk-count">0</span>
+    <div class="btn-row tight">
+      <button class="btn btn-sm" data-bulk="start_many">▶</button>
+      <button class="btn btn-sm" data-bulk="stop_many">■</button>
+      <button class="btn btn-sm" data-bulk="real_world">◎</button>
+      <button class="btn btn-sm" data-bulk="stats">↻</button>
+      <button class="btn btn-sm btn-danger" data-bulk="delete_many">✕</button>
+    </div>
+    <button class="icon" id="bulk-x">✕</button>
   </div>
+
+  <!-- НИЖНИЙ ДОК -->
+  <nav class="dock glass" id="dock">
+    <button class="dock-btn on" data-view="accounts">
+      <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h10" stroke="currentColor" stroke-width="1.9" fill="none" stroke-linecap="round"/></svg>
+      <span>Боты</span>
+    </button>
+    <button class="dock-btn" data-view="proxy">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" stroke="currentColor" stroke-width="1.9" fill="none"/><path d="M4 12h16M12 4c2.5 2.5 2.5 13 0 16M12 4c-2.5 2.5-2.5 13 0 16" stroke="currentColor" stroke-width="1.6" fill="none"/></svg>
+      <span>Прокси</span>
+    </button>
+    <button class="dock-btn" data-view="create">
+      <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round"/></svg>
+      <span>Создать</span>
+    </button>
+    <button class="dock-btn" data-view="more">
+      <svg viewBox="0 0 24 24"><circle cx="6" cy="12" r="1.8" fill="currentColor"/><circle cx="12" cy="12" r="1.8" fill="currentColor"/><circle cx="18" cy="12" r="1.8" fill="currentColor"/></svg>
+      <span>Ещё</span>
+    </button>
+  </nav>
+</div>
+
+<!-- МОДАЛКА -->
+<div class="sheet-wrap" id="sheet-wrap" hidden>
+  <div class="sheet glass" id="sheet"></div>
 </div>
 
 <div class="toasts" id="toasts"></div>
