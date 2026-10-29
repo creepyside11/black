@@ -192,25 +192,71 @@ def _socks5_udp_associate(sock: socket.socket) -> tuple[str, int] | None:
     return host, port
 
 
-def _stun_probe_udp(udp: socket.socket, relay: tuple[str, int], timeout: float) -> str | None:
-    """STUN binding через SOCKS5 UDP. Возвращает внешний ip:port или None."""
+def _stun_probe_udp(
+    udp: socket.socket,
+    relay: tuple[str, int],
+    timeout: float,
+    *,
+    attempts: int = 3,
+) -> tuple[str | None, float | None]:
+    """STUN binding через SOCKS5 UDP.
+
+    Возвращает (внешний ip:port, время круга в мс).
+
+    UDP теряет пакеты — это его нормальное поведение, а не признак смерти
+    узла. Одна попытка давала ложные «UDP не проходит» на живых узлах:
+    при повторных запусках тот же узел с тем же таймаутом то проходил, то
+    нет. Поэтому несколько попыток, и только если все пусты — отказ.
+
+    Время круга берётся по STUN: это настоящая дорога до узла и обратно,
+    в отличие от ответа на CONNECT, который локальный мост отдаёт сразу,
+    не дожидаясь удалённой стороны.
+    """
     import os
 
     try:
         target_ip = socket.gethostbyname(STUN_HOST)
     except OSError:
-        return None
-    transaction = os.urandom(12)
-    request = struct.pack(">HHI", 0x0001, 0, STUN_MAGIC) + transaction
-    header = b"\x00\x00\x00\x01" + socket.inet_aton(target_ip) + struct.pack(">H", STUN_PORT)
-    try:
-        udp.sendto(header + request, relay)
-        data, _ = udp.recvfrom(2048)
-    except OSError:
-        return None
+        return None, None
+
+    external = None
+    samples: list[float] = []
+
+    for _ in range(max(1, int(attempts))):
+        transaction = os.urandom(12)
+        request = struct.pack(">HHI", 0x0001, 0, STUN_MAGIC) + transaction
+        header = b"\x00\x00\x00\x01" + socket.inet_aton(target_ip) + struct.pack(">H", STUN_PORT)
+        started = time.monotonic()
+        try:
+            udp.sendto(header + request, relay)
+            data, _ = udp.recvfrom(2048)
+        except OSError:
+            continue
+        rtt = (time.monotonic() - started) * 1000.0
+        if len(data) < 12:
+            continue
+        found = _parse_stun_external(data)
+        if not found:
+            continue
+        external = found
+        samples.append(rtt)
+        # Туннель прогрет и отвечает быстро — дальше мерить нечего.
+        if len(samples) >= 2 and min(samples) < 300.0:
+            break
+
+    if external is None or not samples:
+        return None, None
+
+    # Минимум, а не последнее значение: UDP теряет и переспрашивает, и
+    # единственный замер почти всегда завышен. Минимум из нескольких — это
+    # и есть дорога до узла без очередей и повторов.
+    return external, min(samples)
+
+
+def _parse_stun_external(data: bytes) -> str | None:
+    """Достать внешний ip:port из ответа STUN, срезав заголовок SOCKS5."""
     if len(data) < 12:
         return None
-    # Отрезаем SOCKS5-заголовок ответа.
     atyp = data[3]
     if atyp == 0x01:
         body = data[10:]
@@ -293,7 +339,7 @@ def verify_socks5(
             return True, False, "socks5: UDP ASSOCIATE не поддерживается", latency
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp.settimeout(timeout)
-        external = _stun_probe_udp(udp, relay, timeout)
+        external, rtt = _stun_probe_udp(udp, relay, timeout)
     except OSError as exc:
         return True, False, f"socks5: UDP — {type(exc).__name__}", latency
     finally:
@@ -306,6 +352,13 @@ def verify_socks5(
 
     if not external:
         return True, False, "socks5: UDP через прокси не проходит", latency
+
+    # Пинг берём по времени круга STUN, а не по ответу на CONNECT.
+    # Локальный мост (sing-box) отвечает на CONNECT сразу, ещё не сходив к
+    # узлу, поэтому его время — это коннект до 127.0.0.1, то есть около
+    # 1 мс. Настоящая дорога видна только по реальному ответу из сети.
+    if rtt:
+        latency = rtt
 
     # Прокси пускает в интернет — но пустит ли он в игру? Это отдельный
     # вопрос, и без него бот входит в «сервер не отвечает».

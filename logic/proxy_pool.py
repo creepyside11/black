@@ -32,6 +32,7 @@ from .vpn_probe import (
     GAME_TARGET_HOST,
     GAME_TARGET_PORT,
     ProbeResult,
+    STATUS_BAD_UDP,
     STATUS_BANNED,
     STATUS_DEAD,
     STATUS_NEEDS_CLIENT,
@@ -393,13 +394,22 @@ class ProxyPool:
             self.fetch_all()
         nodes = self.nodes()
         if not nodes:
+            # Подписка не отдала узлы (сеть моргнула, панель ответила пустым).
+            # Стирать прошлые результаты нельзя: один неудачный запрос
+            # обнулял весь список, и панель показывала «узлов нет» на живом
+            # пуле. Оставляем что было и просто отмечаем время проверки.
             with self._lock:
-                self.results = {}
                 self.last_refresh = self._clock()
-            return []
+                return list(self.results.values())
 
+        # Сколько проверять одновременно. На одноядерном сервере восемь
+        # параллельных проб вместе с мостами забивают процессор, и UDP не
+        # укладывается в таймаут — узлы выглядят мёртвыми, хотя живые.
+        # Считаем от числа ядер, но не больше четырёх.
+        workers = max(1, min(4, (os.cpu_count() or 1) * 2))
         kwargs = {
             "timeout": self.timeout,
+            "workers": workers,
             "target_port": self.target_port,
             # Проверяем не «пускает ли в интернет», а «пускает ли в игру»:
             # узел с выходом в США отдаёт пустоту там, где казахстанский
@@ -444,7 +454,12 @@ class ProxyPool:
             return results
 
         done: dict[str, ProbeResult] = {}
-        workers = max(1, min(6, len(pending)))
+        # Два моста за раз, не шесть. На сервере одно ядро: шесть
+        # одновременно поднятых sing-box вместе с восемью проберами
+        # забивали процессор, UDP-пробы не укладывались в таймаут, и все
+        # живые узлы разом получали «UDP не проходит». Лучше медленнее,
+        # но с правдой в статусе.
+        workers = max(1, min(2, len(pending)))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(self._probe_via_bridge, res.node, res): res.node.key
@@ -561,8 +576,25 @@ class ProxyPool:
             # Мост поднялся, но трафик не идёт — это мёртвый узел, а не
             # «нужен клиент». Держим процесс, вдруг оживёт на следующей
             # проверке.
-            bridged.status = STATUS_DEAD
+            # Узел отвечает, но трафик через него не идёт — это не «мёртвый».
+            # Мёртвый значит «не отвечает вообще»; здесь ответ есть, а
+            # дальше не пускает. Разные вещи, и лечатся по-разному.
+            bridged.status = STATUS_BAD_UDP if bridged.alive else STATUS_DEAD
+            # Время отказа мерялось до 127.0.0.1: sing-box отвечает «не могу»
+            # сам, не сходив в сеть, поэтому выходило 1-2 мс. Это время
+            # локального сокета, а не пинг узла: мёртвые узлы выглядели
+            # самыми быстрыми. Берём реальное время до самого узла.
+            bridged.latency_ms = base.latency_ms
             bridged.reason = f"{node.protocol.upper()} через мост не пускает: {bridged.reason}"
+            # Гасим мост сразу, а не в конце цикла. Раньше остановка была
+            # после проверки всех узлов, и к концу набегало три десятка
+            # процессов sing-box на одном ядре. Процессор захлёбывался,
+            # UDP-пробы не укладывались в таймаут, и живые узлы получали
+            # «UDP не проходит». Ошибка была не в узлах, а в нехватке CPU.
+            try:
+                bridge.stop(node.key)
+            except Exception:
+                pass
         return bridged
 
     def verify_before_connect(
@@ -752,6 +784,9 @@ class ProxyPool:
                 res,
                 status=STATUS_BANNED,
                 usable=False,
+                # Пинг забаненного узла ничего не значит: он остался от
+                # прошлой проверки и только путает. Показывать его — врать.
+                latency_ms=None,
                 reason=entry.get("reason") or "забанен сервером",
             )
             patched.append(copy)

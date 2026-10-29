@@ -522,11 +522,22 @@ class WebBridge:
         pool = getattr(self.manager, "proxy_pool", None)
         if pool is None:
             raise ValueError("пул прокси не запущен")
-        pool.refresh()
+        # Полная проверка — это подъём моста под каждый узел, минуты работы.
+        # Держать мост всё это время нельзя: панель отвалится по таймауту и
+        # покажет ошибку, хотя проверка идёт. Запускаем в фоне и отвечаем
+        # сразу текущим списком — он обновится, когда проверка закончится.
+        threading.Thread(target=self._refresh_vpn_bg, args=(pool,),
+                         daemon=True, name="vpn-refresh").start()
         return self._vpn_payload(
             page=int(args.get("page") or 1),
             per_page=int(args.get("per_page") or 24),
         )
+
+    def _refresh_vpn_bg(self, pool) -> None:
+        try:
+            pool.refresh()
+        except Exception as exc:
+            self.log(f"[ПРОКСИ] фоновая проверка упала: {exc}")
 
     def _cmd_vpn_ban(self, args):
         """Пометить адрес забаненным вручную."""

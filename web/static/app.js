@@ -12,7 +12,11 @@ const S = {
   user: null,
   config: null,
   bots: [],
-  vpn: { nodes: [], summary: {}, page: 1, pages: 1, total: 0, saved: [] },
+  vpn: { nodes: [], summary: {}, saved: [] },
+  // Список узлов живёт отдельно от общего опроса: опрос каждые 4 секунды
+  // приносит первую страницу, и раньше он стирал ту, на которую перелистнул.
+  vpnList: { nodes: [], page: 1, pages: 1, total: 0 },
+  vpnLoaded: false,
   filter: 'all',
   query: '',
   selectMode: false,
@@ -255,8 +259,11 @@ function fillForms() {
 }
 
 function fillProxySelect() {
+  // Опрос перерисовывает список каждые 4 секунды. Без сохранения выбора
+  // форма создания теряла бы выбранный прокси на каждом тике.
+  const keep = ($('#c-proxy') || {}).value || '';
   const saved = (S.vpn && S.vpn.saved) || [];
-  const nodes = (S.vpn && S.vpn.nodes) || [];
+  const nodes = (S.vpnList && S.vpnList.nodes) || [];
   const opts = ['<option value="">Своё IP — без прокси</option>'];
   saved.forEach((p) => {
     opts.push(`<option value="${esc(p.proxy)}">${esc(p.name || p.proxy)}</option>`);
@@ -265,6 +272,10 @@ function fillProxySelect() {
     opts.push(`<option value="node:${esc(n.key)}">${esc(n.name)}</option>`);
   });
   $('#c-proxy').innerHTML = opts.join('');
+  if (keep) {
+    const sel = $('#c-proxy');
+    if ([...sel.options].some((o) => o.value === keep)) sel.value = keep;
+  }
 }
 
 /* ---------- обновление ---------- */
@@ -273,7 +284,13 @@ async function refresh() {
   try {
     const st = await getJSON('/api/state');
     S.bots = st.bots || [];
-    if (st.vpn && st.vpn.nodes) S.vpn = st.vpn;
+    if (st.vpn && st.vpn.nodes) {
+      S.vpn = st.vpn;
+      if (!S.vpnLoaded) {
+        S.vpnList = st.vpn;
+        S.vpnLoaded = true;
+      }
+    }
     setLive(true, st.live);
     renderBots();
     renderStats();
@@ -556,31 +573,61 @@ async function bulk(action) {
 
 /* ---------- прокси ---------- */
 
+function pingText(n) {
+  // Пинг показываем только там, где он что-то значит. У мёртвого и у
+  // забаненного узла любое число — это время локального сокета либо
+  // остаток от прошлой проверки. Врать «1 мс» хуже, чем прочерк.
+  const st = String(n.status || '');
+  if (st === 'banned' || st === 'dead') return '';
+  if (!n.alive && !n.usable) return '';
+  if (n.latency == null || n.latency <= 0) return '';
+  return n.latency + ' мс';
+}
+
+/* Что значит каждый статус — прямо в интерфейсе, без догадок:
+     рабочий       бот может через него ходить прямо сейчас
+     нужен клиент  протокол (vless/vmess/trojan) бот сам не умеет, нужен мост
+     не пускает    узел отвечает, но трафик через него не проходит
+     мёртвый       не отвечает вообще
+     забанен       помечен вручную, бот его не берёт */
+function nodeStatus(n) {
+  const st = String(n.status || '');
+  if (n.usable || st === 'ok') return { dot: 'online', text: 'рабочий' };
+  if (st === 'banned') return { dot: 'bad', text: 'забанен' };
+  if (st === 'needs_client') return { dot: 'work', text: 'нужен клиент' };
+  if (st === 'no_udp') return { dot: 'work', text: 'не пускает' };
+  if (st === 'no_game') return { dot: 'work', text: 'игра не отвечает' };
+  if (n.alive) return { dot: 'work', text: 'не пускает' };
+  return { dot: 'bad', text: 'мёртвый' };
+}
+
 function renderVpn() {
-  const v = S.vpn || {};
-  const sum = v.summary || {};
+  const sum = (S.vpn && S.vpn.summary) || {};
+  const list = S.vpnList || {};
+  const saved = (S.vpn && S.vpn.saved) || [];
   $('#vpn-stats').innerHTML = `
-    <div class="stat"><b>${sum.total != null ? sum.total : (v.total || 0)}</b><span>узлов</span></div>
+    <div class="stat"><b>${sum.total != null ? sum.total : (list.total || 0)}</b><span>узлов</span></div>
     <div class="stat"><b>${sum.usable != null ? sum.usable : 0}</b><span>рабочих</span></div>
-    <div class="stat"><b>${(v.saved || []).length}</b><span>своих</span></div>`;
+    <div class="stat"><b>${saved.length}</b><span>своих</span></div>`;
 
   const box = $('#nodes');
   box.innerHTML = '';
-  const nodes = v.nodes || [];
+  const nodes = list.nodes || [];
   if (!nodes.length) {
     box.innerHTML = '<div class="empty">Узлов нет. Добавь подписку.</div>';
   }
   nodes.forEach((n) => {
+    const st = nodeStatus(n);
     const el = document.createElement('div');
     el.className = 'node';
     el.innerHTML = `
-      <span class="dot ${n.usable ? 'online' : (n.alive ? 'work' : '')}"></span>
+      <span class="dot ${st.dot}"></span>
       <div class="node-main">
         <div class="node-name">${esc(n.name)}</div>
-        <div class="node-sub">${esc(n.protocol || '')} · ${esc(n.address || '')}</div>
+        <div class="node-sub">${esc(n.protocol || '')} · ${esc(n.address || '')} · ${st.text}</div>
       </div>
-      <span class="node-lat">${n.latency ? n.latency + ' мс' : ''}</span>
-      <button class="icon" data-act="use">✓</button>`;
+      <span class="node-lat">${pingText(n)}</span>
+      ${n.usable ? '<button class="icon" data-act="use">✓</button>' : ''}`;
     $$('button', el).forEach((b) => {
       b.onclick = async () => {
         try {
@@ -592,14 +639,23 @@ function renderVpn() {
     box.appendChild(el);
   });
 
-  const pages = v.pages || 1;
-  const page = v.page || 1;
+  const pages = list.pages || 1;
+  const page = list.page || 1;
   const pager = $('#vpn-pager');
   pager.innerHTML = '';
   if (pages > 1) {
     pager.innerHTML = `<button id="pv">←</button><span>${page} / ${pages}</span><button id="nx">→</button>`;
-    $('#pv', pager).onclick = () => { S.vpnPage = Math.max(1, page - 1); loadVpn(); };
-    $('#nx', pager).onclick = () => { S.vpnPage = Math.min(pages, page + 1); loadVpn(); };
+    const go = (target) => {
+      const next = Math.max(1, Math.min(pages, target));
+      if (next === page) return;
+      S.vpnPage = next;
+      loadVpn().then(() => {
+        const top = $('#nodes');
+        if (top) top.scrollIntoView({ block: 'start', behavior: 'smooth' });
+      });
+    };
+    $('#pv', pager).onclick = () => go(page - 1);
+    $('#nx', pager).onclick = () => go(page + 1);
   }
   fillProxySelect();
 }
@@ -612,7 +668,11 @@ async function loadVpn() {
       search: S.vpnQuery,
       only_usable: S.vpnUsable,
     });
-    S.vpn = (r.result && r.result.nodes) ? r.result : (r.result || S.vpn);
+    const res = r.result || {};
+    if (res.nodes) {
+      S.vpnList = res;
+      S.vpnLoaded = true;
+    }
     renderVpn();
   } catch (e) {
     fail(e);
@@ -731,8 +791,20 @@ function wire() {
   $('#vpn-q').oninput = (e) => { S.vpnQuery = e.target.value; S.vpnPage = 1; };
   $('#vpn-q').onchange = () => loadVpn();
   $('#vpn-refresh').onclick = async () => {
-    try { await api('vpn_refresh', {}); good('Проверяю'); loadVpn(); }
-    catch (e) { fail(e); }
+    // Проверка идёт в фоне: подъём моста под каждый узел занимает минуты.
+    // Поэтому не ждём ответа с готовым списком, а подтягиваем его пару раз.
+    const btn = $('#vpn-refresh');
+    btn.disabled = true;
+    try {
+      await api('vpn_refresh', {});
+      good('Проверяю узлы — это займёт минуту');
+      loadVpn();
+      setTimeout(() => { loadVpn(); refresh(); }, 12000);
+      setTimeout(() => { loadVpn(); refresh(); btn.disabled = false; }, 35000);
+    } catch (e) {
+      btn.disabled = false;
+      fail(e);
+    }
   };
   $('#vpn-usable').onclick = (e) => {
     S.vpnUsable = !S.vpnUsable;
