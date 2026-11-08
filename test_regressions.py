@@ -11,13 +11,17 @@ class RpcIdEncodingTests(unittest.TestCase):
     def test_dialog_response_fits_in_9_bits(self):
         # 514 не влезает в 9 бит и уходил как RPC 2 — меню не отвечали.
         self.assertLessEqual(RPC.DIALOG_RESPONSE, 511)
-        self.assertEqual(RPC.DIALOG_RESPONSE, 62)
+        # 406 найден перебором на живом сервере NOVGOROD: ответ этим RPC
+        # открывает выбранный пункт /mm, а следующий /mm приходит уже новым
+        # меню. 62 (стандартный SA-MP) и 514 (не влезал в 9 бит) не работали.
+        self.assertEqual(RPC.DIALOG_RESPONSE, 406)
 
     def test_dialog_response_packet_uses_right_id(self):
         packet = PacketBuilder.rpc_build("dialog_response", 0, 1, 2, "")
         self.assertEqual(packet[0], 0x0B)
-        # 62 = 0x3E младшие 8 бит, старший бит 0, дальше 0b11
-        self.assertEqual(packet[1], 62)
+        # id пишется 9 битами: младшие 8 лежат в packet[1]
+        self.assertEqual(packet[1], RPC.DIALOG_RESPONSE & 0xFF)
+        self.assertEqual(packet[1], 150)
 
     def test_guard_rejects_overflow(self):
         for bad in (512, 514, 515, 517, 1024, -1):

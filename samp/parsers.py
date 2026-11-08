@@ -1301,6 +1301,44 @@ class PacketParser:
         }
 
     @staticmethod
+    def connection_banned(
+        data: bytes
+    ) -> dict:
+        """0x19 — сервер закрывает вход из-за бана адреса.
+
+        В vanilla RakNet у этого пакета тела нет, и раньше здесь стояла
+        лямбда, которая выбрасывала всё, что пришло после идентификатора.
+        В логе оставалось одно «CONNECTION_BANNED (0x19)» без причины, и
+        разбор шёл вслепую. Если сервер дописал текст — сохраняем его.
+        """
+
+        info = {
+            "raw": bytes(data or b""),
+        }
+
+        body = bytes(data or b"")
+        if not body:
+            return info
+
+        printable = bytes(
+            b for b in body
+            if 32 <= b < 127 or b in (9, 10, 13) or b >= 0xC0
+        )
+
+        if printable:
+            for encoding in ("utf-8", "cp1251"):
+                try:
+                    text = printable.decode(encoding).strip()
+                except UnicodeDecodeError:
+                    continue
+
+                if text:
+                    info["reason"] = text
+                    break
+
+        return info
+
+    @staticmethod
     def vehicle_sync(
         data: bytes
     ) -> dict | None:
@@ -1613,7 +1651,7 @@ PACKET_PARSE_REGISTRY: dict[str, tuple[int, "Callable[[bytes], dict | None]"]] =
     ),
     "connection_banned": (
         PacketID.CONNECTION_BANNED,
-        lambda data: {"type": "connection_banned"},
+        PacketParser.connection_banned,
     ),
     "internal_ping": (
         PacketID.INTERNAL_PING,

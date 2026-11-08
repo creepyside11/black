@@ -37,9 +37,16 @@ PACKET_DELIVERY = {
     "interface_register_finish": (REL, PRI_SYS, 0),
     "interface_cinematic_stop": (REL, PRI_HIGH, 0),
     "interface_sync": (REL_ORD, PRI_MED, 0),
-    "player_sync": (UNREL_SEQ, PRI_HIGH, 0),
-    "vehicle_sync": (UNREL_SEQ, PRI_HIGH, 0),
-    "passenger_sync": (UNREL_SEQ, PRI_HIGH, 0),
+    # Синхронизация позиции — SYSTEM_PRIORITY не ради приоритета, а ради
+    # немедленной отправки: HIGH/MEDIUM копятся в очереди и уезжают пачкой
+    # на следующем проходе сети. В ECO-режиме проход раз в 167 мс, поэтому
+    # 50 пакетов в секунду уходили 12 датаграммами по 4-5 пакетов (иногда 6
+    # в одной), а живой клиент шлёт ровно один sync в датаграме — 82% его
+    # датаграмов содержат один on-foot sync (_diag/route2.pcap). Пачку из
+    # восьми позиций с одним временем прихода сервер видит как телепорт.
+    "player_sync": (UNREL_SEQ, PRI_SYS, 0),
+    "vehicle_sync": (UNREL_SEQ, PRI_SYS, 0),
+    "passenger_sync": (UNREL_SEQ, PRI_SYS, 0),
     "connection_request": (REL, PRI_SYS, 0),
     "auth_key_response": (REL, PRI_SYS, 0),
     "new_incoming_connection": (REL, PRI_HIGH, 0),

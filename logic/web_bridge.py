@@ -196,7 +196,43 @@ class WebBridge:
         return {"pong": True, "pid": os.getpid()}
 
     def _cmd_list(self, args):
-        return {"bots": self._bots_payload()}
+        return {"bots": self._bots_payload(), "project": self._project_payload()}
+
+    def _project_payload(self) -> dict:
+        """Активный проект для панели: имя, ключ, файл реестра."""
+        project = getattr(self.manager, "project", None)
+        if project is None:
+            return {}
+        payload = project.as_dict()
+        payload["accounts_file"] = os.path.basename(
+            getattr(self.manager, "accounts_file", "") or "")
+        return payload
+
+    def _cmd_switch_project(self, args):
+        """Переключить проект из панели.
+
+        Идёт синхронно и может занять секунды: менеджер сохраняет реестр,
+        останавливает ботов и поднимает аккаунты нового проекта. Панель
+        шлёт команду и ждёт — она это умеет, в отличие от молчаливого
+        переключения, после которого непонятно, что стало с фермой.
+        """
+        key = str(args.get("project") or args.get("key") or "").strip()
+        if not key:
+            raise ValueError("не указан проект")
+        # KeyError несёт кавычки в тексте, а это сообщение уходит прямо в
+        # панель — переводим в нормальную фразу.
+        try:
+            report = self.manager.switch_project(key)
+        except KeyError:
+            raise ValueError(f"неизвестный проект: {key}")
+        payload = self._project_payload()
+        return {
+            "changed": bool(report.get("changed")),
+            "stopped": int(report.get("stopped") or 0),
+            "loaded": int(report.get("loaded") or 0),
+            "project": payload,
+            "previous": report.get("previous") or {},
+        }
 
     def _cmd_start(self, args):
         bot_id = int(args["id"])
@@ -727,6 +763,9 @@ class WebBridge:
                 "ts": time.time(),
                 "bots": self._bots_payload(),
                 "vpn": self._vpn_payload(),
+                # Проект в снимке: панель по нему рисует, чьи это аккаунты,
+                # даже когда бот не отвечает.
+                "project": self._project_payload(),
             }
             _write_atomic(STATE_FILE, payload)
         except Exception as exc:

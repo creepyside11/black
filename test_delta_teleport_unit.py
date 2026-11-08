@@ -212,6 +212,98 @@ def main():
     res = engine.run((900, 0, 0))
     ok &= check("обрыв распознан", res["status"] == "aborted" and res["reason"] == "session_down", str(res["status"]))
 
+    print("\n=== человеческий режим ===")
+    # Живой клиент шлёт sync неровно: интервалы гуляют, и velocity в каждом
+    # пакете совпадает с реальным сдвигом. Сервер считает скорость по своему
+    # интервалу между пакетами, поэтому «поспать после отправки» даёт
+    # расхождение — здесь его не должно быть ни на одном пакете.
+    class HumanPlayer(FakePlayer):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.axes = (0, 0)
+
+        def set_control_axes(self, lr, ud):
+            self.axes = (int(lr), int(ud))
+
+    clock = {"t": 0.0}
+    hplayer = HumanPlayer(0, 0, 0)
+    seen = []
+
+    def send_human():
+        speed = math.sqrt(
+            hplayer.velocity_x ** 2 + hplayer.velocity_y ** 2 + hplayer.velocity_z ** 2
+        )
+        seen.append(
+            {
+                "t": clock["t"],
+                "pos": hplayer.get_position(),
+                "v": speed * 50.0,
+                "axes": hplayer.axes,
+                "keys": hplayer.keys,
+            }
+        )
+
+    engine = DeltaTeleport(
+        hplayer,
+        send_human,
+        step=0.16,
+        interval=0.02,
+        settle_packets=3,
+        human=True,
+        sleep=lambda s: clock.__setitem__("t", clock["t"] + max(0.0, s)),
+        clock=lambda: clock["t"],
+    )
+    res = engine.run((300, 0, 0))
+    ok &= check(
+        "человеческий режим доехал",
+        res["status"] == "ok"
+        and all(abs(a - b) < 1e-6 for a, b in zip(res["final_position"], (300, 0, 0))),
+        str(res["status"]),
+    )
+
+    moving = []
+    prev = None
+    for p in seen:
+        if prev is not None and p["t"] - prev["t"] > 0.0:
+            moved = math.dist(p["pos"], prev["pos"])
+            if moved > 0.05:
+                moving.append(
+                    {
+                        "dt": p["t"] - prev["t"],
+                        "moved": moved,
+                        "v": p["v"],
+                        "axes": p["axes"],
+                        "keys": p["keys"],
+                    }
+                )
+        prev = p
+
+    ticks = [m["dt"] for m in moving]
+    ok &= check(
+        "интервалы разные",
+        len(set(round(t, 4) for t in ticks)) > 20,
+        f"{len(set(round(t, 4) for t in ticks))} различных из {len(ticks)}",
+    )
+    worst = max((abs(m["moved"] / m["dt"] - m["v"]) for m in moving), default=0.0)
+    ok &= check("velocity == сдвиг/интервал", worst < 0.05, f"макс {worst:.4f} м/с")
+    jump = max((m["moved"] for m in moving), default=0.0)
+    ok &= check("нет многометровых прыжков", jump < 0.7, f"макс {jump:.3f} м")
+    ok &= check(
+        "оси ввода как у живого",
+        all(m["axes"][1] == -127 for m in moving),
+        str(set(m["axes"] for m in moving[:1])),
+    )
+    ok &= check(
+        "спринт при движении",
+        all(m["keys"] == 8 for m in moving),
+        str(sorted(set(m["keys"] for m in moving))),
+    )
+    ok &= check(
+        "стоячие пакеты с нулевой velocity",
+        all(p["v"] == 0.0 for p in seen[-3:]),
+        str([round(p["v"], 3) for p in seen[-3:]]),
+    )
+
     print("\n" + ("ВСЁ ЗЕЛЁНОЕ" if ok else "ЕСТЬ ПАДЕНИЯ"))
     return 0 if ok else 1
 

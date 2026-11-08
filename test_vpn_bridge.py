@@ -209,3 +209,71 @@ class OrphanTests(unittest.TestCase):
     def test_reap_skips_when_no_binary(self):
         bridge = B.VpnBridge(state_dir="/tmp", binary="/нет/бинаря")
         bridge._reap_orphans()
+
+
+class BridgeBusyTests(unittest.TestCase):
+    """Занятый мост не гасится уборкой.
+
+    Проба может провалиться на живом узле: таймаут, потеря UDP, занятый
+    процессор. Пока через мост играет бот, гасить его нельзя — у сессии
+    рвётся соединение (sing-box умирает с кодом -15), и это выглядит как
+    «аккаунт вылетел без причины». Остановка откладывается до release.
+    """
+
+    def setUp(self):
+        self.bridge = B.VpnBridge(binary="/bin/true")
+        self.killed: list[str] = []
+        # Подменяем только убийство процесса: логика занятости настоящая.
+        self.bridge._kill = lambda key: (self.killed.append(key),
+                                         self.bridge._procs.pop(key, None),
+                                         self.bridge._ports.pop(key, None))
+        self.key = "vless://node.example.com:443#u1"
+        self.bridge._procs[self.key] = None
+        self.bridge._ports[self.key] = 20001
+
+    def test_free_bridge_is_stopped(self):
+        self.bridge.stop(self.key)
+        self.assertEqual(self.killed, [self.key])
+
+    def test_busy_bridge_is_not_stopped(self):
+        self.bridge.acquire(self.key)
+        self.bridge.stop(self.key)
+        self.assertEqual(self.killed, [], "мост под живой сессией погасили")
+        self.assertIn(self.key, self.bridge.pending_stops())
+
+    def test_stop_after_release(self):
+        self.bridge.acquire(self.key)
+        self.bridge.stop(self.key)
+        self.bridge.release(self.key)
+        self.assertEqual(self.killed, [self.key], "отложенная остановка не сработала")
+        self.assertEqual(self.bridge.pending_stops(), [])
+
+    def test_counter_for_several_bots(self):
+        self.bridge.acquire(self.key)
+        self.bridge.acquire(self.key)
+        self.bridge.stop(self.key)
+        self.bridge.release(self.key)
+        self.assertEqual(self.killed, [], "второй бот ещё играет")
+        self.bridge.release(self.key)
+        self.assertEqual(self.killed, [self.key])
+        self.assertFalse(self.bridge.is_busy(self.key))
+
+    def test_release_without_acquire_is_safe(self):
+        self.bridge.release(self.key)
+        self.assertEqual(self.killed, [])
+        self.bridge.release("чужой-ключ")
+
+    def test_force_stops_busy(self):
+        self.bridge.acquire(self.key)
+        self.bridge.stop(self.key, force=True)
+        self.assertEqual(self.killed, [self.key])
+
+    def test_stop_all_skips_busy_without_force(self):
+        other = "vless://other.example.com:443#u2"
+        self.bridge._procs[other] = None
+        self.bridge._ports[other] = 20002
+        self.bridge.acquire(self.key)
+        self.bridge.stop_all(force=False)
+        self.assertEqual(self.killed, [other], "занятый мост погасили вместе со всеми")
+        self.bridge.stop_all()
+        self.assertIn(self.key, self.killed)

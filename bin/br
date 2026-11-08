@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Запуск Black Russia из любого каталога.
+# Работает и напрямую (./bin/br), и через symlink в /usr/local/bin/br:
+# путь репозитория вычисляется по реальному расположению этого файла.
+
+set -e
+
+SELF="$0"
+while [ -L "$SELF" ]; do
+    DIR="$(cd -P "$(dirname "$SELF")" >/dev/null 2>&1 && pwd)"
+    SELF="$(readlink "$SELF")"
+    case "$SELF" in
+        /*) ;;
+        *) SELF="$DIR/$SELF" ;;
+    esac
+done
+REPO="$(cd -P "$(dirname "$SELF")/.." >/dev/null 2>&1 && pwd)"
+
+if [ ! -f "$REPO/bot.py" ]; then
+    echo "[!] Не найден $REPO/bot.py — запусти скрипт из каталога репозитория." >&2
+    exit 1
+fi
+
+if [ -n "$PYTHON" ]; then
+    PY="$PYTHON"
+elif command -v python3 >/dev/null 2>&1; then
+    PY="python3"
+elif command -v python >/dev/null 2>&1; then
+    PY="python"
+else
+    echo "[!] Python не найден. Termux: pkg install python; Debian/Ubuntu: apt install python3" >&2
+    exit 1
+fi
+
+cd "$REPO"
+exec "$PY" bot.py "$@"

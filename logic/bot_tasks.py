@@ -708,6 +708,12 @@ class QuestMasterTask(BaseTask):
         self.bot.add_log(f"[КВЕСТ-NPC] {name}: '{str(text)[:60]}'")
         self.engine.on_npc_dialog(name, text, model, buttons)
 
+    def on_map_icon(self, icon_id, xyz, marker_type=None, style=None):
+        """Маркер квеста (RPC 417). В эталоне именно он ведёт бота."""
+        if not self.running:
+            return
+        self.engine.on_map_icon(icon_id, xyz, marker_type, style)
+
     def on_call_notification(self, header: str, text: str, button: str,
                              notif_type: int):
         if not self.running:

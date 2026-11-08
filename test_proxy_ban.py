@@ -269,7 +269,13 @@ class BridgePortRefreshTests(unittest.TestCase):
 
 
 class IpBanHandlerTests(unittest.TestCase):
-    """handle_ip_ban: адрес помечен, все аккаунты с него — бан."""
+    """handle_ip_ban: адрес в мусор, аккаунты целы и припаркованы.
+
+    Блокировка по IP — это не бан аккаунта. Раньше обработчик помечал
+    аккаунт `is_banned` и гасил сессию через stop(), и владелец видел
+    «аккаунты быстро банятся и вылетают». Теперь метка ложится на адрес
+    узла, а аккаунт уходит на парковку.
+    """
 
     def setUp(self):
         import bot as botmod
@@ -285,18 +291,25 @@ class IpBanHandlerTests(unittest.TestCase):
         import shutil
         shutil.rmtree(self.dir, ignore_errors=True)
 
-    def _bot(self, bid, proxy, nickname):
+    def _bot(self, bid, proxy, nickname, proxy_node="", live=False):
         class B:
             def __init__(self):
                 self.bot_id = bid
                 self.proxy = proxy
+                self.proxy_node = proxy_node
                 self.nickname = nickname
                 self.is_banned = False
                 self.ban_reason = ""
                 self.ban_kind = ""
                 self.banned_at = 0.0
+                self.parked_until = 0.0
+                self.parked_reason = ""
                 self.status = ""
                 self.logs = []
+                self.stopped = False
+                self.stop_calls = 0
+                if live:
+                    self.session = type("S", (), {"connected": True})()
 
             def add_log(self, text):
                 self.logs.append(text)
@@ -305,6 +318,8 @@ class IpBanHandlerTests(unittest.TestCase):
                 pass
 
             def stop(self, banned=False):
+                # Считаем вызовы: аккаунт при бане АДРЕСА гасить нельзя.
+                self.stop_calls += 1
                 self.stopped = banned
 
         return B()
@@ -339,6 +354,11 @@ class IpBanHandlerTests(unittest.TestCase):
         self.assertNotIn(3, handled)
         self.assertTrue(self.pool.is_banned("socks5://9.9.9.9:1080"))
         self.assertEqual(mgr.saved, 1)
+        # Замены нет — аккаунты не забанены, а припаркованы.
+        self.assertEqual(sorted(out["parked"]), [1, 2])
+        self.assertFalse(a.is_banned)
+        self.assertFalse(b.is_banned)
+        self.assertGreater(a.parked_until, time.time())
 
     def test_accounts_moved_to_other_proxy(self):
         """IP-бан переводит аккаунты на другой узел, а не убивает их.
@@ -374,15 +394,21 @@ class IpBanHandlerTests(unittest.TestCase):
         out = self.botmod.BotManager.handle_ip_ban(mgr, a, reason="Античит: IP заблокирован")
 
         self.assertEqual(sorted(out["moved"]), [1, 2])
-        self.assertEqual(out["marked"], [])
+        self.assertEqual(out["parked"], [])
         self.assertFalse(a.is_banned, "аккаунт не должен считаться забаненным")
         self.assertFalse(b.is_banned)
         self.assertEqual(a.proxy, "socks5://5.5.5.5:1080")
         self.assertTrue(self.pool.is_banned("socks5://9.9.9.9:1080"))
 
-    def test_marked_when_no_replacement(self):
-        """Замены нет — тогда аккаунт помечается, чтобы не долбился впустую."""
+    def test_no_replacement_parks_account_instead_of_banning(self):
+        """Замены нет — аккаунт припаркован, жив и не помечен забаненным.
+
+        Раньше здесь стоял `is_banned = True`, `ban_kind = "ip"` и
+        `status = "ЗАБАНЕН (IP)"`. Из-за закрытого адреса терялся живой
+        аккаунт — на это и жаловался владелец.
+        """
         a = self._bot(1, "socks5://9.9.9.9:1080", "A")
+        stopped = []
 
         class Mgr:
             def __init__(self):
@@ -399,9 +425,182 @@ class IpBanHandlerTests(unittest.TestCase):
         self_pool = self.pool
         out = self.botmod.BotManager.handle_ip_ban(Mgr(), a, reason="ip")
         self.assertEqual(out["moved"], [])
-        self.assertEqual(out["marked"], [1])
-        self.assertTrue(a.is_banned)
-        self.assertEqual(a.ban_kind, "ip")
+        self.assertEqual(out["parked"], [1])
+        # Адрес — в мусор.
+        self.assertTrue(self.pool.is_banned("socks5://9.9.9.9:1080"))
+        # Аккаунт — жив.
+        self.assertFalse(a.is_banned, "бан адреса не банит аккаунт")
+        self.assertEqual(a.ban_kind, "")
+        self.assertNotEqual(a.status, "ЗАБАНЕН (IP)")
+        # Сессию не гасим.
+        self.assertEqual(a.stop_calls, 0, "живую сессию stop() не трогает")
+        # И припаркован с понятной причиной.
+        self.assertGreater(a.parked_until, time.time())
+        self.assertIn("заблокирован", a.parked_reason)
+
+    def test_live_session_is_not_stopped(self):
+        """Идёт игра — сессию не гасим, даже если адрес закрыт."""
+        a = self._bot(1, "socks5://9.9.9.9:1080", "A", live=True)
+
+        class Mgr:
+            def __init__(self):
+                self.bots = {1: a}
+                self.proxy_pool = self_pool
+                self.tg_controller = None
+                self.swapped = []
+
+            def save_accounts(self):
+                pass
+
+            def swap_proxy(self, bot, *, reason=""):
+                self.swapped.append(bot.bot_id)
+                return "socks5://5.5.5.5:1080"
+
+        self_pool = self.pool
+        mgr = Mgr()
+        out = self.botmod.BotManager.handle_ip_ban(mgr, a, reason="ip")
+        self.assertEqual(out["parked"], [1])
+        self.assertEqual(a.stop_calls, 0, "живую сессию не гасим")
+        self.assertEqual(mgr.swapped, [], "переезд не трогает идущую сессию")
+        self.assertFalse(a.is_banned)
+        self.assertGreater(a.parked_until, time.time())
+
+    def test_park_is_targeted_by_node_not_by_bridge_url(self):
+        """Мост 127.0.0.1:10808 один на всех — парковка идёт по УЗЛУ.
+
+        Иначе один закрытый узел гасит всю пачку аккаунтов за общим мостом.
+        """
+        bridge = "socks5://127.0.0.1:10808"
+        a = self._bot(1, bridge, "A", proxy_node="node-1")
+        b = self._bot(2, bridge, "B", proxy_node="node-2")
+        c = self._bot(3, bridge, "C", proxy_node="")
+
+        pool = self.pool
+        handled = []
+
+        class Mgr:
+            def __init__(self):
+                self.bots = {1: a, 2: b, 3: c}
+                self.proxy_pool = pool
+                self.tg_controller = None
+
+            def save_accounts(self):
+                pass
+
+            def swap_proxy(self, bot, *, reason=""):
+                handled.append(bot.bot_id)
+                return ""
+
+        out = self.botmod.BotManager.handle_ip_ban(Mgr(), a, reason="ip")
+        self.assertEqual(out["parked"], [1], "узел node-1, а не весь мост")
+        self.assertNotIn(2, out["parked"], "другой узел за тем же мостом не при чём")
+        self.assertNotIn(3, out["parked"], "без узла бота не паркуем")
+        self.assertFalse(b.is_banned)
+        self.assertFalse(c.is_banned)
+
+    def test_connection_banned_text_reaches_handler_and_does_not_ban(self):
+        """`Пакет CONNECTION_BANNED (0x19)` — капс не мешает, аккаунт цел.
+
+        Текстовый вход нужен для чата и окна Anti-Cheat: там кода нет,
+        только строка. Раньше этот же путь ставил аккаунту `is_banned`,
+        `ban_kind="ip"` и гасил сессию.
+        """
+        a = self._bot(1, "socks5://9.9.9.9:1080", "A")
+        seen = []
+
+        class Mgr:
+            def __init__(self):
+                self.bots = {1: a}
+                self.proxy_pool = self_pool
+                self.tg_controller = None
+
+            def save_accounts(self):
+                pass
+
+            def handle_ip_ban(self, bot, reason=""):
+                seen.append((bot.bot_id, reason))
+                return {"proxy": "", "banned_keys": [], "moved": [], "parked": []}
+
+            def add_bot(self, **kw):
+                raise AssertionError("замена при бане адреса не создаётся")
+
+        self_pool = self.pool
+        self.botmod.BotManager.mark_bot_banned(
+            Mgr(), a, reason="Пакет CONNECTION_BANNED (0x19)")
+
+        self.assertEqual([s[0] for s in seen], [1],
+                         "капс в причине не мешает: 0x19 обязан дойти "
+                         "до обработчика адреса")
+        self.assertFalse(a.is_banned, "бан адреса не банит аккаунт")
+        self.assertEqual(a.ban_kind, "")
+
+    def test_kick_999_goes_by_code_and_park_account(self):
+        """Кик 999 (CONNECTION_BANNED) решается по КОДУ, не по тексту.
+
+        Хвост сообщений сервера в причине не должен ломать решение:
+        раньше ветка 999 звала mark_bot_banned и банила аккаунт.
+        """
+        import bot as botmod
+        from logic.events import emitter
+
+        a = self._bot(1, "socks5://9.9.9.9:1080", "A")
+        seen = []
+
+        mgr = botmod.BotManager.__new__(botmod.BotManager)
+        mgr.bots = {1: a}
+        mgr._lock = threading.Lock()
+        mgr._obj_index = {id(a): 1}
+        mgr.proxy_pool = self.pool
+        mgr.tg_controller = None
+        mgr.handle_ip_ban = lambda bot, reason="": seen.append(reason) or {
+            "proxy": "", "banned_keys": [], "moved": [], "parked": []}
+
+        # Обработчики живут в глобальном эмиттере: снимаем после себя
+        # целиком, вместе с чужими, которые были до нас.
+        snapshot = {k: list(v) for k, v in emitter._listeners.items()}
+        mgr._setup_event_hooks()
+        try:
+            emitter.emit("onKick", a, 999)
+            for _ in range(300):
+                if seen:
+                    break
+                time.sleep(0.01)
+        finally:
+            emitter._listeners.clear()
+            emitter._listeners.update(snapshot)
+
+        self.assertEqual(len(seen), 1, "999 обязан дойти до обработчика адреса")
+        self.assertIn("CONNECTION_BANNED", seen[0])
+        self.assertFalse(a.is_banned, "999 — бан адреса, аккаунт не баним")
+
+    def test_watchdog_does_not_stop_live_session(self):
+        """Сторож прокси не гасит идущую игру из-за бана адреса.
+
+        Иначе вред из handle_ip_ban просто переехал бы в сторож: он тоже
+        видит `is_banned(proxy)` и зовёт swap_proxy со stop()+start().
+        """
+        a = self._bot(1, "socks5://9.9.9.9:1080", "A", live=True)
+        a.stopping = False
+        self.pool.mark_banned("socks5://9.9.9.9:1080", reason="тест")
+
+        swapped = []
+
+        class Mgr:
+            def __init__(self):
+                self.bots = {1: a}
+                self.proxy_pool = self_pool
+
+            def swap_proxy(self, bot, *, reason=""):
+                swapped.append(bot.bot_id)
+                return ""
+
+        self_pool = self.pool
+        self.botmod.BotManager._proxy_watch_pass(Mgr())
+
+        self.assertEqual(swapped, [], "живую сессию сторож не трогает")
+        self.assertEqual(a.stop_calls, 0, "stop() посреди игры запрещён")
+        self.assertFalse(a.is_banned, "бан адреса не банит аккаунт")
+        self.assertGreater(a.parked_until, time.time())
 
     def test_no_proxy_does_not_crash(self):
         a = self._bot(1, "", "A")
@@ -416,8 +615,44 @@ class IpBanHandlerTests(unittest.TestCase):
 
         out = self.botmod.BotManager.handle_ip_ban(Mgr(), a, reason="x")
         self.assertEqual(out["moved"], [])
-        self.assertEqual(out["marked"], [])
+        self.assertEqual(out["parked"], [])
         self.assertEqual(out["proxy"], "")
+
+
+class ParkingTests(unittest.TestCase):
+    """Парковка: аккаунт жив, но в закрытый адрес не долбится."""
+
+    def test_park_delays_reconnect_start(self):
+        from test_reconnect import make_bot
+
+        bot = make_bot()
+        bot.parked_until = time.time() + 2.0
+        bot.parked_reason = "адрес заблокирован, свободного узла нет"
+
+        bot.schedule_reconnect(delay=0.1)
+        time.sleep(1.0)
+        self.assertFalse(bot.start.called,
+                         "пока парковка идёт, вход не начинается")
+
+        for _ in range(60):
+            if bot.start.called:
+                break
+            time.sleep(0.1)
+        self.assertTrue(bot.start.called,
+                        "после парковки вход обязан состояться")
+
+        bot.stopping = True
+        bot.reconnect_cancel_event.set()
+
+    def test_unpark_allows_immediate_reconnect(self):
+        from test_reconnect import make_bot
+
+        bot = make_bot()
+        bot.parked_until = time.time() + 600.0
+        bot.parked_reason = "долгая парковка"
+        bot.unpark("ручной запуск")
+        self.assertEqual(bot.park_remaining(), 0.0)
+        self.assertFalse(bot.is_parked())
 
 
 class VpnPaginationTests(unittest.TestCase):

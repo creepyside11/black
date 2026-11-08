@@ -602,6 +602,10 @@ def _default_pickup(bot, pickup_id: int) -> bool:
 
     SendPickup(436) без picked_up_interact(413) меню не открывает — это
     уже проверено на шахте, там шлются оба.
+
+    Внимание: это про пикапы с меню (шахта, ферма). Предмет с земли
+    поднимается иначе и одним пакетом — RPC 413 с телом 18.
+    Подробности и доказательства: PICKUP_PROTOCOL.md.
     """
     session = getattr(bot, "session", None)
     if session is None:

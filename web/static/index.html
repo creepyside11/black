@@ -23,17 +23,13 @@
       </svg>
     </div>
     <h1>RakCRMP</h1>
-    <p class="gate-sub" id="gate-sub">Проверяю вход через Telegram…</p>
+    <p class="gate-sub" id="gate-sub">Проверяю вход…</p>
 
     <form id="login-form" class="gate-form" hidden>
       <label class="fld">
-        <span>Логин</span>
-        <input id="in-login" type="text" autocomplete="username"
-               spellcheck="false" autocapitalize="off" required>
-      </label>
-      <label class="fld">
-        <span>Пароль</span>
-        <input id="in-pass" type="password" autocomplete="current-password" required>
+        <span>Ключ доступа</span>
+        <input id="in-key" type="text" autocomplete="off" spellcheck="false"
+               autocapitalize="characters" placeholder="RAK-XXXX-XXXX-XXXX-XXXX" required>
       </label>
       <button class="btn btn-solid" type="submit" id="in-submit">Войти</button>
     </form>
@@ -123,6 +119,19 @@
 
     <!-- ЕЩЁ -->
     <section class="view" data-view="more" hidden>
+      <div class="glass card">
+        <h2>Проект</h2>
+        <label class="fld"><span>Игровой проект</span>
+          <select id="p-project"></select>
+        </label>
+        <p class="hint">
+          Переключение сохраняет реестр текущего проекта, останавливает его ботов
+          и поднимает аккаунты выбранного. Аккаунты не удаляются: у каждого
+          проекта свой файл.
+        </p>
+        <button class="btn btn-solid" id="p-go">Переключить</button>
+      </div>
+
       <form class="glass card form" id="settings-form">
         <h2>Настройки</h2>
         <label class="fld"><span>Базовый пароль новых</span>
@@ -154,8 +163,8 @@
 
       <div class="glass card">
         <h2>Аккаунт</h2>
-        <div class="kv"><span>Логин</span><b id="m-login">—</b></div>
-        <div class="kv"><span>Telegram</span><b id="m-tg">—</b></div>
+        <div class="kv"><span>Вход</span><b id="m-tg">по ключу</b></div>
+        <div class="kv"><span>Проект</span><b id="m-project">—</b></div>
         <div class="kv"><span>Серверов</span><b id="m-servers">—</b></div>
         <button class="btn btn-danger btn-block" id="btn-logout">Выйти</button>
       </div>

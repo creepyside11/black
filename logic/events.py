@@ -35,6 +35,9 @@ class EventEmitter:
         )
         self._shutdown = False
         self._shutdown_lock = threading.Lock()
+        # Обработчики, которым нужен синхронный вызов. Держим отдельно:
+        # на связанный метод атрибут не повесить (см. subscribe).
+        self._sync_listeners: set = set()
 
     def on(self, event: str, key: Hashable = None, sync: bool = False):
         def decorator(func: Callable) -> Callable:
@@ -47,6 +50,35 @@ class EventEmitter:
 
             return func
         return decorator
+
+    def subscribe(self, event: str, func: Callable, key: Hashable = None,
+                  sync: bool = False) -> Callable:
+        """Подписать готовый обработчик, в том числе связанный метод.
+
+        on() — декоратор: он пишет _event_sync в саму функцию, а у
+        связанного метода нет __dict__, и запись падает с AttributeError.
+        Поэтому для методов — сюда: регистрируем напрямую, а флаг
+        синхронности держим в множестве, а не в атрибуте.
+
+        sync=True обязателен для объектов, которые меняют своё состояние
+        из обработчика и читают его из своего же цикла: пул воркеров
+        выполнил бы обработчик в другом потоке, и состояние поехало бы.
+        """
+        if sync:
+            self._sync_listeners.add(func)
+
+        if key is None:
+            self._listeners.setdefault(event, []).append(func)
+        else:
+            self._keyed_listeners.setdefault(event, {}).setdefault(key, []).append(func)
+
+        return func
+
+    def _is_sync_listener(self, func: Callable) -> bool:
+        try:
+            return func in self._sync_listeners
+        except TypeError:
+            return False
 
     def off(self, event: str, func: Callable, key: Hashable = None) -> None:
         if key is None:
@@ -87,7 +119,9 @@ class EventEmitter:
         if self._shutdown:
             return
 
-        if self._is_default_handler(func) or getattr(func, "_event_sync", False):
+        if (self._is_default_handler(func)
+                or getattr(func, "_event_sync", False)
+                or self._is_sync_listener(func)):
             self._run_handler(event, func, *args, **kwargs)
             return
 

@@ -617,7 +617,9 @@ class BotAPI(JsonAPI):
 
         self.session.protocol.send_with_header(
             PacketBuilder.rpc(
-                RPCBuilder.create(int(rpc_id) & 0xFF, bytes(payload))
+                # В заголовке под id 9 бит. Маска 0xFF съедала старший бит:
+                # RPC 423 уходил как 167 (чужой RPC), и сервер молчал.
+                RPCBuilder.create(int(rpc_id) & 0x1FF, bytes(payload))
             ),
             reliability,
             ordering_channel,
@@ -855,21 +857,28 @@ class BotAPI(JsonAPI):
         speed: float | None = None,
         velocity_mode: str = "consistent",
         legit_speed: float | None = None,
-        keys: int = 0,
+        keys: int | None = None,
         face_movement: bool = True,
         jitter: float | None = None,
         settle_packets: int | None = None,
         blocking: bool = True,
         on_progress=None,
+        human: bool = True,
     ):
         """Телепорт delta-методом: путь режется на шаги, каждый шаг — свой sync.
 
         speed     — целевая скорость в м/с. Шаг считается из неё, чтобы
                     позиция и velocity в пакете не расходились. По умолчанию
-                    SAFE_SPEED (8.5 м/с) — быстрее сервер откатывает.
+                    SAFE_SPEED (8 м/с — решение владельца).
         step      — метров за один пакет (перебивает speed)
-        interval  — секунд между пакетами (по умолчанию один тик, 0.02с)
+        interval  — номинальный интервал между пакетами (тик, 0.02с)
         velocity_mode — consistent | legit | zero
+        human     — человеческий ритм: интервал между пакетами и скорость
+                    гуляют от пакета к пакету, оси движения и спринт
+                    выставляются как у живого клиента. Ровная очередь из
+                    50 пакетов в секунду с постоянным шагом — подпись
+                    скрипта, её и видит античит.
+        keys      — битмаска клавиш; None = спринт (8) в human-режиме.
         """
         if not self.session or not self.session.connected:
             raise RuntimeError("DeltaTeleportTo: сессия не подключена")
@@ -877,6 +886,7 @@ class BotAPI(JsonAPI):
         from logic.delta_teleport import (
             DeltaTeleport,
             DEFAULT_LEGIT_SPEED,
+            HUMAN_SPRINT_KEYS,
             SAFE_INTERVAL,
             SAFE_SPEED,
             step_for_speed,
@@ -884,6 +894,11 @@ class BotAPI(JsonAPI):
 
         bot_player = self.session.players.bot
         target = (float(x), float(y), float(z))
+
+        if keys is None:
+            resolved_keys = HUMAN_SPRINT_KEYS if human else 0
+        else:
+            resolved_keys = int(keys)
 
         def _run() -> dict:
             bot_player.cancel_coord_movement(reason="delta_teleport")
@@ -905,12 +920,13 @@ class BotAPI(JsonAPI):
                 interval=resolved_interval,
                 velocity_mode=velocity_mode,
                 legit_speed=DEFAULT_LEGIT_SPEED if legit_speed is None else legit_speed,
-                keys=keys,
+                keys=resolved_keys,
                 face_movement=face_movement,
                 jitter=0.05 if jitter is None else jitter,
                 settle_packets=3 if settle_packets is None else settle_packets,
                 abort_check=lambda: not self.session.connected,
                 on_progress=on_progress,
+                human=human,
             )
 
             # Шедулер не должен вклиниваться между шагами: он пришлёт

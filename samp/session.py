@@ -1,4 +1,5 @@
 
+import os
 import time
 import threading
 import queue
@@ -56,9 +57,22 @@ class SampSession:
         http_server_names: dict[str, str] | None = None,
         registration: RegistrationConfig | None = None,
         json_ui: JsonUIConfig | None = None,
+        handshake: str = "br",
+        handshake_options: dict | None = None,
     ):
         self.api = None
         self._emit_callback = lambda event, *args, **kwargs: None
+
+        # Каким пакетом начинается вход. "br" — два байта b"BR" и BR-шный
+        # OPEN_CONNECTION_REPLY с cookie (Black Russia). "raknet" —
+        # стандартный offline-обмен RakNet 0x05/0x06/0x07/0x08/0x09
+        # (SA-MP и форки вроде Arizona).
+        self.handshake = str(handshake or "br").strip().lower()
+        # Версия протокола и magic для raknet-входа: у разных сборок они
+        # разные, поэтому задаются профилем проекта, а не кодом.
+        self.handshake_options = dict(handshake_options or {})
+        # Отчёт offline-этапа: попадает в логи и в диагностику.
+        self.raknet_offline_report: dict = {}
 
         self.protocol = protocol
         self.server_ip = server_ip
@@ -1001,6 +1015,15 @@ class SampSession:
         )
 
     def _send_post_handshake_packets(self) -> None:
+        if self.handshake == "raknet":
+            # В SA-MP после принятого offline-подключения клиент шлёт только
+            # CLIENT_JOIN и ждёт INIT_GAME. BR-шные NEW_INCOMING_CONNECTION,
+            # внутренние пинги и RECEIVED_STATIC_DATA — свои пакеты CRMP,
+            # сервер SA-MP их не знает и на них не отвечает.
+            self.send_rpc_client_join()
+            self._mark_server_packet_received()
+            return
+
         self.send_new_incoming_connection()
 
         for _ in range(POST_ACCEPT_INTERNAL_PING_COUNT):
@@ -1009,6 +1032,59 @@ class SampSession:
         self.send_received_static_data()
         self.send_rpc_client_join()
         self._mark_server_packet_received()
+
+    def _run_offline_handshake(self) -> bool:
+        """Стандартный offline-обмен RakNet вместо BR-шного пакета b"BR".
+
+        Идёт по тому же транспорту, что и вся сессия: если бот сидит на
+        SOCKS-прокси, offline-пакеты уходят через него, а не напрямую с
+        домашнего IP.
+        """
+        from . import raknet_offline
+
+        try:
+            timeout = float(os.environ.get("BR_RAKNET_OFFLINE_TIMEOUT", "3.0"))
+        except (TypeError, ValueError):
+            timeout = 3.0
+
+        transport = getattr(self.protocol, "network", None)
+
+        # Вариант из профиля проекта, если он там задан: перебор версий на
+        # боевом канале недопустим — каждый вариант в переборе шлётся своим
+        # сокетом, а тут канал один и он же нужен connected-фазе.
+        variant = None
+        if self.handshake_options.get("version"):
+            variant = {
+                "version": int(self.handshake_options.get("version")),
+                "magic": bool(self.handshake_options.get("magic")),
+            }
+
+        engine = raknet_offline.OfflineHandshake(
+            self.server_ip, self.server_port,
+            timeout=timeout, log=logger.info, transport=transport,
+            variant=variant,
+        )
+        report = engine.run()
+        self.raknet_offline_report = report
+
+        if report.get("ok"):
+            logger.info(
+                "OFFLINE: соединение принято | "
+                f"protocol={report.get('variant', {}).get('version')} "
+                f"magic={int(bool(report.get('variant', {}).get('magic')))} "
+                f"mtu={report.get('mtu')}"
+            )
+            return True
+
+        replies = ", ".join(
+            str(item.get("name")) for item in report.get("replies") or []
+        )
+        self.report_handshake_failure(
+            "offline_raknet",
+            "стандартный RakNet не принят"
+            + (f"; ответы сервера: {replies}" if replies else "; сервер молчит"),
+        )
+        return False
 
     def _fail_open_connection(self, attempts: int) -> bool:
         server_ip = str(self.server_ip)
@@ -1089,14 +1165,42 @@ class SampSession:
             return False
 
         self._reset_for_connect()
-        self._background_recv_enabled = True
-        self._start_network_loop()
 
         attempts = 0
         next_open_request_at = 0.0
         stage_deadline = 0.0
 
         logger.info(f"Connecting to {self.server_ip}:{self.server_port}")
+
+        if self.handshake == "raknet":
+            # Порядок входа другой, и он весь до приёмного цикла: offline-обмен
+            # 0x05/0x06/0x07/0x08/0x09 идёт вне connected-фрейма, поэтому
+            # разборщик датаграмм его не поймёт — а именно он начнёт читать
+            # сокет, если поднять цикл раньше.
+            #
+            # pre-ping тут не формальность: у Black Russia сервер открывает
+            # UDP только тому адресу, который сначала представился по HTTP, и
+            # с SA-MP-форками бывает так же. Без него offline-этап уходит в
+            # пустоту, а выглядит это как «сервер не отвечает».
+            self.http_pre_ping.ping(reason="before RAKNET offline handshake")
+            if not self._run_offline_handshake():
+                return False
+
+            self._background_recv_enabled = True
+            self._start_network_loop()
+
+            # Пакета b"BR" и BR-шного cookie-обмена тут нет: соединение
+            # принято на offline-этапе, следующая стадия — init_game.
+            self._connection_request_sent = True
+            self._handshake_stage = "init_game"
+            self._send_post_handshake_packets()
+            stage_deadline = (
+                time.monotonic()
+                + self._handshake_stage_timeout("init_game")
+            )
+        else:
+            self._background_recv_enabled = True
+            self._start_network_loop()
 
         while self.connected:
             if self._init_game_received.is_set():

@@ -48,6 +48,18 @@ STUN_HOST = "stun.l.google.com"
 STUN_PORT = 19302
 STUN_MAGIC = 0x2112A442
 
+# Куда спрашивать «какой у меня внешний IP» по TCP, когда UDP не прошёл.
+EGRESS_HOST = "api.ipify.org"
+EGRESS_PORT = 80
+
+# Куда стучимся, чтобы понять, везёт ли туннель TCP вообще.
+#
+# Нужен адрес, который отвечает всегда и не зависит от игры: молчание
+# игрового сервера и мёртвый туннель выглядят одинаково, а лечатся
+# по-разному. 1.1.1.1 по HTTP отвечает всем.
+TCP_PROBE_HOST = "1.1.1.1"
+TCP_PROBE_PORT = 80
+
 # Проверка ДО ИГРЫ, а не до интернета.
 #
 # Прокси может прекрасно пускать в интернет и при этом не пускать на
@@ -73,6 +85,12 @@ STATUS_NEEDS_CLIENT = "needs_client"
 # Прокси живой, UDP идёт, но игровой сервер через него не отвечает.
 # Для бота это то же самое, что мёртвый: он не зайдёт.
 STATUS_NO_GAME = "no_game"
+# Живой CONNECT, но через туннель не проходит ни один байт: ни UDP, ни
+# TCP. Отдельно от no_udp: там узел работает и не везёт только датаграммы,
+# тут не работает вообще. Раньше оба случая сливались в no_udp, потому что
+# SOCKS5 отвечает «ok» на CONNECT ещё до похода в сеть, и «успешный»
+# CONNECT ничего не доказывал.
+STATUS_NO_TRAFFIC = "no_traffic"
 STATUS_BAD_UDP = "no_udp"
 STATUS_UNKNOWN = "unknown"
 
@@ -89,6 +107,11 @@ class ProbeResult:
     # SOCKS5-адрес локального моста, если узел поднят через sing-box.
     # Для direct-узлов пусто: там прокси — сам узел.
     socks_url: str = ""
+    # Внешний адрес, которым прокси выходит в сеть — то, что видит игровой
+    # сервер. У моста это выход узла, а не 127.0.0.1:<порт>. Нужен, чтобы
+    # бан по IP ложился на адрес, а не на локальный порт: порт виден только
+    # нам, банить его бессмысленно и вредно.
+    egress: str = ""
 
     @property
     def proxy_url(self) -> str:
@@ -293,12 +316,16 @@ def verify_socks5(
     check_udp: bool = True,
     game_host: str = "",
     game_port: int = GAME_TARGET_PORT,
+    report: dict | None = None,
 ) -> tuple[bool, bool, str, float | None]:
     """Сквозная проверка SOCKS5: TCP до цели и UDP через STUN.
 
     TCP и UDP проверяются на РАЗНЫХ управляющих соединениях. После CONNECT
     соединение уходит в туннель, и UDP ASSOCIATE на нём сервер уже не
     обрабатывает — проверка висела бы до таймаута на живом прокси.
+
+    `report` — необязательный словарь, куда кладётся внешний адрес выхода
+    (`egress`). Возвращать пятое значение нельзя: сигнатуру уже вызывают.
 
     Возвращает (живой, годится_боту, причина, задержка_мс).
     """
@@ -351,6 +378,17 @@ def verify_socks5(
                     pass
 
     if not external:
+        # UDP не прошёл. Но «не прошёл UDP» и «не работает вообще» — разные
+        # диагнозы, и лечатся по-разному. SOCKS5 отвечает «ok» на CONNECT до
+        # того, как открыл соединение к узлу, поэтому успешный CONNECT ничего
+        # не доказывает: узел с мёртвым туннелем выглядел живым и получал
+        # ложный «no_udp». Спрашиваем данные у адреса, который отвечает
+        # всегда, — чтобы не путать молчание игры с мёртвым туннелем.
+        carried, why = _tcp_carries(
+            host, port, login=login, password=password, timeout=timeout,
+        )
+        if not carried:
+            return True, False, f"узел не везёт трафик ({why})", latency
         return True, False, "socks5: UDP через прокси не проходит", latency
 
     # Пинг берём по времени круга STUN, а не по ответу на CONNECT.
@@ -359,6 +397,10 @@ def verify_socks5(
     # 1 мс. Настоящая дорога видна только по реальному ответу из сети.
     if rtt:
         latency = rtt
+
+    if report is not None:
+        # STUN отдал внешний ip:port — это и есть адрес выхода прокси.
+        report["egress"] = external.rsplit(":", 1)[0]
 
     # Прокси пускает в интернет — но пустит ли он в игру? Это отдельный
     # вопрос, и без него бот входит в «сервер не отвечает».
@@ -407,6 +449,93 @@ def _game_reachable(host, port, *, login="", password="", game_host="",
                 sock.close()
             except OSError:
                 pass
+
+
+def _tcp_carries(host: str, port: int, *, login: str = "", password: str = "",
+                 timeout: float = 6.0,
+                 target_host: str = TCP_PROBE_HOST,
+                 target_port: int = TCP_PROBE_PORT) -> tuple[bool, str]:
+    """Везёт ли туннель TCP на самом деле: CONNECT и реальные данные.
+
+    Успешный ответ SOCKS5 на CONNECT ничего не доказывает — sing-box
+    отвечает «ok» раньше, чем открыл соединение к узлу. Поэтому просим
+    страницу у адреса, который отвечает всегда, и смотрим на байты.
+    """
+    sock = None
+    try:
+        sock = socket.create_connection((host, int(port)), timeout=timeout)
+        sock.settimeout(timeout)
+        if not _socks5_handshake(sock, login, password):
+            return False, "отказ авторизации"
+        if not _socks5_connect(sock, target_host, int(target_port)):
+            return False, "CONNECT не прошёл"
+        sock.sendall(
+            f"HEAD / HTTP/1.0\r\nHost: {target_host}\r\n\r\n".encode()
+        )
+        data = sock.recv(32)
+        if not data:
+            return False, "данных нет"
+        return True, ""
+    except OSError as exc:
+        return False, type(exc).__name__
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def tcp_egress(
+    host: str,
+    port: int,
+    *,
+    login: str = "",
+    password: str = "",
+    timeout: float = 6.0,
+    target_host: str = EGRESS_HOST,
+    target_port: int = EGRESS_PORT,
+) -> str:
+    """Внешний IP прокси по TCP: адрес, который видит игровой сервер.
+
+    Нужен там, где UDP не проходит, а адрес выхода узнать всё равно надо:
+    бан должен ложиться на выходной IP, а не на локальный порт моста.
+    Пустая строка — не узнали; выдумывать адрес нельзя.
+    """
+    sock = None
+    try:
+        sock = socket.create_connection((host, int(port)), timeout=timeout)
+        sock.settimeout(timeout)
+        if not _socks5_handshake(sock, login, password):
+            return ""
+        if not _socks5_connect(sock, target_host, int(target_port)):
+            return ""
+        sock.sendall(
+            f"GET / HTTP/1.0\r\nHost: {target_host}\r\n"
+            "User-Agent: Dalvik/2.1.0\r\n\r\n".encode()
+        )
+        body = b""
+        while len(body) < 256:
+            chunk = sock.recv(128)
+            if not chunk:
+                break
+            body += chunk
+    except OSError:
+        return ""
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+    if b"\r\n\r\n" not in body:
+        return ""
+    tail = body.rsplit(b"\r\n\r\n", 1)[1].strip().decode("ascii", "ignore")
+    try:
+        socket.inet_aton(tail)
+    except OSError:
+        return ""
+    return tail if tail.count(".") == 3 else ""
 
 
 def verify_http(
@@ -489,6 +618,7 @@ def probe_node(
         return result
 
     if node.protocol in ("socks5", "socks4", "socks4a"):
+        report: dict = {}
         alive, usable, reason, latency = verify_socks5(
             node.address,
             node.port,
@@ -500,15 +630,21 @@ def probe_node(
             check_udp=check_udp,
             game_host=game_host,
             game_port=game_port,
+            report=report,
         )
         result.alive = alive
         result.usable = usable
         result.latency_ms = latency
         result.reason = reason
+        result.egress = str(report.get("egress") or "")
         if usable:
             result.status = STATUS_OK
         elif reason.startswith("игра"):
             result.status = STATUS_NO_GAME
+        elif reason.startswith("узел не везёт"):
+            # Живой вход, мёртвый туннель. Это не «no_udp»: там узел
+            # работает и не везёт только датаграммы.
+            result.status = STATUS_NO_TRAFFIC
         elif alive:
             result.status = STATUS_BAD_UDP
         else:

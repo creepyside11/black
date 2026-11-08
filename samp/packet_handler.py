@@ -444,15 +444,47 @@ class SampPacketHandler:
     def api(self):
         return self.session.api
 
+    @staticmethod
+    def _describe_connection_banned(result: dict) -> str:
+        """Что именно пришло в 0x19: текст причины, тело или пусто.
+
+        Раньше этот пакет только превращался в код 999, и в логе не было
+        ни одной зацепки, за что забанен адрес.
+        """
+        parsed = result.get("parsed_payload")
+        if not isinstance(parsed, dict):
+            parsed = result
+
+        text = str(parsed.get("reason") or "").strip()
+        if text:
+            return f"причина от сервера: {text[:200]!r}"
+
+        raw = parsed.get("raw") or b""
+        try:
+            raw = bytes(raw)
+        except Exception:
+            raw = b""
+
+        if raw:
+            return f"тело пакета без текста: {raw[:32].hex()}"
+
+        return "тело пакета пустое (vanilla 0x19 несёт только код)"
+
     def _check_disconnection(self, result: dict) -> bool:
         if result and result.get("type") == "disconnection_notification":
             reason = result.get("reason", "Unknown reason")
 
             self.session.connected = False
+            self.session._last_disconnect_reason = str(reason)
             self.session._emit_callback("disconnect")
             return True
         elif result and result.get("type") == "connection_banned":
+            detail = self._describe_connection_banned(result)
+
             self.session.connected = False
+            self.session._last_disconnect_reason = f"CONNECTION_BANNED (0x19): {detail}"
+            logger.warn(f"CONNECTION_BANNED (0x19) | {detail}")
+
             self.session._emit_callback("onKick", 999)
             self.session._emit_callback("disconnect")
             return True

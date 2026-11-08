@@ -452,3 +452,144 @@ class BridgeMemoryTests(unittest.TestCase):
         pool._prober = prober
         pool.refresh(fetch=False)
         self.assertEqual(stopped, [nodes[1].key], "мост мёртвого узла не погашен")
+
+
+class BusyBridgeTests(unittest.TestCase):
+    """Проба не гасит мост, через который играет живой бот.
+
+    `_probe_needs_client` и `_probe_via_bridge` останавливали всё, что не
+    пустило трафик. Проба может провалиться на живом узле (таймаут, потеря
+    UDP, загруженный CPU), и тогда у работающего бота рвался туннель —
+    sing-box умирал с кодом -15. Живая сессия важнее статуса в сводке.
+    """
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        self._tmp.close()
+        self.path = self._tmp.name
+
+    def tearDown(self):
+        import os
+        for suffix in ("", ".bak", ".tmp"):
+            try:
+                os.unlink(self.path + suffix)
+            except OSError:
+                pass
+
+    def _fake(self):
+        nodes = [
+            VpnNode(name="good", protocol="vless", address="good.example.com",
+                    port=443, login="u1", raw='{"outbounds":[{"server":"good"}]}'),
+            VpnNode(name="bad", protocol="vless", address="bad.example.com",
+                    port=443, login="u2", raw='{"outbounds":[{"server":"bad"}]}'),
+        ]
+        stopped = []
+        busy: set[str] = set()
+
+        class Bridge:
+            def available(self):
+                return True
+
+            def start(self, key, link):
+                return "socks5://127.0.0.1:%d" % (20001 if "good" in key else 20002)
+
+            def port_of(self, key):
+                return 20001 if "good" in key else 20002
+
+            def running(self):
+                return [n.key for n in nodes]
+
+            def acquire(self, key, port=None):
+                if key:
+                    busy.add(key)
+                if port:
+                    busy.add("port:%d" % int(port))
+
+            def release(self, key, port=None):
+                busy.discard(key)
+                if port:
+                    busy.discard("port:%d" % int(port))
+
+            def is_busy(self, key):
+                return key in busy
+
+            def key_of_port(self, port):
+                for n in nodes:
+                    if (20001 if "good" in n.key else 20002) == int(port):
+                        return n.key
+                return ""
+
+            def stop(self, key, force=False):
+                # Настоящая логика моста: занятый не гасим.
+                if not force and key in busy:
+                    return
+                stopped.append(key)
+
+        pool = P.ProxyPool(self.path, loader=lambda u, **k: [],
+                           log=lambda _m: None)
+        pool.bridge = Bridge()
+        pool._cached_nodes = list(nodes)
+
+        def prober(batch, **kwargs):
+            return [
+                ProbeResult(node=n, alive=True, usable=n.port == 20001,
+                            status=STATUS_OK if n.port == 20001
+                            else STATUS_NEEDS_CLIENT)
+                for n in batch
+            ]
+
+        pool._prober = prober
+        return pool, nodes, stopped, busy
+
+    def test_busy_bridge_survives_failed_probe(self):
+        pool, nodes, stopped, busy = self._fake()
+        # Бот играет через мост «плохого» узла.
+        busy.add(nodes[1].key)
+        pool.refresh(fetch=False)
+        self.assertEqual(stopped, [], "мост под живой сессией погасили")
+        self.assertTrue(busy, "метка занятости потерялась")
+
+    def test_free_dead_bridge_is_still_stopped(self):
+        pool, nodes, stopped, busy = self._fake()
+        pool.refresh(fetch=False)
+        self.assertEqual(stopped, [nodes[1].key],
+                         "никем не занятый мёртвый мост не погасили")
+
+    def test_hold_is_released_after_bot_disconnect(self):
+        pool, nodes, stopped, busy = self._fake()
+        token = pool.acquire_proxy("socks5://127.0.0.1:20002")
+        key, _, port = token.rpartition("|")
+        self.assertEqual(key, nodes[1].key, "порт не перевёлся в узел")
+        self.assertEqual(port, "20002")
+        self.assertTrue(pool.bridge.is_busy(nodes[1].key))
+        pool.refresh(fetch=False)
+        self.assertEqual(stopped, [], "занятый мост погасили во время пробы")
+        # Бот отключился — метка снята, и мост уже не нужен.
+        pool.release_proxy(token)
+        self.assertFalse(pool.bridge.is_busy(nodes[1].key))
+        self.assertNotIn("port:20002", busy)
+
+    def test_hold_survives_unknown_key_by_port(self):
+        """Мост поднял прошлый процесс: ключа нет, но порт известен.
+
+        Такой мост менеджеру не погасить (процесс не его), но и метка по
+        порту должна стоять: если он поднимет свой мост на этом порту,
+        уборка не имеет права его тронуть.
+        """
+        pool, nodes, stopped, busy = self._fake()
+        pool.bridge.key_of_port = lambda port: ""
+        pool._cached_nodes = []
+        pool.nodes = lambda: []
+        pool.statuses = lambda: []
+        token = pool.acquire_proxy("socks5://127.0.0.1:20002")
+        self.assertTrue(token.endswith("|20002"))
+        self.assertIn("port:20002", busy, "метка по порту не встала")
+
+    def test_acquire_ignores_remote_proxy(self):
+        pool, nodes, stopped, busy = self._fake()
+        self.assertEqual(pool.acquire_proxy("socks5://1.2.3.4:1080"), "",
+                         "чужой прокси держать нечего")
+        self.assertEqual(pool.acquire_proxy(""), "")
+        # Локальный порт держим даже без ключа узла — по номеру порта.
+        self.assertTrue(pool.acquire_proxy("socks5://127.0.0.1:9").endswith("|9"))

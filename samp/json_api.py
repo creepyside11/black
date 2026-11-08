@@ -208,3 +208,26 @@ class JsonAPI:
             PacketBuilder.rpc_build("picked_up_interact", int(pickup_id)),
             rpc_name="picked_up_interact",
         )
+
+    def pickup_ground(self) -> bool:
+        """Поднять предмет с земли. ОДИН пакет, тело — константа 18.
+
+        Не путать с pickup_interact(id): тот шлёт тот же RPC 413, но с id
+        пикапа, и открывает МЕНЮ (шахта, ферма). Предмет с земли берётся
+        пакетом с телом 18 — сервер сам решает, что лежит под игроком,
+        поэтому знать id предмета не нужно, нужно только стоять рядом.
+
+        Проверено: тело 0b9df10090000000 совпадает с живым клиентом
+        побайтово. Разбор — PICKUP_PROTOCOL.md.
+        """
+        from .constants import RPC
+
+        if not self.session.connected:
+            return False
+        self.session._sender.send(
+            PacketBuilder.rpc_build(
+                "picked_up_interact", int(RPC.GROUND_PICKUP_CONST)
+            ),
+            rpc_name="picked_up_interact",
+        )
+        return True

@@ -4,7 +4,7 @@ import math
 import unittest
 
 from logic import undermap
-from logic.delta_teleport import SAFE_SPEED
+from logic.delta_teleport import SAFE_SPEED, step_for_speed
 
 
 class FakePlayer:
@@ -196,9 +196,16 @@ class TravelTests(unittest.TestCase):
                 steps.append(step)
             prev = pos
         self.assertTrue(steps)
-        self.assertLessEqual(max(steps), 0.171)
+        # Границы считаем от той же формулы, что и модуль: здесь стояли
+        # числа 0.171/0.169, посчитанные руками под SAFE_SPEED = 8.5
+        # (8.5 * 0.02 = 0.17). Смена скорости владельцем (8.0 → шаг 0.16)
+        # роняла тест, хотя поведение оставалось правильным.
+        step_ref = step_for_speed(SAFE_SPEED, 0.001)
+        self.assertLessEqual(max(steps), step_ref * 1.006)
         # подавляющая часть шагов — ровно расчётные
-        self.assertGreater(sum(1 for x in steps if x > 0.169), len(steps) * 0.9)
+        self.assertGreater(
+            sum(1 for x in steps if x > step_ref * 0.994), len(steps) * 0.9
+        )
 
     def test_velocity_never_exceeds_safe(self):
         report, recorder, _, _ = run_route((0, 0, 20), (200, 0, 20))

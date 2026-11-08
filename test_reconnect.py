@@ -103,3 +103,99 @@ class BusySessionHandlingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def make_pausable_bot():
+    """Бот с полями, которые трогает pause_until."""
+    instance = make_bot()
+    instance.paused_until = 0.0
+    instance.scheduled_reconnect_delay = None
+    instance.active_task = None
+    instance.api = MagicMock()
+    return instance
+
+
+class PauseUntilTests(unittest.TestCase):
+    """Пауза под payday: выйти сейчас, вернуться в своё окно входа.
+
+    Раньше «перерыв» делался через stop(): он ставит stopping=True и
+    отменяет переподключение, а монитор 24/7 такие аккаунты не поднимает.
+    Бот уходил отдыхать и не возвращался никогда.
+    """
+
+    def setUp(self):
+        self._bots = []
+
+    def tearDown(self):
+        for bot in self._bots:
+            bot.stopping = True
+            bot.reconnect_cancel_event.set()
+
+    def _bot(self):
+        bot = make_pausable_bot()
+        self._bots.append(bot)
+        return bot
+
+    def test_sets_paused_until(self):
+        bot = self._bot()
+        before = time.time()
+        delay = bot.pause_until(before + 600, reason="payday")
+        self.assertAlmostEqual(delay, 600.0, delta=1.0)
+        self.assertAlmostEqual(bot.paused_until, before + 600, delta=2.0)
+
+    def test_does_not_mark_stopping(self):
+        """stopping=True убил бы возврат: монитор такие аккаунты не поднимает."""
+        bot = self._bot()
+        bot.pause_until(time.time() + 600)
+        self.assertFalse(bot.stopping)
+
+    def test_does_not_cancel_reconnect(self):
+        bot = self._bot()
+        bot.pause_until(time.time() + 600)
+        self.assertFalse(bot.reconnect_cancel_event.is_set())
+
+    def test_disconnects_session(self):
+        bot = self._bot()
+        bot.pause_until(time.time() + 600)
+        bot.api.disconnect.assert_called_once()
+
+    def test_stops_active_task(self):
+        bot = self._bot()
+        task = MagicMock()
+        bot.active_task = task
+        bot.pause_until(time.time() + 600)
+        task.stop.assert_called_once()
+        self.assertIsNone(bot.active_task)
+
+    def test_survives_without_task_and_api(self):
+        bot = self._bot()
+        bot.api = None
+        bot.pause_until(time.time() + 600)
+        self.assertGreater(bot.paused_until, time.time())
+
+    def test_minimum_delay(self):
+        """Дата в прошлом не должна давать нулевую паузу."""
+        bot = self._bot()
+        delay = bot.pause_until(time.time() - 5000)
+        self.assertGreaterEqual(delay, botmod.PAUSE_MIN)
+
+    def test_returns_to_game_after_delay(self):
+        """По истечении паузы бот действительно поднимается."""
+        bot = self._bot()
+        original = botmod.PAUSE_MIN
+        botmod.PAUSE_MIN = 0.3
+        try:
+            bot.pause_until(time.time() + 0.3)
+            deadline = time.time() + 5.0
+            while time.time() < deadline and not bot.start.called:
+                time.sleep(0.05)
+        finally:
+            botmod.PAUSE_MIN = original
+        self.assertTrue(bot.start.called, "бот не вернулся в игру после паузы")
+
+    def test_logs_the_pause(self):
+        bot = self._bot()
+        bot.pause_until(time.time() + 600, reason="payday: конец сессии")
+        joined = "\n".join(bot.logs)
+        self.assertIn("[ПАУЗА]", joined)
+        self.assertIn("payday", joined)

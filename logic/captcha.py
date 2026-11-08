@@ -451,8 +451,17 @@ class ImageUrlSolver:
 
 
 def answer_payload(answer):
-    """Payload ответа на капчу. Единственный рабочий вариант."""
-    return {KEY_ANSWER_TYPE: ANSWER_TYPE, KEY_ANSWER_TEXT: str(answer)}
+    """Payload ответа на капчу.
+
+    Порядок ключей — `s`, потом `t`, как их пишет сам клиент. Снято с живой
+    отправки в _diag/farm.pcap, 22:18:17:
+
+        ОТ НАС id=26  {"s":"23Cuny","t":0}
+
+    Порядок для JSON не значим, но байт-в-байт совпадать с клиентом полезнее:
+    если сервер когда-нибудь начнёт сравнивать сырые строки, расхождения не будет.
+    """
+    return {KEY_ANSWER_TEXT: str(answer), KEY_ANSWER_TYPE: ANSWER_TYPE}
 
 
 def send_answer(session, answer, *, interface_id=CAPTCHA_INTERFACE):

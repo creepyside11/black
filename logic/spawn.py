@@ -651,8 +651,13 @@ class SpawnWatchdog:
                 pass
 
 
-def ensure_spawn(bot, *, timeout: float = 60.0, log=None, on_success=None,
-                 stable_seconds: float = 2.0) -> dict:
+def ensure_spawn(bot, *, index: int | None = None, timeout: float = 60.0,
+                 log=None, on_success=None, stable_seconds: float = 2.0) -> dict:
+    """Дотянуть бота до вокзала в пределах общего таймаута.
+
+    index задаёт пункт меню вокзалов напрямую. Без него берётся первый
+    (menu_choice) — а первый на разных серверах разный.
+    """
     """Дотянуть бота до вокзала в пределах общего таймаута."""
     deadline = time.monotonic() + max(1.0, float(timeout))
     report = {"status": "timeout", "position": _getpos(bot)}
@@ -671,6 +676,7 @@ def ensure_spawn(bot, *, timeout: float = 60.0, log=None, on_success=None,
         # Только меню: RPC-хендшейк — причина кика античитом кодом 25.
         report = spawn_via_menu(
             bot,
+            index=index,
             log=log,
             menu_timeout=min(30.0, max(4.0, remaining)),
             timeout=min(SPAWN_TIMEOUT, max(4.0, remaining / 2.0)),

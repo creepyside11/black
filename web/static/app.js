@@ -184,7 +184,7 @@ async function boot() {
     if (s.authed) return enter();
   } catch (e) {}
 
-  $('#gate-sub').textContent = 'Вход в панель';
+  $('#gate-sub').textContent = 'Вход по ключу доступа';
   showPassword();
 }
 
@@ -192,16 +192,15 @@ function showPassword() {
   $('#login-form').hidden = false;
 }
 
-async function doPassword(ev) {
+async function doKey(ev) {
   ev.preventDefault();
   $('#gate-err').textContent = '';
   const btn = $('#in-submit');
   btn.disabled = true;
   try {
-    await api('login', {
-      login: $('#in-login').value,
-      password: $('#in-pass').value,
-    });
+    const key = $('#in-key').value.trim();
+    if (!key) throw new Error('Введите ключ');
+    await api('key', { token: key });
     return enter();
   } catch (e) {
     $('#gate-err').textContent = e.message;
@@ -227,11 +226,77 @@ async function enter() {
 
 function renderWho() {
   const u = S.user;
-  const name = u ? (u.first_name || u.username || '') : (S.config && S.config.login) || '';
+  const name = u ? (u.first_name || u.username || '') : 'RakCRMP';
   $('#who').textContent = name;
-  $('#m-login').textContent = (S.config && S.config.login) || '—';
-  $('#m-tg').textContent = u ? (u.username ? '@' + u.username : String(u.id)) : 'пароль';
+  $('#m-tg').textContent = u ? (u.username ? '@' + u.username : String(u.id)) : 'по ключу';
+  $('#m-project').textContent = projectTitle();
   $('#m-servers').textContent = String((S.config && S.config.servers || []).length);
+}
+
+/* ---------- проект ---------- */
+
+function projectList() {
+  return (S.config && S.config.projects) || [];
+}
+
+function projectTitle() {
+  const list = projectList();
+  const active = (S.config && S.config.active_project) || '';
+  const hit = list.find((p) => p.key === active);
+  if (hit) return hit.title;
+  // Живой ответ бота знает проект точнее, чем конфиг, снятый при входе.
+  const live = S.project || {};
+  return live.title || active || '—';
+}
+
+function fillProjects() {
+  const sel = $('#p-project');
+  if (!sel) return;
+  const list = projectList();
+  const active = (S.config && S.config.active_project) || '';
+  if (!list.length) {
+    sel.innerHTML = '<option value="">проект один</option>';
+    return;
+  }
+  sel.innerHTML = list.map((p) => {
+    const mark = p.key === active ? ' • активный' : '';
+    return `<option value="${esc(p.key)}">${esc(p.title)}${mark}</option>`;
+  }).join('');
+  sel.value = active || list[0].key;
+}
+
+async function onSwitchProject() {
+  const sel = $('#p-project');
+  const key = sel ? sel.value : '';
+  if (!key) return;
+  const list = projectList();
+  const hit = list.find((p) => p.key === key) || {};
+  const active = (S.config && S.config.active_project) || '';
+  if (key === active) {
+    good('Этот проект уже активен');
+    return;
+  }
+  const running = (S.bots || []).length;
+  const warning = `Переключить проект на «${hit.title || key}»?\n\n` +
+    `Будут сохранены текущие аккаунты, остановлены боты (${running}) ` +
+    `и загружены аккаунты проекта «${hit.title || key}».`;
+  if (!confirm(warning)) return;
+  const btn = $('#p-go');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api('switch_project', { project: key });
+    const res = r.result || {};
+    good(`Проект: ${(res.project || {}).title || key}. ` +
+         `Остановлено ${res.stopped || 0}, загружено ${res.loaded || 0}`);
+    S.config = await getJSON('/api/config');
+    fillForms();
+    renderWho();
+    await refresh();
+  } catch (e) {
+    fail(e);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 /* ---------- формы ---------- */
@@ -255,6 +320,7 @@ function fillForms() {
   $('#c-task').innerHTML = taskOpts;
   $('#s-task').innerHTML = taskOpts;
 
+  fillProjects();
   fillProxySelect();
 }
 
@@ -284,6 +350,18 @@ async function refresh() {
   try {
     const st = await getJSON('/api/state');
     S.bots = st.bots || [];
+    if (st.project && st.project.key) {
+      // Живой проект от бота: если его переключили из Telegram, панель
+      // покажет это без перезагрузки страницы.
+      const changed = S.project && S.project.key !== st.project.key;
+      S.project = st.project;
+      if (changed) {
+        try { S.config = await getJSON('/api/config'); } catch (e) {}
+        fillForms();
+      }
+      const el = $('#m-project');
+      if (el) el.textContent = projectTitle();
+    }
     if (st.vpn && st.vpn.nodes) {
       S.vpn = st.vpn;
       if (!S.vpnLoaded) {
@@ -751,7 +829,7 @@ function showView(name) {
 /* ---------- привязки ---------- */
 
 function wire() {
-  $('#login-form').onsubmit = doPassword;
+  $('#login-form').onsubmit = doKey;
 
   $$('.dock-btn').forEach((b) => {
     b.onclick = () => showView(b.dataset.view);
@@ -827,6 +905,7 @@ function wire() {
 
   $('#create-form').onsubmit = onCreate;
   $('#settings-form').onsubmit = onSettings;
+  $('#p-go').onclick = onSwitchProject;
 
   $('#btn-logout').onclick = async () => {
     try { await api('logout', {}); } catch (e) {}

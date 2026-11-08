@@ -21,10 +21,35 @@ TICK = 1.0 / TICK_RATE
 
 # Скорость, которую сервер ещё считает честной.
 #
-# Замерено на живых серверах: 8.5 м/с проходит километры без единого
-# SetPlayerPos-отката, 9+ м/с сервер ловит и возвращает на доверенную точку.
-# Потолок — это скорость бега игрока, античит сверяет её с позицией.
-SAFE_SPEED = 8.5
+# 8.0 м/с — решение владельца. Доказательства «6.0 спасает» у меня нет:
+# запись живого клиента (_diag/route2.pcap) показывает, что сервер спокойно
+# терпит 3.3 м/с на дистанции и velocity 0.10-0.12 на тик, но НЕ показывает,
+# что он реагирует именно на скорость. Обрыв сессии происходит на старте
+# перелёта, когда бот ещё не сдвинулся, — значит скорость там ни при чём.
+# Что действительно видно в записи и чего не было у нас — форма трафика:
+# рваный ритм, нулевые оси ввода и один sync на датаграм. Это и правим.
+SAFE_SPEED = 8.0
+
+# Человеческий ритм. Живой клиент не шлёт sync ровной очередью: в движении
+# интервалы гуляют от 0.02 до 0.06 с, вместе с ними и velocity. Ровные
+# 50 пакетов в секунду с постоянным шагом — подпись скрипта, а не игрока.
+#
+# Пауз внутри перелёта здесь нет намеренно. В записи живого клиента редкий
+# sync (раз в полсекунды) — это когда он СТОИТ; в движении он шлёт часто.
+# «Пойти на паузу, но продолжить сдвигать позицию» — это шаг на несколько
+# метров одной датаграмой без пакетов между, то есть ровно тот самый
+# телепорт-паттерн, от которого уходим. Стоячий режим с редким sync —
+# задача шедулера (bot.py, sync_rate).
+HUMAN_TICK_MIN = 0.022
+HUMAN_TICK_MAX = 0.055
+HUMAN_SPEED_JITTER = 0.18
+# Живой клиент всё время движения держит ud = -127 (0xFF81) и жмёт спринт
+# (keys = 8). У нас в пакете стояли нули — «игрок» ехал без ввода.
+HUMAN_UD = -127
+HUMAN_LR_JITTER = 8
+HUMAN_SPRINT_KEYS = 8
+# Стоячий sync живой клиент шлёт примерно раз в полсекунды.
+HUMAN_IDLE_INTERVAL = 0.45
 
 # Один пакет на тик. Позиция и velocity в пакете должны сходиться:
 # step == speed * interval, иначе сервер видит расхождение и режет.
@@ -82,12 +107,17 @@ class DeltaTeleport:
         interval: float = DEFAULT_INTERVAL,
         velocity_mode: str = "consistent",
         legit_speed: float = DEFAULT_LEGIT_SPEED,
-        keys: int = 0,
+        keys: int | None = None,
         face_movement: bool = True,
         jitter: float = 0.05,
         settle_packets: int = 3,
         abort_check=None,
         on_progress=None,
+        human: bool = False,
+        tick_min: float = HUMAN_TICK_MIN,
+        tick_max: float = HUMAN_TICK_MAX,
+        speed_jitter: float = HUMAN_SPEED_JITTER,
+        control_axes: bool = True,
         sleep=time.sleep,
         clock=time.monotonic,
     ):
@@ -111,6 +141,10 @@ class DeltaTeleport:
         self.interval = _clamp(interval, MIN_INTERVAL, MAX_INTERVAL)
         self.velocity_mode = velocity_mode
         self.legit_speed = max(0.0, float(legit_speed))
+        # Без явной битмаски в человеческом режиме жмём спринт — ровно так
+        # делает живой клиент, когда бежит (keys = 8 в записи route2.pcap).
+        if keys is None:
+            keys = HUMAN_SPRINT_KEYS if human else 0
         self.keys = int(keys) & 0xFFFF
         self.face_movement = bool(face_movement)
         self.jitter = _clamp(jitter, 0.0, 0.5)
@@ -120,13 +154,70 @@ class DeltaTeleport:
         self._sleep = sleep
         self._clock = clock
 
+        # Человеческий режим: интервал и скорость гуляют от пакета к пакету.
+        # Выключен по умолчанию — оффлайн-тесты проверяют ровную математику.
+        self.human = bool(human)
+        self.tick_min = _clamp(tick_min, MIN_INTERVAL, MAX_INTERVAL)
+        self.tick_max = _clamp(max(tick_max, self.tick_min), self.tick_min, MAX_INTERVAL)
+        self.speed_jitter = _clamp(speed_jitter, 0.0, 0.5)
+        self.control_axes = bool(control_axes)
+        # Средняя скорость: шаг и интервал задают её, дальше её только
+        # размазываем по времени, чтобы позиция и velocity не разошлись.
+        self.nominal_speed = self.step / self.interval
+        self.settle_interval = (
+            HUMAN_IDLE_INTERVAL if self.human else self.interval
+        )
+
+    # ---------------------------------------------------------------- ритм
+
+    def _sample_advance(self) -> tuple[float, float]:
+        """Возвращает (шаг в метрах, интервал в секундах) для одного пакета.
+
+        В human-режиме интервал гуляет, а шаг считается из него: тогда
+        velocity в пакете всегда равна реальной скорости, и по пакету видно
+        не ровную линию, а человеческий разброс.
+        """
+        if not self.human:
+            return self.step, self.interval
+
+        dt = random.uniform(self.tick_min, self.tick_max)
+
+        speed = self.nominal_speed
+        if self.speed_jitter > 0.0:
+            speed *= 1.0 + random.uniform(-self.speed_jitter, self.speed_jitter)
+
+        return speed * dt, dt
+
+    def _reset_axes(self) -> None:
+        if not self.control_axes:
+            return
+        if hasattr(self.player, "set_control_axes"):
+            self.player.set_control_axes(0, 0)
+
+    def _set_moving_axes(self) -> None:
+        if not self.control_axes:
+            return
+        if hasattr(self.player, "set_control_axes"):
+            lr = random.randint(-HUMAN_LR_JITTER, HUMAN_LR_JITTER)
+            self.player.set_control_axes(lr, HUMAN_UD)
+
     # ------------------------------------------------------------------ plan
 
     def plan(self, target) -> dict:
         start = self.player.get_position()
         distance = _distance(start, target)
-        steps = int(math.ceil(distance / self.step)) if distance > 0.0 else 0
-        duration = steps * self.interval + self.settle_packets * self.interval
+        if self.human:
+            # Пакеты идут по фактическому интервалу, поэтому и план считаем
+            # по средней длине шага, а не по номинальному self.step.
+            mean_tick = (self.tick_min + self.tick_max) / 2.0
+            mean_step = max(0.01, self.nominal_speed * mean_tick)
+            steps = int(math.ceil(distance / mean_step)) if distance > 0.0 else 0
+            duration = (
+                (distance / self.nominal_speed) if self.nominal_speed > 0.0 else 0.0
+            ) + self.settle_packets * self.settle_interval
+        else:
+            steps = int(math.ceil(distance / self.step)) if distance > 0.0 else 0
+            duration = steps * self.interval + self.settle_packets * self.interval
         return {
             "start": tuple(start),
             "target": tuple(float(v) for v in target),
@@ -140,14 +231,28 @@ class DeltaTeleport:
 
     # ------------------------------------------------------------------ apply
 
-    def _apply_velocity(self, ux: float, uy: float, uz: float, advance: float) -> None:
+    def _apply_velocity(
+        self,
+        ux: float,
+        uy: float,
+        uz: float,
+        advance: float,
+        interval: float | None = None,
+    ) -> None:
         if self.velocity_mode == "zero":
             self.player.velocity_x = 0.0
             self.player.velocity_y = 0.0
             self.player.velocity_z = 0.0
             return
 
-        speed = advance / self.interval
+        # Скорость считаем по фактическому интервалу ЭТОГО пакета, а не по
+        # номинальному: с человеческим ритмом они разные, и velocity должна
+        # совпадать с шагом, иначе сервер видит расхождение.
+        dt = self.interval if interval is None else float(interval)
+        if dt <= 0.0:
+            dt = self.interval
+
+        speed = advance / dt
         if self.velocity_mode == "legit":
             speed = min(speed, self.legit_speed)
 
@@ -222,10 +327,22 @@ class DeltaTeleport:
                 result["server_position"] = current
                 break
 
-            advance = min(self.step, remaining)
+            advance, dt = self._sample_advance()
+            advance = min(advance, remaining)
             if self.jitter > 0.0:
                 advance *= 1.0 + random.uniform(-self.jitter, self.jitter)
                 advance = _clamp(advance, 0.01, remaining)
+
+            # Пауза ДО отправки, а не после: сервер считает скорость по
+            # своему интервалу между пакетами, и если поспать после, он
+            # увидит шаг пакета с интервалом предыдущего — позиция и
+            # velocity разъедутся ровно на разницу интервалов.
+            next_at += dt
+            wait = next_at - self._clock()
+            if wait > 0.0:
+                self._sleep(wait)
+            else:
+                next_at = self._clock()
 
             nx = expected[0] + ux * advance
             ny = expected[1] + uy * advance
@@ -234,7 +351,8 @@ class DeltaTeleport:
             self.player._set_position_internal(
                 nx, ny, nz, update_velocity=False, now=time.time()
             )
-            self._apply_velocity(ux, uy, uz, advance)
+            self._apply_velocity(ux, uy, uz, advance, dt)
+            self._set_moving_axes()
             if self.keys:
                 self.player.set_keys(self.keys)
 
@@ -260,17 +378,11 @@ class DeltaTeleport:
                 except Exception:
                     pass
 
-            next_at += self.interval
-            wait = next_at - self._clock()
-            if wait > 0.0:
-                self._sleep(wait)
-            else:
-                next_at = self._clock()
-
         result["packets"] = packets
 
         if self.keys:
             self.player.set_keys(0)
+        self._reset_axes()
 
         if result["status"] == "ok":
             self.player._set_position_internal(*target, update_velocity=False)
@@ -286,11 +398,17 @@ class DeltaTeleport:
         return result
 
     def _settle(self) -> None:
-        """Гасим velocity и доигрываем пару стоячих пакетов."""
+        """Гасим velocity и доигрываем пару стоячих пакетов.
+
+        Стоячий пакет живой клиент шлёт примерно раз в полсекунды, а не
+        каждые 20 мс: три пакета подряд с нулевой velocity в одном
+        датаграме — это тоже подпись скрипта.
+        """
         self.player.reset_velocity()
+        self._reset_axes()
         for _ in range(self.settle_packets):
             self._send()
-            self._sleep(self.interval)
+            self._sleep(self.settle_interval)
 
 
 def parse_spawn_table(spawns: dict) -> dict:

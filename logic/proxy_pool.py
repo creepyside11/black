@@ -32,14 +32,17 @@ from .vpn_probe import (
     GAME_TARGET_HOST,
     GAME_TARGET_PORT,
     ProbeResult,
+    STATUS_UNKNOWN,
     STATUS_BAD_UDP,
     STATUS_BANNED,
     STATUS_DEAD,
     STATUS_NEEDS_CLIENT,
     STATUS_NO_GAME,
+    STATUS_NO_TRAFFIC,
     STATUS_OK,
     probe_many,
     probe_node,
+    tcp_egress,
 )
 from .vpn_sub import (
     SubscriptionError,
@@ -48,13 +51,41 @@ from .vpn_sub import (
     load_subscription,
     parse_link,
 )
-from .vpn_bridge import VpnBridge, bridge_available
+from .vpn_bridge import VpnBridge, bridge_available, port_for
 
 DEFAULT_INTERVAL = 300.0  # 5 минут
 DEFAULT_TIMEOUT = 6.0
 
 # Ключи для ручных прокси, чтобы они не конфликтовали с узлами подписок.
 MANUAL_PREFIX = "manual"
+
+# Бан по адресу хранится под этим префиксом.
+#
+# Античит банит ВЫХОДНОЙ адрес — тот, с которого бот приходит на игровой
+# сервер. Локальный порт моста (127.0.0.1:<порт>) — это наш собственный
+# клиентский сокет, игровой сервер его не видит вообще. Пометить его
+# забаненным значит навсегда выкинуть живой прокси из раздачи: даже когда
+# HAPP переподключится и выйдет с другого адреса, порт останется
+# «забаненным». Поэтому выходной адрес и локальный эндпоинт — разные вещи,
+# и в списке банов хранится первое.
+BAN_IP_PREFIX = "ip:"
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1", "0.0.0.0")
+
+
+def is_local_address(address: str) -> bool:
+    """Локальный эндпоинт — наш сокет, а не адрес, который видит игра."""
+    return (address or "").strip().lower() in LOCAL_HOSTS
+
+
+def _port_of(proxy: str) -> int | None:
+    """Порт локального прокси-строки. Локальный — только 127.0.0.1."""
+    parsed = parse_link(proxy) if "://" in str(proxy) else None
+    if parsed is None or not is_local_address(parsed.address):
+        return None
+    try:
+        return int(parsed.port)
+    except (TypeError, ValueError):
+        return None
 
 
 class ProxyPoolError(Exception):
@@ -147,6 +178,11 @@ class ProxyPool:
         # а забаненный сервером не оживёт никогда. Храним на диске, иначе
         # после перезапуска бот снова возьмёт тот же адрес и словит бан.
         self.banned: dict[str, dict] = {}
+        # Выходной адрес по ключу прокси: key -> ip. Это факт, а не бан.
+        # Нужен, чтобы «забанен адрес 1.2.3.4» находился и у моста, у
+        # которого в аккаунте записан локальный порт, и чтобы один и тот же
+        # выход не выдавался под другим узлом.
+        self.egress: dict[str, str] = {}
         self._cached_nodes: list[VpnNode] = []
         self.last_refresh: float = 0.0
         self.last_error: str = ""
@@ -193,9 +229,65 @@ class ProxyPool:
                     str(k): dict(v) for k, v in banned.items()
                     if isinstance(v, dict)
                 }
+            egress = data.get("egress") or {}
+            if isinstance(egress, dict):
+                self.egress = {
+                    str(k): str(v) for k, v in egress.items() if v
+                }
+        migrated = self._migrate_local_bans()
         if not self.hwid:
             self.hwid = _new_hwid()
             self.save()
+        elif migrated:
+            self.save()
+
+    def _migrate_local_bans(self) -> bool:
+        """Перевести старые баны с локальных портов на выходные адреса.
+
+        Раньше обработчик кика метил `socks5://127.0.0.1:10808` — то есть
+        локальный порт HAPP. Игровой сервер этого порта не видит: он видит
+        выходной адрес HAPP. Порт, помеченный навсегда, означает, что даже
+        после смены выхода прокси больше никогда не выдадут.
+
+        Что делаем: знаем выходной адрес — переносим метку на него;
+        не знаем — спрашиваем его у самого прокси (один короткий запрос на
+        старую запись) и переносим. Только если прокси не отвечает,
+        снимаем метку с порта и говорим об этом в лог: ложная метка на
+        локальном порту хуже её отсутствия, потому что навсегда выкидывает
+        живой прокси из раздачи.
+        """
+        moved = False
+        for key in list(self.banned):
+            parsed = parse_link(key) if "://" in key else None
+            if parsed is None or not is_local_address(parsed.address):
+                continue
+            entry = self.banned.pop(key, {})
+            egress = self.egress.get(key, "")
+            if not egress:
+                try:
+                    egress = tcp_egress(
+                        parsed.address, int(parsed.port),
+                        login=parsed.login, password=parsed.password,
+                        timeout=min(4.0, float(self.timeout)),
+                    )
+                except Exception:
+                    egress = ""
+            if egress:
+                self.egress[key] = egress
+                self.banned[f"{BAN_IP_PREFIX}{egress}"] = dict(
+                    entry, address=egress,
+                    reason=(entry.get("reason") or "") +
+                    " [перенесено с локального порта]",
+                )
+                self.log(f"[ПРОКСИ] бан {key} перенесён на выходной адрес {egress}")
+            else:
+                self.log(
+                    f"[ПРОКСИ] снят бессмысленный бан с локального порта {key}: "
+                    "игровой сервер видит выходной адрес, а не наш порт. "
+                    "Адрес будет помечен заново, если сервер его отвергнет."
+                )
+            moved = True
+        return moved
 
     def save(self) -> None:
         with self._lock:
@@ -204,6 +296,7 @@ class ProxyPool:
                 "manual": list(self.manual),
                 "hwid": self.hwid,
                 "banned": dict(self.banned),
+                "egress": dict(self.egress),
             }
         try:
             directory = os.path.dirname(self.path)
@@ -436,6 +529,7 @@ class ProxyPool:
             self.results = {res.node.key: res for res in results}
             self.last_refresh = self._clock()
             self.last_error = ""
+        self._remember_egress(results)
         self._report(results)
         return results
 
@@ -454,6 +548,7 @@ class ProxyPool:
             return results
 
         done: dict[str, ProbeResult] = {}
+        stopped: set[str] = set()
         # Два моста за раз, не шесть. На сервере одно ядро: шесть
         # одновременно поднятых sing-box вместе с восемью проберами
         # забивали процессор, UDP-пробы не укладывались в таймаут, и все
@@ -462,7 +557,8 @@ class ProxyPool:
         workers = max(1, min(2, len(pending)))
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
-                pool.submit(self._probe_via_bridge, res.node, res): res.node.key
+                pool.submit(self._probe_via_bridge, res.node, res,
+                            stopped=stopped): res.node.key
                 for res in pending
             }
             for future in concurrent.futures.as_completed(futures):
@@ -482,7 +578,10 @@ class ProxyPool:
         # мёртвые — просто память.
         keep = {res.node.key for res in merged if res.usable}
         for key in getattr(bridge, "running", lambda: [])():
-            if key not in keep:
+            # Мост мог быть погашен ещё внутри _probe_via_bridge. Второй
+            # stop по тому же ключу — уже не «погасить мёртвый», а шум:
+            # на живом пуле это десяток лишних вызовов за цикл.
+            if key not in keep and key not in stopped:
                 try:
                     bridge.stop(key)
                 except Exception:
@@ -490,15 +589,60 @@ class ProxyPool:
         return merged
 
     def _report(self, results: list[ProbeResult]) -> None:
-        alive = [r for r in results if r.alive]
-        usable = [r for r in results if r.usable]
-        dead = [r for r in results if not r.alive]
+        """Сводка так, чтобы по логу было видно, что именно чинить.
+
+        «Рабочих 0» — это не диагноз, а его отсутствие. Забаненный адрес,
+        узел без UDP и узел, который вообще не везёт трафик, лечатся
+        по-разному: первый — сменой выходного адреса, второй — другим
+        транспортом, третий — починкой узла.
+        """
+        counts: dict[str, int] = {}
+        banned: list[tuple[ProbeResult, dict]] = []
+        dead: list[ProbeResult] = []
+        for res in results:
+            entry = self._ban_entry_for(res)
+            if entry is not None:
+                banned.append((res, entry))
+                continue
+            counts[res.status] = counts.get(res.status, 0) + 1
+            if not res.alive:
+                dead.append(res)
+
+        usable = counts.get(STATUS_OK, 0)
         self.log(
-            f"[ПРОКСИ] проверено {len(results)} | рабочих {len(usable)} | "
-            f"живых без клиента {len(alive) - len(usable)} | мёртвых {len(dead)}"
+            f"[ПРОКСИ] проверено {len(results)} | рабочих {usable} | "
+            f"адрес забанен сервером {len(banned)} | "
+            f"узел не везёт UDP {counts.get(STATUS_BAD_UDP, 0)} | "
+            f"узел не везёт трафик {counts.get(STATUS_NO_TRAFFIC, 0)} | "
+            f"игра не отвечает {counts.get(STATUS_NO_GAME, 0)} | "
+            f"нужен клиент {counts.get(STATUS_NEEDS_CLIENT, 0)} | "
+            f"мёртвых {counts.get(STATUS_DEAD, 0)}"
         )
+        for res, entry in banned:
+            where = entry.get("address") or self._egress_of(
+                res.proxy_url or res.node.key, res.node) or "?"
+            self.log(
+                f"    🚫 {res.node.name} ({res.node.address}:{res.node.port}) — "
+                f"забанен адрес {where}: {entry.get('reason') or 'бан по IP'}"
+            )
+        no_udp = [r for r in results
+                  if r.status == STATUS_BAD_UDP and self._ban_entry_for(r) is None]
+        for res in no_udp:
+            self.log(f"    ⚠ {res.node.name} — узел жив, но UDP не везёт: {res.reason}")
+        no_traffic = [r for r in results
+                      if r.status == STATUS_NO_TRAFFIC and self._ban_entry_for(r) is None]
+        for res in no_traffic:
+            self.log(f"    ⚠ {res.node.name} — узел не везёт ни TCP, ни UDP: {res.reason}")
         for res in dead:
             self.log(f"    ❌ {res.node.name} ({res.node.address}:{res.node.port}) — {res.reason}")
+
+        if not usable and banned:
+            self.log(
+                "[ПРОКСИ] рабочих нет, и причина — не мёртвые узлы: живые "
+                f"выходят с адресов ({len(banned)}), которые игровой сервер уже "
+                "заблокировал. Это лечится сменой выходного адреса, а не "
+                "починкой узла."
+            )
 
     def _probe(self, node: VpnNode) -> ProbeResult:
         kwargs = {"timeout": self.timeout, "target_port": self.target_port,
@@ -534,10 +678,16 @@ class ProxyPool:
 
         with self._lock:
             self.results[node.key] = result
+        self._remember_egress([result])
         return result
 
-    def _probe_via_bridge(self, node: VpnNode, base: ProbeResult) -> ProbeResult:
-        """Поднять мост под узел и проверить получившийся SOCKS5."""
+    def _probe_via_bridge(self, node: VpnNode, base: ProbeResult,
+                          stopped: set | None = None) -> ProbeResult:
+        """Поднять мост под узел и проверить получившийся SOCKS5.
+
+        `stopped` — необязательное множество ключей, которые этот прогон
+        уже погасил: вызывающий затем не гасит их второй раз.
+        """
         bridge = self.bridge
         if bridge is None or not getattr(bridge, "available", lambda: False)():
             return base
@@ -573,13 +723,14 @@ class ProxyPool:
             latency = f"{bridged.latency_ms:.0f}мс" if bridged.latency_ms else "?"
             bridged.reason = f"{node.protocol.upper()} через мост ({latency})"
         else:
-            # Мост поднялся, но трафик не идёт — это мёртвый узел, а не
-            # «нужен клиент». Держим процесс, вдруг оживёт на следующей
-            # проверке.
-            # Узел отвечает, но трафик через него не идёт — это не «мёртвый».
-            # Мёртвый значит «не отвечает вообще»; здесь ответ есть, а
-            # дальше не пускает. Разные вещи, и лечатся по-разному.
-            bridged.status = STATUS_BAD_UDP if bridged.alive else STATUS_DEAD
+            # Мост поднялся, но трафик не идёт. Статус НЕ переписываем:
+            # пробер уже различил «узел работает, но не везёт датаграммы»
+            # (no_udp) и «узел не везёт ничего» (no_traffic), а также
+            # «игра не отвечает» (no_game). Раньше здесь всё живое
+            # схлопывалось в no_udp, и по логу нельзя было понять, чинить
+            # узел или менять выходной адрес.
+            if bridged.status in (STATUS_OK, STATUS_UNKNOWN, STATUS_NEEDS_CLIENT, ""):
+                bridged.status = STATUS_BAD_UDP if bridged.alive else STATUS_DEAD
             # Время отказа мерялось до 127.0.0.1: sing-box отвечает «не могу»
             # сам, не сходив в сеть, поэтому выходило 1-2 мс. Это время
             # локального сокета, а не пинг узла: мёртвые узлы выглядели
@@ -593,6 +744,8 @@ class ProxyPool:
             # «UDP не проходит». Ошибка была не в узлах, а в нехватке CPU.
             try:
                 bridge.stop(node.key)
+                if stopped is not None:
+                    stopped.add(node.key)
             except Exception:
                 pass
         return bridged
@@ -614,11 +767,17 @@ class ProxyPool:
             return False, f"не понял прокси {proxy!r}"
         # Забаненный адрес не проверяем вовсе: сервер его уже отверг, и
         # запускать с него бота — гарантированный бан нового аккаунта.
+        # Метка лежит на выходном адресе, поэтому ищем и её: у моста в
+        # аккаунте записан локальный порт, а забанен выход узла.
+        egress = self._egress_of(proxy, node)
         with self._lock:
             entry = self.banned.get(node.key)
+            if entry is None and egress:
+                entry = self.banned.get(f"{BAN_IP_PREFIX}{egress}")
         if entry is not None:
             why = entry.get("reason") or "забанен сервером"
-            return False, f"адрес забанен: {why}"
+            where = egress or entry.get("address") or node.address
+            return False, f"адрес {where} забанен сервером: {why}"
         if not node.is_direct:
             return False, f"{node.protocol} не поддерживается напрямую"
 
@@ -677,40 +836,134 @@ class ProxyPool:
                             return known
         return None
 
+    def _resolve_egress(self, proxy: str, *, timeout: float | None = None) -> str:
+        """Выходной адрес прокси: то, с чего бот придёт на игровой сервер.
+
+        Спрашиваем только когда прокси локальный. Удалённый адрес сам
+        является выходным, а лезть в сеть на каждый бан нельзя: проверка
+        бан-списка должна оставаться дешёвой.
+        """
+        parsed = parse_link(proxy) if "://" in str(proxy) else None
+        if parsed is None or not parsed.is_direct:
+            return ""
+        if not is_local_address(parsed.address):
+            return ""
+        try:
+            return tcp_egress(
+                parsed.address, int(parsed.port),
+                login=parsed.login, password=parsed.password,
+                timeout=float(timeout or self.timeout),
+            )
+        except Exception:
+            return ""
+
+    def _egress_of(self, proxy: str, node=None) -> str:
+        """Известный выход прокси. Сеть не трогает."""
+        text = str(proxy or "").strip()
+        if node is not None:
+            with self._lock:
+                known = self.egress.get(node.key) or ""
+                if not known:
+                    cached = self.results.get(node.key)
+                    known = getattr(cached, "egress", "") or ""
+            if known:
+                return known
+        with self._lock:
+            known = self.egress.get(text) or ""
+        if known:
+            return known
+        if node is not None:
+            # Свой адрес — выход только у узла без моста. У узла за мостом
+            # адрес узла это ВХОД, а не выход: игра видит адрес, с которого
+            # узел выходит в сеть, и он другой.
+            if not node.is_direct:
+                return ""
+            return "" if is_local_address(node.address) else node.address
+        parsed = parse_link(text) if "://" in text else None
+        if parsed is not None and not is_local_address(parsed.address):
+            return parsed.address
+        return ""
+
+    def _remember_egress(self, results: list[ProbeResult]) -> None:
+        """Запомнить выходные адреса узлов.
+
+        Выход нужен, когда придёт кик: банить надо адрес, а не порт моста.
+        Держим его на диске, потому что кик может прийти уже после
+        перезапуска — кэш результатов к тому моменту пуст.
+        """
+        changed = False
+        with self._lock:
+            for res in results:
+                egress = getattr(res, "egress", "") or ""
+                if egress and self.egress.get(res.node.key) != egress:
+                    self.egress[res.node.key] = egress
+                    changed = True
+        # Пишем на диск только когда это на что-то влияет: без бан-записей
+        # выход не нужен никому, а лишняя запись файла ни к чему.
+        if changed and self.banned:
+            self.save()
+
     def mark_banned(self, proxy: str, reason: str = "") -> list[str]:
         """Пометить адрес забаненным. Принимает URL, ключ узла или адрес.
 
+        Метка ложится на ВЫХОДНОЙ адрес: узел подписки — под своим ключом,
+        всё остальное — под `ip:<адрес>`. Локальный порт моста не банится
+        никогда: игровой сервер его не видит, и такая метка навсегда
+        выкидывает живой прокси из раздачи.
+
         Возвращает ключи, которые реально попали в список.
         """
-        keys: list[str] = []
         node = self.node_for_proxy(proxy)
-        candidates: list[str] = []
-        if node is not None:
-            candidates.append(node.key)
-        # Строка может быть socks5://host:port — из неё тоже достаём адрес.
         parsed = parse_link(proxy) if "://" in str(proxy) else None
-        if parsed is not None and parsed.key not in candidates:
-            candidates.append(parsed.key)
-        if not candidates:
-            candidates.append(str(proxy).strip())
+        keys: list[str] = []
 
+        # Узел подписки (или узел за портом моста) баним под его ключом.
+        if node is not None and not is_local_address(node.address):
+            keys.append(node.key)
+
+        egress = self._egress_of(proxy, node)
+        if not egress:
+            egress = self._resolve_egress(proxy)
+            if egress and node is not None:
+                with self._lock:
+                    self.egress[node.key] = egress
+        if egress:
+            keys.append(f"{BAN_IP_PREFIX}{egress}")
+        elif node is None and parsed is not None and not is_local_address(parsed.address):
+            # Ни узла, ни выхода — но адрес удалённый, значит он и есть
+            # выход. Баним его как адрес.
+            keys.append(f"{BAN_IP_PREFIX}{parsed.address}")
+        elif node is not None and not keys:
+            keys.append(node.key)
+
+        if not keys:
+            # Локальный эндпоинт без известного выхода. Банить порт
+            # бессмысленно, а выдумывать адрес — врать. Говорим как есть.
+            self.log(
+                f"[ПРОКСИ] кик пришёл с {proxy}, но выходной адрес неизвестен — "
+                "помечать нечего. Локальный порт не баним: он не тот адрес, "
+                "который видит игровой сервер."
+            )
+            return []
+
+        listed: list[str] = []
         with self._lock:
-            for key in candidates:
+            for key in keys:
                 if not key:
                     continue
                 entry = {
                     "reason": str(reason or "бан по IP"),
                     "ts": float(self._clock()),
-                    "address": getattr(node, "address", "") or "",
+                    "address": egress or getattr(node, "address", "") or "",
                     "name": getattr(node, "name", "") or "",
                 }
                 self.banned[key] = entry
-                keys.append(key)
-        if keys:
+                listed.append(key)
+        if listed:
             self.save()
-            names = ", ".join(keys)
+            names = ", ".join(listed)
             self.log(f"[ПРОКСИ] забанен и больше не выдаётся: {names}")
-        return keys
+        return listed
 
     def unban(self, proxy: str) -> bool:
         """Снять бан вручную: адрес мог смениться или бан был ошибкой."""
@@ -722,6 +975,11 @@ class ProxyPool:
         if parsed is not None:
             keys.append(parsed.key)
         keys.append(str(proxy).strip())
+        # Бан по выходному адресу снимается вместе с узлом: иначе узел
+        # останется забаненным через `ip:`, и «разбан» ничего не изменит.
+        egress = self._egress_of(proxy, node)
+        if egress:
+            keys.append(f"{BAN_IP_PREFIX}{egress}")
         removed = False
         with self._lock:
             for key in keys:
@@ -743,13 +1001,20 @@ class ProxyPool:
         node = self.node_for_proxy(text)
         if node is not None:
             with self._lock:
-                return node.key in self.banned
+                if node.key in self.banned:
+                    return True
+            egress = self._egress_of(text, node)
+            if egress:
+                with self._lock:
+                    return f"{BAN_IP_PREFIX}{egress}" in self.banned
+            return False
         parsed = parse_link(text) if "://" in text else None
         if parsed is not None:
             with self._lock:
                 if parsed.key in self.banned:
                     return True
-            with self._lock:
+                if f"{BAN_IP_PREFIX}{parsed.address}" in self.banned:
+                    return True
                 return f"{parsed.address}:{parsed.port}" in self.banned
         return False
 
@@ -759,6 +1024,22 @@ class ProxyPool:
 
     # ---------- выдача ----------
 
+    def _ban_entry_for(self, res: ProbeResult) -> dict | None:
+        """Бан-запись для результата проверки, если она есть.
+
+        Смотрим три вещи, и это принципиально: узел может быть помечен под
+        своим ключом, выходной адрес — под `ip:<адрес>`, а узел без моста
+        сам является выходным адресом.
+        """
+        egress = self.egress.get(res.node.key) or res.egress
+        if not egress and res.node.is_direct and not is_local_address(res.node.address):
+            egress = res.node.address
+        with self._lock:
+            entry = self.banned.get(res.node.key)
+            if entry is None and egress:
+                entry = self.banned.get(f"{BAN_IP_PREFIX}{egress}")
+        return entry
+
     def statuses(self) -> list[ProbeResult]:
         """Все известные статусы: рабочие, живые, мёртвые, забаненные.
 
@@ -767,16 +1048,16 @@ class ProxyPool:
         """
         with self._lock:
             items = list(self.results.values())
-            banned = dict(self.banned)
         order = {STATUS_OK: 0, STATUS_NEEDS_CLIENT: 1, STATUS_NO_GAME: 2,
-                 STATUS_DEAD: 3, STATUS_BANNED: 4}
+                 STATUS_NO_TRAFFIC: 3, STATUS_BAD_UDP: 3, STATUS_DEAD: 4,
+                 STATUS_BANNED: 5}
 
         # Копируем, а не правим на месте: результат лежит в кэше, и если
         # испортить его здесь, снятие бана не вернёт узел в работу —
         # он останется помеченным забаненным до следующей проверки.
         patched: list[ProbeResult] = []
         for res in items:
-            entry = banned.get(res.node.key)
+            entry = self._ban_entry_for(res)
             if entry is None:
                 patched.append(res)
                 continue
@@ -803,11 +1084,9 @@ class ProxyPool:
         Забаненные исключены: иначе следующая раздача снова даст адрес,
         с которого сервер уже не пускает.
         """
-        with self._lock:
-            banned = set(self.banned)
         return [
             res for res in self.statuses()
-            if res.usable and res.node.key not in banned
+            if res.usable and self._ban_entry_for(res) is None
         ]
 
     def usable_proxies(self) -> list[str]:
@@ -853,6 +1132,83 @@ class ProxyPool:
         except Exception:
             return ""
 
+    # ---------- занятость мостов ----------
+    #
+    # Мост — процесс на узел, и он один на всех, кто через этот узел
+    # ходит. Периодическая проверка пула гасит мосты, которые «не пустили
+    # трафик», но проба может провалиться на живом узле (таймаут, потеря
+    # UDP, загруженный процессор) — и тогда у бота, который в этот момент
+    # играет, рвётся соединение с кодом -15. Поэтому бот, подключившийся
+    # через мост, помечает его занятым, а уборка откладывается до release.
+
+    def _bridge_key_for(self, proxy: str, port: int) -> str:
+        """Какой узел стоит за локальным портом моста.
+
+        Три способа, от точного к запасному: мост знает свои порты; номер
+        порта считается из ключа узла, поэтому его можно найти по списку
+        узлов; наконец, сам пул уже отдавал этот адрес какому-то узлу.
+        Запасные нужны, потому что мост мог поднять прошлый процесс.
+        """
+        bridge = self.bridge
+        try:
+            key = bridge.key_of_port(port) if bridge is not None else ""
+        except Exception:
+            key = ""
+        if key:
+            return key
+        try:
+            for node in self.nodes():
+                if port_for(node.key) == int(port):
+                    return node.key
+        except Exception:
+            pass
+        try:
+            for res in self.statuses():
+                if proxy and proxy in (res.socks_url, res.proxy_url):
+                    return res.node.key
+        except Exception:
+            pass
+        return ""
+
+    def acquire_proxy(self, proxy: str) -> str:
+        """Отметить мост под прокси занятым живой сессией.
+
+        Возвращает метку-держатель вида «ключ|порт»: её надо сохранить и
+        отдать в release_proxy. Пустая строка — держать нечего (прокси не
+        локальный или мост неизвестен).
+        """
+        bridge = self.bridge
+        acquire = getattr(bridge, "acquire", None)
+        if bridge is None or acquire is None:
+            return ""
+        port = _port_of(proxy)
+        if port is None:
+            return ""
+        key = self._bridge_key_for(proxy, port)
+        try:
+            acquire(key, port)
+        except Exception as exc:
+            self.log(f"[ПРОКСИ] не смог пометить мост занятым: {exc}")
+            return ""
+        return f"{key}|{port}"
+
+    def release_proxy(self, token: str) -> None:
+        """Снять метку занятости. Отложенная уборка сработает здесь."""
+        bridge = self.bridge
+        release = getattr(bridge, "release", None)
+        if bridge is None or release is None or not token:
+            return
+        # Ключ узла разделителем не содержит — режем по последнему.
+        key, _, port_text = str(token).rpartition("|")
+        try:
+            port = int(port_text) if port_text.isdigit() else None
+        except ValueError:
+            port = None
+        try:
+            release(key, port)
+        except Exception as exc:
+            self.log(f"[ПРОКСИ] не снял метку занятости с {str(key)[:40]}: {exc}")
+
     def rotate(self, bot_count: int, *, per_node: int = 3) -> list[str]:
         """Раскладка прокси по ботам: несколько ботов на узел, по кругу.
 
@@ -895,17 +1251,21 @@ class ProxyPool:
     def summary(self) -> dict:
         with self._lock:
             items = list(self.results.values())
-            banned = set(self.banned)
-        usable = [r for r in items if r.usable and r.node.key not in banned]
-        banned_items = [r for r in items if r.node.key in banned]
+        usable = [r for r in items if r.usable and self._ban_entry_for(r) is None]
+        banned_items = [r for r in items if self._ban_entry_for(r) is not None]
         return {
             "subscriptions": len(self.subscriptions),
             "manual": len(self.manual),
             "total": len(items),
             "usable": len(usable),
             "alive": sum(1 for r in items if r.alive),
-            "dead": sum(1 for r in items if not r.alive and r.node.key not in banned),
+            "dead": sum(1 for r in items
+                        if not r.alive and self._ban_entry_for(r) is None),
             "banned": len(banned_items),
+            "no_udp": sum(1 for r in items if r.status == STATUS_BAD_UDP
+                          and self._ban_entry_for(r) is None),
+            "no_traffic": sum(1 for r in items if r.status == STATUS_NO_TRAFFIC
+                              and self._ban_entry_for(r) is None),
             "last_refresh": self.last_refresh,
             "last_error": self.last_error,
             "interval": self.interval,

@@ -1,18 +1,36 @@
 #!/usr/bin/env python3
 # Engine: SA-MP / Black Russia RakNet | Python 3 | Termux
-# Build: pip install -r requirements.txt (if any)
-# Run: python3 bot.py [сервер/номер] [никнейм] [пароль]
+# Build: bash install.sh   (зависимости уже в репозитории; pip install -r requirements.txt — по желанию)
+# Run: python3 bot.py [сервер/номер] [никнейм] [пароль]   |   br
 
 import sys
+
+# Аннотации вида `int | None` и встроенные генерики требуют Python 3.10+.
+# На 3.8/3.9 модуль падал бы сырым TypeError посреди импорта, и понять,
+# что дело в версии, было нельзя. Говорим прямо.
+if sys.version_info < (3, 10):
+    sys.exit(
+        "Нужен Python 3.10 или новее, сейчас %d.%d. "
+        "Termux: pkg install python; Debian/Ubuntu: apt install python3 "
+        "(или python3.12 из deadsnakes); Windows: python.org/downloads"
+        % sys.version_info[:2]
+    )
+
 import os
 import shutil
 import time
 import random
 import threading
 import json
-import resource
 import re
 from collections import deque
+
+# resource есть только на Unix. На Windows импорт падал ещё до старта —
+# теперь модуль опционален, а лимит дескрипторов просто не трогаем.
+try:
+    import resource
+except ImportError:  # Windows
+    resource = None
 
 # Оптимизация системы для поддержки до 300+ ботов одновременно в Termux / Linux
 # 128 KB стек на поток позволяет держать 80-100 потоков всего в ~12 MB RAM
@@ -21,13 +39,15 @@ try:
 except Exception:
     pass
 
-try:
-    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-    resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, 8192), max(hard, 8192)))
-except Exception:
-    pass
+if resource is not None:
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, 8192), max(hard, 8192)))
+    except Exception:
+        pass
 
 import br_servers
+import projects as projects_mod
 from core.network import Network
 from core import security
 from core import logger
@@ -49,6 +69,12 @@ ACCOUNTS_FILE = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts.json"),
 )
 
+# Значение по умолчанию на момент импорта — эталон, по которому видно
+# подмену. У каждого проекта свой реестр (accounts.json, accounts_arz.json),
+# но если тест или внешняя обёртка подменила bot.ACCOUNTS_FILE, победить
+# должна подмена: иначе тест писал бы в боевой файл проекта.
+DEFAULT_ACCOUNTS_FILE = ACCOUNTS_FILE
+
 PROXIES_FILE = os.environ.get(
     "BR_PROXIES_FILE",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "proxies.txt"),
@@ -63,7 +89,9 @@ PROXY_POOL_FILE = os.environ.get(
 # Как часто перепроверять узлы. 300 секунд = 5 минут, как и просили.
 PROXY_REFRESH_INTERVAL = float(os.environ.get("BR_PROXY_REFRESH", "300"))
 
-# Максимальная длина игрового ника в Black Russia
+# Максимальная длина игрового ника. У каждого проекта лимит свой, и берётся
+# он у активного проекта: у Black Russia 20, у Arizona может быть меньше.
+# Константа оставлена значением по умолчанию — её читают внешние скрипты.
 MAX_NICKNAME_LEN = 20
 
 # Сколько секунд считать повторное сообщение о бане тем же самым баном.
@@ -176,6 +204,88 @@ def anticheat_kick(title: str, body: str) -> int | None:
     return int(found.group(1)) if found else 0
 
 
+# ---------------------------------------------------------------------------
+# Блокировка АДРЕСА, а не аккаунта.
+#
+# Сервер может закрыть IP (окно Anti-Cheat, CONNECTION_BANNED 0x19, «Ваш
+# IP-адрес был заблокирован»). Аккаунт при этом цел — с другого адреса он
+# заходит нормально. Раньше обработчик в этом случае гасил сессию через
+# stop() и ставил аккаунту is_banned=True, и владелец видел «аккаунты
+# быстро банятся и вылетают». Ниже — три вещи, которые вместо этого:
+# понять, идёт ли игра; припарковать, не баня; сравнить адреса по УЗЛУ,
+# а не по строке прокси (мост 127.0.0.1:10808 один на всех, узлы за ним
+# разные, и гасить всю пачку за один узел нельзя).
+# ---------------------------------------------------------------------------
+
+
+def _is_address_ban(*texts) -> bool:
+    """Это сообщение про блокировку АДРЕСА (CONNECTION_BANNED / IP-бан)?
+
+    Регистр не важен: сервер пишет и «CONNECTION_BANNED», и
+    «connection_banned», и «Пакет CONNECTION_BANNED (0x19)». Сравнение
+    по коду (kick 999) надёжнее текста, но текстовые пути — чат и окно
+    Anti-Cheat — приходят без кода, и их тоже надо узнавать.
+    """
+    for text in texts:
+        if "connection_banned" in str(text or "").lower():
+            return True
+    return False
+
+
+def _session_is_live(bot) -> bool:
+    """Идёт ли у бота живая игра. Урезанные объекты в тестах — не в игре."""
+    session = getattr(bot, "session", None)
+    if session is None:
+        return False
+    return bool(getattr(session, "connected", False))
+
+
+def _park_bot(bot, reason: str, seconds: float | None = None) -> float:
+    """Припарковать аккаунт: не бан и не остановка, только отсрочка входа.
+
+    Возвращает время, до которого бот не переподключается.
+    """
+    try:
+        delay = IP_PARK_SECONDS if seconds is None else max(1.0, float(seconds))
+    except (TypeError, ValueError):
+        delay = 1800.0
+
+    park = getattr(bot, "park", None)
+    if callable(park):
+        try:
+            return float(park(delay, reason))
+        except Exception as exc:
+            print(f"[!] Парковка #{getattr(bot, 'bot_id', '?')}: {exc!r}")
+
+    # Урезанные объекты (внешние менеджеры, тесты) — без метода park.
+    until = time.time() + delay
+    try:
+        bot.parked_until = until
+        bot.parked_reason = str(reason or "адрес заблокирован")
+        bot.status = "Парковка: адрес заблокирован"
+    except Exception:
+        pass
+    try:
+        bot.add_log(f"[ПАРКОВКА] {reason}")
+    except Exception:
+        pass
+    return until
+
+
+def _same_address(other, proxy: str, node_key: str) -> bool:
+    """Сидит ли бот на том же адресе, что забанен.
+
+    Если узел забаненного бота известен — сравниваем только узлы. Мост
+    `127.0.0.1:10808` один на всех, и по строке прокси под нож попал бы
+    весь пул за один закрытый узел. Строка — только когда узла нет ни у
+    кого: тогда другой приметы просто не существует.
+    """
+    other_node = str(getattr(other, "proxy_node", "") or "")
+    if node_key:
+        return other_node == node_key
+    return (getattr(other, "proxy", "") or "").strip() == proxy
+
+
 def is_freq_ban_text(text: str) -> bool:
     """Это сообщение об ограничении входа, а не обычная рассылка?
 
@@ -218,6 +328,16 @@ QUEUE_JITTER = 0.35
 # Пауза между реконнектами после разрыва.
 RECONNECT_MIN = max(1.0, float(os.environ.get("BR_RECONNECT_MIN", "8")))
 RECONNECT_MAX = max(RECONNECT_MIN, float(os.environ.get("BR_RECONNECT_MAX", "20")))
+
+# Сколько последних сообщений сервера держать в памяти бота, чтобы
+# показать их в логе кика/бана. Причина приходит чатом или окном
+# Anti-Cheat за мгновение до разрыва; без хвоста её не видно.
+SERVER_TAIL_MAXLEN = max(2, int(os.environ.get("BR_SERVER_TAIL", "6")))
+
+# На сколько припарковать аккаунт, когда сервер закрыл АДРЕС.
+# Это не бан аккаунта: адрес уходит в мусор, аккаунт ждёт свободный узел.
+# 30 минут — с запасом к 25-минутным лимитам сервера за частые входы.
+IP_PARK_SECONDS = max(60.0, float(os.environ.get("BR_IP_PARK", "1800")))
 
 # Минимальная пауза перед намеренным выходом (почасовой цикл payday).
 # Меньше ставить нельзя: переподключение само занимает время, и бот
@@ -357,8 +477,26 @@ class BotInstance:
         # Ключ узла пула под этим прокси. Нужен, чтобы после перезапуска
         # найти узел заново: порт моста не постоянный.
         self.proxy_node = str(proxy_node or "")
+        # Ключ моста, который держит этот бот. Пока он тут лежит, мост
+        # занят: уборка пула не гасит его под живой сессией.
+        self._bridge_hold = ""
         # Автопереключение на прокси уже пробовали — второй раз не дёргаем.
         self._auto_proxy_tried = False
+
+        # Последние сообщения сервера: чат и диалоги.
+        #
+        # Сервер рвёт сессию пакетом без кода (Kick -> ID_DISCONNECTION_
+        # NOTIFICATION) или CONNECTION_BANNED, а причину пишет за мгновение
+        # до этого — строкой в чат или окном Anti-Cheat с кодом. Без этого
+        # хвоста в логе остаётся «соединение разорвано» без причины, и
+        # разбор идёт вслепую.
+        self.server_tail = deque(maxlen=SERVER_TAIL_MAXLEN)
+
+        # Парковка. Ставится, когда заблокирован АДРЕС, а не аккаунт:
+        # до этой отметки бот не переподключается, чтобы не долбиться в
+        # закрытый IP, но остаётся живым и не помечен забаненным.
+        self.parked_until = 0.0
+        self.parked_reason = ""
 
         self.level_str = "-"
         # Числа уровня отдельно от строки: из них считается «сколько до
@@ -518,6 +656,90 @@ class BotInstance:
         formatted = f"{t_str} [{self.nickname}] {text}"
         self.logs.append(formatted)
         return formatted
+
+    def note_server_text(self, kind: str, text: str) -> None:
+        """Запомнить последнее, что написал сервер (чат или диалог).
+
+        Нужно, чтобы в момент разрыва в логе была причина, а не одно
+        «соединение разорвано»: сервер пишет её окном Anti-Cheat или
+        строкой в чат и только потом закрывает соединение.
+        """
+        clean = re.sub(r"\{[0-9a-fA-F]{6}\}", "", str(text or "")).strip()
+        if not clean:
+            return
+
+        clean = " ".join(clean.split())
+
+        try:
+            self.server_tail.append(f"{kind}: {clean[:200]}")
+        except Exception:
+            pass
+
+    def server_tail_text(self, limit: int = 3) -> str:
+        """Последние сообщения сервера одной строкой для лога."""
+        try:
+            items = list(self.server_tail)[-max(1, int(limit)):]
+        except Exception:
+            return ""
+
+        return " ⏐ ".join(items)
+
+    # ==================== ПАРКОВКА ПРИ БАНЕ АДРЕСА ====================
+
+    def park(self, seconds: float, reason: str = "") -> float:
+        """Отложить переподключение, не гася сессию и не баня аккаунт.
+
+        Так обрабатывается блокировка АДРЕСА. Аккаунт цел: с другого IP он
+        заходит нормально. Гасить живую сессию самим нельзя — если игра
+        идёт, она идёт, а если адрес закрыт, сервер отпустит сам. Здесь
+        только ставим отметку «до какого времени не переподключаться»,
+        чтобы бот не долбился в закрытый IP и не ловил лимит частых входов.
+        """
+        try:
+            delay = max(1.0, float(seconds))
+        except (TypeError, ValueError):
+            delay = IP_PARK_SECONDS
+
+        self.parked_until = time.time() + delay
+        self.parked_reason = str(reason or "адрес заблокирован")
+
+        minutes = max(1, int(round(delay / 60.0)))
+        self.status = f"Парковка ({minutes} мин): адрес заблокирован"
+        self.add_log(
+            f"[ПАРКОВКА] {self.parked_reason} | аккаунт не забанен, "
+            f"переподключение после "
+            f"{time.strftime('%H:%M:%S', time.localtime(self.parked_until))}"
+        )
+
+        # Уже висящий таймер входа должен дождаться конца парковки, а не
+        # выстрелить в закрытый адрес через свои 8-20 секунд.
+        try:
+            if self.scheduled_reconnect_delay:
+                self.scheduled_reconnect_delay = max(
+                    self.scheduled_reconnect_delay, delay
+                )
+        except Exception:
+            pass
+
+        return self.parked_until
+
+    def unpark(self, reason: str = "") -> None:
+        """Снять парковку. Ручной запуск всегда сильнее автопарковки."""
+        was = self.parked_until
+        self.parked_until = 0.0
+        self.parked_reason = ""
+        if was > time.time():
+            self.add_log(f"[ПАРКОВКА] снята ({reason or 'вручную'})")
+
+    def park_remaining(self) -> float:
+        """Сколько ещё стоять на парковке, секунд (0 — не припаркован)."""
+        try:
+            return max(0.0, float(self.parked_until) - time.time())
+        except Exception:
+            return 0.0
+
+    def is_parked(self) -> bool:
+        return self.park_remaining() > 0.0
 
     # ==================== ОЧЕРЕДЬ НА ПЕРЕПОЛНЕННЫЙ СЕРВЕР ====================
 
@@ -686,14 +908,52 @@ class BotInstance:
         self.spawn_report = report
         return report
 
+    def _hold_proxy_bridge(self) -> None:
+        """Пометить мост занятым: через него играет живой бот.
+
+        Вызывается после успешной проверки прокси, до подключения.
+        """
+        pool = getattr(self.manager, "proxy_pool", None) if self.manager else None
+        if pool is None or not self.proxy:
+            return
+        acquire = getattr(pool, "acquire_proxy", None)
+        if acquire is None:
+            return
+        try:
+            self._bridge_hold = acquire(self.proxy) or ""
+        except Exception as exc:
+            self._bridge_hold = ""
+            self.add_log(f"[ПРОКСИ] не смог пометить мост занятым: {exc}")
+            return
+        if self._bridge_hold:
+            self.add_log("[ПРОКСИ] мост помечен занятым: уборка его не тронет")
+
+    def _release_proxy_bridge(self) -> None:
+        """Снять метку занятости. Отложенная уборка сработает здесь."""
+        key = getattr(self, "_bridge_hold", "")
+        if not key:
+            return
+        self._bridge_hold = ""
+        pool = getattr(self.manager, "proxy_pool", None) if self.manager else None
+        release = getattr(pool, "release_proxy", None) if pool is not None else None
+        if release is None:
+            return
+        try:
+            release(key)
+        except Exception as exc:
+            self.add_log(f"[ПРОКСИ] не снял метку занятости с моста: {exc}")
+
     def setup_session(self):
         self.stopping = False
         self._real_world_checked = False
         self.network = Network(self.host, self.port)
         self.protocol = RakNetProtocol(self.network, security)
-        # В ECO-режиме снижаем интервал OnFoot синхронизации для стоячего бота
-        # Вместо частых 5 пакетов/сек шлем раз в 0.7-1.2 секунды. Для сервера это валидный OnFoot.
-        sync_rate = 0.8 if ECO_80_MODE else 0.2
+        # В ECO-режиме снижаем интервал OnFoot синхронизации для стоячего бота.
+        # Было 0.8 с — вдвое реже живого клиента: он, стоя, шлёт on-foot sync
+        # примерно раз в 0.5 с (медиана интервалов в _diag/route2.pcap), а во
+        # время движения — пачками до 50 в секунду. Ровные 0.8 с — тоже
+        # расписание, а не игрок; 0.5 с совпадает с замером.
+        sync_rate = 0.5 if ECO_80_MODE else 0.2
         self.sync_scheduler = PlayerSyncScheduler(
             rate_player=sync_rate,
             rate_player_min=sync_rate,
@@ -728,8 +988,19 @@ class BotInstance:
         )
 
         server_names_map = {}
+        host_suffix = "blackrussia.online"
         if self.manager and hasattr(self.manager, "server_names_cache"):
             server_names_map = self.manager.server_names_cache
+
+        project = getattr(self.manager, "project", None) if self.manager else None
+        if project is not None:
+            # Зона проекта берётся как есть, включая пустую. У Black Russia
+            # это blackrussia.online и Host собирается как red.blackrussia.online.
+            # У Arizona в списке уже готовое имя (mobile3.arizona-rp.com), и
+            # приклеенный чужой суффикс дал бы «mobile iii.blackrussia.online» —
+            # такого домена нет, pre-ping уходит в никуда, а сервер после этого
+            # молчит на хендшейк.
+            host_suffix = project.http_host_suffix or ""
 
         self.session = SampSession(
             self.protocol,
@@ -743,10 +1014,16 @@ class BotInstance:
             http_pre_ping=True,
             http_pre_ping_port=80,
             http_pre_ping_timeout=5.0,
-            http_pre_ping_host_suffix="blackrussia.online",
+            http_pre_ping_host_suffix=host_suffix,
             http_server_names=server_names_map,
             registration=reg_config,
             json_ui=json_ui,
+            # Чем начинается вход — свойство проекта: Black Russia ждёт
+            # b"BR", SA-MP-форки (Arizona) — стандартный offline-обмен RakNet.
+            handshake=getattr(project, "handshake", "br") or "br",
+            handshake_options=(
+                projects_mod.raknet_options() if project is not None else {}
+            ),
         )
 
         self.api = BotAPI(self.session)
@@ -806,6 +1083,9 @@ class BotInstance:
         url = min(urls, key=lambda u: counts.get(u, 0))
 
         self.proxy = url
+        # И сразу держим мост: дальше бот переподключится сам, уже через
+        # этот туннель, а уборка пула про него знать не будет.
+        self._hold_proxy_bridge()
         self.add_log(
             f"[ПРОКСИ] прямой вход не проходит ({self.connect_failures} попыток). "
             f"Переключаюсь на {url} — ботов на нём: {counts.get(url, 0)}."
@@ -853,6 +1133,9 @@ class BotInstance:
             self.status = f"Прокси не работает: {reason}"
             self.add_log(f"[-] Запуск отменён, прокси не работает: {reason}")
             return False
+
+        # Прокси проверен и сейчас пойдёт трафик — держим мост за собой.
+        self._hold_proxy_bridge()
 
         self.cancel_reconnect()
         self.stopping = False
@@ -1012,6 +1295,17 @@ class BotInstance:
 
         self.reconnect_cancel_event.clear()
         target_time = time.time() + delay
+
+        # Парковка (бан адреса) длиннее обычной паузы: вход откладываем до
+        # её конца, чтобы не долбиться в закрытый IP.
+        try:
+            remaining = self.park_remaining()
+            if remaining > 0.0:
+                target_time = time.time() + remaining
+                delay = max(delay, remaining)
+        except Exception:
+            pass
+
         self._queue_timer_active = bool(self.queue_mode)
         if self.queue_mode:
             self.add_log(
@@ -1021,10 +1315,21 @@ class BotInstance:
             self.add_log(f"Связь разорвана/ожидание. Авто-вход через {int(delay)} сек...")
 
         def _reconnect_waiter():
+            # nonlocal: парковку могут продлить уже после старта таймера, и
+            # тогда deadline переезжает. Без этого присваивание сделало бы
+            # target_time локальной переменной потока (UnboundLocalError).
+            nonlocal target_time
             try:
                 while time.time() < target_time:
                     if self.reconnect_cancel_event.is_set() or self.stopping or self.is_banned:
                         return
+                    # Парковку могли продлить уже после старта таймера.
+                    try:
+                        remaining = self.park_remaining()
+                        if remaining > 0.0 and self.parked_until > target_time:
+                            target_time = self.parked_until
+                    except Exception:
+                        pass
                     rem = max(0, int(target_time - time.time()))
                     m, s = divmod(rem, 60)
                     if self.queue_mode:
@@ -1036,6 +1341,8 @@ class BotInstance:
                 if self.reconnect_cancel_event.is_set() or self.stopping or self.is_banned:
                     return
 
+                # Парковка кончилась — значит адрес могли уже разбанить или
+                # подменить. Пробуем зайти.
                 if self.queue_mode:
                     self.add_log(
                         f"[ОЧЕРЕДЬ] Попытка входа #{self.queue_attempts} — подключаемся..."
@@ -1143,6 +1450,9 @@ class BotInstance:
     def stop(self, banned: bool = False):
         self.stopping = True
         self.cancel_reconnect()
+        # Мост больше не наш: освобождаем сразу, иначе отложенная уборка
+        # будет ждать бота, которого уже нет.
+        self._release_proxy_bridge()
         self.stop_spawn_watchdog()
         self.queue_mode = False
         self.queue_reason = ""
@@ -1187,13 +1497,34 @@ class BotManager:
         self._last_save = 0.0
         self._save_pending = False
 
-        # Кэш соответствия IP серверов и их названий (для правильного HTTP pre-ping заголовка Host)
-        self.server_names_cache = {}
+        # Можно ли вообще писать accounts.json этим менеджером.
+        #
+        # Скрипты, которые ведут одного бота через полный BotManager,
+        # используют реестр только как вход. Обработчик IP-бана и сторож
+        # прокси переписывают файл целиком, и одиночный прогон уже стирал
+        # из него прокси аккаунта. Раньше это глушилось подменой метода
+        # снаружи; теперь заморозка — явная, логируемая и её видно в логе.
+        self.accounts_writable = True
+        self.accounts_frozen_reason = ""
+        self._accounts_save_reason = ""
+        self._accounts_skip_logged_at = 0.0
+
+        # Активный проект. Берётся до всего остального: от него зависят и
+        # список серверов, и файл реестра, и суффикс HTTP-пинга, и лимит
+        # длины ника. Ошибка здесь — не повод не запуститься: остаётся
+        # Black Russia, как было до появления второго проекта.
         try:
-            all_s = br_servers.get_servers()
-            self.server_names_cache = {s["ip"]: s.get("firstname", "") for s in all_s}
-        except Exception:
-            self.server_names_cache = {}
+            self.project = projects_mod.active_project()
+        except Exception as exc:
+            print(f"[-] Проект не определился ({exc!r}) — беру Black Russia")
+            self.project = projects_mod.get_project(projects_mod.DEFAULT_PROJECT)
+        try:
+            projects_mod.apply_rpc_profile(self.project, log=lambda m: print(m, flush=True))
+        except Exception as exc:
+            print(f"[-] Профиль проекта не применён: {exc!r}")
+
+        # Кэш соответствия IP серверов и их названий (для правильного HTTP pre-ping заголовка Host)
+        self.server_names_cache = self._server_names_for(self.project)
 
         logger.set_log_interceptor(self._handle_global_log)
         self._setup_event_hooks()
@@ -1205,10 +1536,16 @@ class BotManager:
         # Переменная читается здесь, а не при импорте модуля: иначе тест не
         # может подставить свой файл, и менеджер успевает загрузить боевой
         # реестр до подмены.
-        self.accounts_file = os.environ.get("BR_ACCOUNTS_FILE") or ACCOUNTS_FILE
+        #
+        # У каждого проекта свой реестр: accounts.json у Black Russia,
+        # accounts_arz.json у Arizona. Один файл на всех означал бы, что
+        # запись фермы одного проекта стирает аккаунты второго — save_accounts
+        # пишет файл целиком из памяти.
+        self.accounts_file = self._resolve_accounts_file(self.project)
         # Предохранитель: под unittest настоящий реестр не трогаем никогда,
         # даже если тест забыл подставить свой путь.
-        if os.environ.get("BR_TEST_MODE") and self.accounts_file == ACCOUNTS_FILE:
+        if (os.environ.get("BR_TEST_MODE")
+                and self.accounts_file == self.project.accounts_path):
             self.accounts_file = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
                 "accounts.test.json",
@@ -1242,6 +1579,152 @@ class BotManager:
 
         # Загружаем сохраненные аккаунты из accounts.json
         self.load_accounts()
+
+    def _resolve_accounts_file(self, project) -> str:
+        """Какой файл реестра соответствует проекту.
+
+        Приоритет: переменная окружения -> подмена константы (тесты,
+        внешние обёртки) -> файл проекта. Порядок именно такой: явная
+        подмена должна побеждать, иначе тест запишет в боевой реестр.
+        """
+        env_file = os.environ.get("BR_ACCOUNTS_FILE")
+        if env_file:
+            return env_file
+        if ACCOUNTS_FILE != DEFAULT_ACCOUNTS_FILE:
+            return ACCOUNTS_FILE
+        return project.accounts_path
+
+    def _server_names_for(self, project) -> dict:
+        """IP -> короткое имя сервера для Host в HTTP pre-ping.
+
+        Сеть тут не обязательна: если список не пришёл, карта просто пустая,
+        и сессия стучится по адресу. Падать из-за этого на старте нельзя —
+        без карты бот всё ещё входит в игру.
+        """
+        try:
+            items = br_servers.get_servers(project)
+        except Exception:
+            return {}
+        out = {}
+        for item in items or []:
+            if not isinstance(item, dict):
+                continue
+            ip = str(item.get("ip") or "").strip()
+            if not ip:
+                continue
+            name = project.clean_server_name(item.get("firstname") or "")
+            out[ip] = name or str(item.get("firstname") or "").strip()
+        return out
+
+    def _display_server_name(self, srv: dict) -> str:
+        """Имя сервера как его зовёт проект.
+
+        У Black Russia это короткое «RED», и к нему клеится
+        blackrussia.online — по этой же строке бот ищет сервер в списке при
+        переподключении. Поэтому из записи берём firstname, а не полное
+        «RED | ...»: полное не совпадёт ни с одной записью реестра, и после
+        перезапуска аккаунт потеряет свой сервер.
+        """
+        project = getattr(self, "project", None)
+        raw = str(
+            (srv or {}).get("firstname")
+            or (srv or {}).get("name")
+            or ""
+        ).strip()
+        if project is None:
+            return raw
+        clean = project.clean_server_name(raw)
+        return clean or raw
+
+    @property
+    def nickname_max(self) -> int:
+        """Лимит длины ника активного проекта."""
+        try:
+            value = int(getattr(self.project, "nickname_max", 0) or 0)
+        except (TypeError, ValueError):
+            value = 0
+        return value if value > 0 else MAX_NICKNAME_LEN
+
+    def switch_project(self, raw):
+        """Переключить проект: чужой реестр на диск, свой — в память.
+
+        Почему с остановкой. Аккаунты одного проекта живут в своём файле, а
+        менеджер пишет файл целиком из памяти. Оставить ботов Black Russia
+        работать при активном Arizona — значит при первой же записи либо
+        потерять их из реестра, либо подмешать их в чужой файл. Поэтому
+        порядок жёсткий: сохранить, остановить, очистить, загрузить новый.
+
+        Возвращает отчёт для Telegram и панели: что было, что стало и сколько
+        аккаунтов поднялось.
+        """
+        previous = self.project
+        key = raw if str(raw) in projects_mod.project_keys() else projects_mod.resolve_key(raw)
+        if not key:
+            raise KeyError(f"неизвестный проект: {raw}")
+        target = projects_mod.all_projects()[key]
+
+        if key == previous.key:
+            return {"changed": False, "project": target.as_dict(),
+                    "previous": previous.as_dict(), "loaded": len(self.bots)}
+
+        # 1. Реестр текущего проекта — на диск, пока он ещё в памяти.
+        try:
+            self.save_accounts(force=True)
+        except Exception as exc:
+            print(f"[ПРОЕКТ] реестр не сохранился перед переключением: {exc!r}")
+
+        # 2. Остановить и отпустить ботов: они держат сессии, прокси-мосты
+        #    и сокеты. Без остановки половина ботов осталась бы висеть
+        #    в сети невидимой для меню.
+        try:
+            self.stop_all()
+        except Exception as exc:
+            print(f"[ПРОЕКТ] остановка ботов: {exc!r}")
+        with self._lock:
+            count_before = len(self.bots)
+            self.bots.clear()
+            self._nick_index.clear()
+            self._obj_index.clear()
+            self.active_bot_id = None
+            self._next_id = 1
+        self._used_nicknames = set()
+        self._nick_generator = None
+
+        # 3. Сменить проект и всё, что от него зависит.
+        projects_mod.set_active(key)
+        self.project = target
+        self.accounts_file = self._resolve_accounts_file(target)
+        if (os.environ.get("BR_TEST_MODE")
+                and self.accounts_file == target.accounts_path):
+            self.accounts_file = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "accounts.test.json",
+            )
+        self.server_names_cache = self._server_names_for(target)
+        projects_mod.apply_rpc_profile(target, log=lambda m: print(m, flush=True))
+        # Кэш списка серверов держит предыдущий проект: без сброса первый
+        # заход на новом проекте показал бы чужие серверы.
+        try:
+            br_servers.reset_cache()
+        except Exception:
+            pass
+
+        # 4. Поднять реестр нового проекта.
+        self.load_accounts()
+        report = {
+            "changed": True,
+            "project": target.as_dict(),
+            "previous": previous.as_dict(),
+            "stopped": count_before,
+            "loaded": len(self.bots),
+        }
+        print(
+            f"[ПРОЕКТ] {previous.title} -> {target.title}: "
+            f"остановлено {count_before}, загружено {len(self.bots)} "
+            f"({os.path.basename(self.accounts_file)})",
+            flush=True,
+        )
+        return report
 
     def _ensure_br_alias(self):
         """Автоматически регистрирует команду 'br' в системе при первом запуске."""
@@ -1383,6 +1866,19 @@ class BotManager:
         info = parse_ban(raw or reason)
         now = time.time()
 
+        # CONNECTION_BANNED (0x19) — закрыт АДРЕС, а не аккаунт. Раньше здесь
+        # аккаунт помечался забаненным, останавливался и заменялся новым, и
+        # владелец видел «аккаунты быстро банятся». Аккаунт цел: с другого IP
+        # он заходит нормально. Поэтому адрес — в мусор пула, аккаунт — на
+        # парковку до свободного узла, реестр не трогаем.
+        if _is_address_ban(reason, raw):
+            bot.add_log(
+                "[ЗАБАН АДРЕС] CONNECTION_BANNED (0x19) — это блокировка IP, "
+                "аккаунт не баню"
+            )
+            self.handle_ip_ban(bot, reason=reason or raw or "connection banned")
+            return
+
         # Тот же бан пришёл второй раз (чат + диалог) — не дублируем.
         if bot.is_banned and bot.banned_at and (now - bot.banned_at) < BAN_ALERT_DEDUPE:
             bot.add_log(f"[!] Повторное сообщение о бане проигнорировано: {info.summary}")
@@ -1399,7 +1895,18 @@ class BotManager:
         bot.add_log(f"[!] АККАУНТ ЗАБАНЕН! {info.summary} | сырое: {reason}")
         print(f"\n[!] ВНИМАНИЕ: Бот #{bot.bot_id} [{bot.nickname}] получил БАН! "
               f"({info.summary})")
+        tail = (
+            bot.server_tail_text(4)
+            if hasattr(bot, "server_tail_text")
+            else ""
+        )
+        if tail:
+            bot.add_log(f"[!] Что писал сервер до бана: {tail}")
         bot.stop(banned=True)
+        # Причина записи в реестр: без неё непонятно, кто переписал файл.
+        self._accounts_save_reason = (
+            f"бан {bot.nickname} (код {info.kind or '—'}): {info.summary[:120]}"
+        )
         self.save_accounts()
 
         # 1. Отправляем в Telegram и ИИ-анализ если подключен Telegram контроллер
@@ -1460,14 +1967,13 @@ class BotManager:
         # Замену не делаем только в одном случае: IP-бан (kick 999,
         # CONNECTION_BANNED). Он на адрес, а не на аккаунт — новый ник с
         # того же IP забанят так же, и регистрация сгорит впустую.
-        ip_banned = "connection_banned" in (reason or "").lower()
+        ip_banned = _is_address_ban(reason, raw)
         if ip_banned:
-            # Бан по IP: сервер не пускает никого с этого адреса. Помечаем
-            # прокси непригодным навсегда и переносим на него метку всем,
-            # кто с него сидел. Иначе следующий бот возьмёт тот же адрес
-            # из пула и словит тот же бан — а мы будем думать, что дело
-            # в аккаунтах.
+            # Сюда больше не попадаем: адресный бан разобран выше и до
+            # выставления is_banned. Ветка оставлена как страховка, чтобы
+            # ни один путь не пометил АККАУНТ за чужой IP.
             self.handle_ip_ban(bot, reason=reason or "connection banned")
+            return
         if not ip_banned and not getattr(bot, "_replaced", False):
             bot._replaced = True
 
@@ -1636,6 +2142,8 @@ class BotManager:
                 # стрим рядом пуст, а люди на сервере пишут.
                 b.last_chat_at = time.time()
                 b.add_log(f"[ЧАТ] {message}")
+                if hasattr(b, "note_server_text"):
+                    b.note_server_text("чат", message)
                 if b.active_task and hasattr(b.active_task, "on_chat_message"):
                     b.active_task.on_chat_message(str(message))
                 msg_lower = str(message).lower()
@@ -1713,6 +2221,10 @@ class BotManager:
 
                 dialog_text = f"{title} {info}".lower()
                 clean_info = re.sub(r'\{[0-9a-fA-F]{6}\}', '', info)
+
+                # Хвост сообщений сервера: в момент кика причина уже здесь.
+                if hasattr(b, "note_server_text"):
+                    b.note_server_text("диалог", f"{title}: {clean_info[:160]}")
 
                 # 0. Диалог о переполнении сервера -> очередь как в лаунчере
                 if any(k in dialog_text for k in FULL_SERVER_MARKERS):
@@ -1950,15 +2462,51 @@ class BotManager:
                         random.uniform(RECONNECT_MIN, RECONNECT_MAX), 1
                     )
 
+                # Парковка (бан адреса) длиннее обычной паузы: ждём её конца,
+                # чтобы не долбиться в закрытый IP и не ловить лимит входов.
+                parked = b.park_remaining() if hasattr(b, "park_remaining") else 0.0
+                if parked > 0.0:
+                    reconnect_delay = max(reconnect_delay, parked)
+                    b.add_log(
+                        f"[ПАРКОВКА] вход отложен на {int(parked / 60)} мин "
+                        f"({b.parked_reason or 'адрес заблокирован'})"
+                    )
+
                 b.schedule_reconnect(delay=reconnect_delay)
 
         @emitter.on("onKick")
         def _on_kick(bot_obj, reason_code, *args, **kwargs):
             b = self._find_bot_by_session_or_api(bot_obj)
             if b:
-                b.add_log(f"[КИК] Отключен сервером. Код причины: {reason_code}")
+                # Текст причины сервер пишет чатом или окном Anti-Cheat за
+                # мгновение до кика. Без него в логе «код 25» или «999» и
+                # ни слова о том, за что.
+                tail = (
+                    b.server_tail_text()
+                    if hasattr(b, "server_tail_text")
+                    else ""
+                )
+                detail = f" | до кика: {tail}" if tail else ""
+                b.add_log(
+                    f"[КИК] Отключен сервером. Код причины: {reason_code}{detail}"
+                )
+                print(
+                    f"[КИК] #{b.bot_id} [{b.nickname}] код {reason_code}{detail}",
+                    flush=True,
+                )
                 if reason_code == 999:
-                    self.mark_bot_banned(b, reason="Пакет CONNECTION_BANNED (0x19)")
+                    # CONNECTION_BANNED (0x19) — закрыт АДРЕС, а не аккаунт.
+                    # Решаем по КОДУ, а не по тексту: раньше здесь стоял
+                    # mark_bot_banned, и аккаунт помечался забаненным из-за
+                    # чужого IP. Аккаунт цел: адрес в мусор пула, аккаунт на
+                    # парковку до свободного узла.
+                    b.add_log(
+                        "[ЗАБАН АДРЕС] CONNECTION_BANNED (0x19) — это "
+                        "блокировка IP, аккаунт не баню"
+                    )
+                    self.handle_ip_ban(
+                        b, reason=f"Пакет CONNECTION_BANNED (0x19){detail}"
+                    )
                     return
                 if reason_code == 2 and getattr(b, "auto_regen_nick", False):
                     self.replace_bot_nickname(b)
@@ -2087,6 +2635,23 @@ class BotManager:
                 except Exception as exc:
                     b.add_log(f"[СЛАВА] сброс маркера упал: {exc!r}")
 
+        @emitter.on("onSetMapIcon")
+        def _on_map_icon(bot_obj, icon_id, xyz, marker_type=None, style=None,
+                         *args, **kwargs):
+            # Маркер квеста — единственный источник координат цели в эталоне
+            # (RPC 417). Checkpoint'ов за весь проход всего два, а маркеров
+            # десятки, поэтому движок Славы смотрит сюда.
+            b = self._find_bot_by_session_or_api(bot_obj)
+            if not b:
+                return
+            quest = getattr(b, "slava_quest", None)
+            if quest is None:
+                return
+            try:
+                quest.on_map_icon(icon_id, xyz, marker_type, style)
+            except Exception as exc:
+                b.add_log(f"[СЛАВА] маркер упал: {exc!r}")
+
         @emitter.on("OnSetMoney")
         def _on_set_money(bot_obj, amount, *args, **kwargs):
             b = self._find_bot_by_session_or_api(bot_obj)
@@ -2154,6 +2719,11 @@ class BotManager:
                     banned_at = 0.0
                 proxy = item.get("proxy") or ""
                 proxy_node = str(item.get("proxy_node") or "")
+                try:
+                    parked_until = float(item.get("parked_until") or 0.0)
+                except (TypeError, ValueError):
+                    parked_until = 0.0
+                parked_reason = str(item.get("parked_reason") or "")
                 saved_lvl = item.get("lvl") or "-"
                 try:
                     saved_money = int(item.get("money") or 0)
@@ -2201,7 +2771,7 @@ class BotManager:
                         skipped_bad += 1
                         continue
                 else:
-                    clean_name = srv.get("firstname") or srv.get("name", "").replace("BLACK RUSSIA | ", "").strip()
+                    clean_name = self._display_server_name(srv)
                     clean_name = clean_name.upper()
                     ip = srv["ip"]
                     port = int(srv["port"])
@@ -2228,6 +2798,11 @@ class BotManager:
                     b.ban_kind = ban_kind
                     b.ban_duration = ban_duration
                     b.banned_at = banned_at
+                    # Просроченную парковку не тащим: она либо ещё идёт,
+                    # либо уже неактуальна.
+                    if parked_until > time.time():
+                        b.parked_until = parked_until
+                        b.parked_reason = parked_reason
                     b.level_str = saved_lvl
                     b.money = saved_money
                     b.target_lvl = saved_target_lvl
@@ -2265,8 +2840,45 @@ class BotManager:
                 b.nickname: b for b in self.bots.values() if b.nickname
             }
 
+    def freeze_accounts(self, reason: str = "") -> None:
+        """Запретить запись accounts.json до конца процесса.
+
+        Нужно скриптам, которые ведут одного бота через полный BotManager:
+        реестр для них — только вход. Обработчик IP-бана и сторож прокси
+        пишут файл целиком, поэтому одиночный прогон стирал из него прокси
+        аккаунта. Раньше это глушилось подменой save_accounts снаружи —
+        молча, без следа в логе.
+        """
+        self.accounts_writable = False
+        self.accounts_frozen_reason = str(reason or "реестр заморожен")
+        print(
+            f"[РЕЕСТР] accounts.json заморожен: {self.accounts_frozen_reason}",
+            flush=True,
+        )
+
     def save_accounts(self, force: bool = False):
-        """Пишет accounts.json. Без force — не чаще раза в 10 секунд (бережём флеш)."""
+        """Пишет accounts.json. Без force — не чаще раза в 10 секунд (бережём флеш).
+
+        Причина записи берётся из self._accounts_save_reason: её ставят
+        обработчики бана и прокси. В лог уходит и запись, и отказ —
+        раньше файл менялся молча, и стёртый прокси аккаунта никто не
+        связал с обработчиком бана.
+        """
+        why = str(getattr(self, "_accounts_save_reason", "") or "")
+
+        if not getattr(self, "accounts_writable", True):
+            now = time.time()
+            if now - getattr(self, "_accounts_skip_logged_at", 0.0) >= 60.0:
+                self._accounts_skip_logged_at = now
+                frozen = getattr(self, "accounts_frozen_reason", "") or "заморожен"
+                print(
+                    f"[РЕЕСТР] запись accounts.json пропущена "
+                    f"({frozen}) | причина вызова: {why or '—'}",
+                    flush=True,
+                )
+            self._accounts_save_reason = ""
+            return
+
         now = time.time()
         with self._save_lock:
             if not force and (now - self._last_save) < SAVE_DEBOUNCE:
@@ -2297,9 +2909,23 @@ class BotManager:
                     "lvl": b.level_str,
                     "money": b.money,
                     "target_lvl": b.target_lvl,
+                    # Парковка при бане адреса: без неё после перезапуска бот
+                    # снова долбится в закрытый IP и ловит лимит частых входов.
+                    "parked_until": getattr(b, "parked_until", 0.0) or 0.0,
+                    "parked_reason": getattr(b, "parked_reason", "") or "",
                 })
 
         self._write_accounts(data)
+        self._accounts_save_reason = ""
+        # Имя файла в логе — настоящее. У проектов реестры разные
+        # (accounts.json / accounts_arz.json), и запись «accounts.json» при
+        # работе на Arizona сбивала бы с толку при разборе логов.
+        print(
+            f"[РЕЕСТР] {os.path.basename(self.accounts_file)} записан: "
+            f"{len(data)} аккаунтов"
+            + (f" | причина: {why}" if why else ""),
+            flush=True,
+        )
 
     def _write_accounts(self, data: list) -> None:
         """Записать accounts.json атомарно и оставить одну резервную копию.
@@ -2458,7 +3084,9 @@ class BotManager:
         if not hasattr(self, "_nick_generator") or self._nick_generator is None:
             from logic.nicks import NickGenerator
 
-            self._nick_generator = NickGenerator()
+            # Лимит длины у проекта свой: генератор обрезает ник сам, а не
+            # сервер отказом в регистрации.
+            self._nick_generator = NickGenerator(max_len=self.nickname_max)
 
         if not hasattr(self, "_used_nicknames"):
             self._used_nicknames = set()
@@ -2485,13 +3113,14 @@ class BotManager:
             # обычную пару «имя_фамилия» напрямую из пулов.
             from logic.nicks import FEMALE_NAMES, MALE_NAMES, SURNAMES
 
+            limit = self.nickname_max
             for _ in range(200):
                 nick = f"{random.choice(MALE_NAMES + FEMALE_NAMES)}" \
                        f"_{random.choice(SURNAMES)}"
-                if nick not in avoid and len(nick) <= 20:
+                if nick not in avoid and len(nick) <= limit:
                     break
             else:
-                nick = f"Nick_{random.choice(SURNAMES)}"
+                nick = f"Nick_{random.choice(SURNAMES)}"[:limit]
 
         self._used_nicknames.add(nick)
         return nick
@@ -2679,60 +3308,105 @@ class BotManager:
         return bots_to_start
 
     def handle_ip_ban(self, bot, reason: str = "") -> dict:
-        """Античит заблокировал IP: адрес в мусор, аккаунты — на другой.
+        """Античит заблокировал IP: адрес в мусор, аккаунты — на парковку.
 
         Блокировка по IP — это не бан аккаунта. С этого адреса сервер не
         пускает никого, но сам аккаунт цел: с другого IP он заходит
-        нормально. Поэтому аккаунт не убиваем, а переводим на рабочий
-        узел и перезаходим.
+        нормально. Поэтому:
 
-        Адрес при этом помечается забаненным навсегда. Без этого пул
-        выдаст его следующему боту, тот зайдёт и получит ту же надпись,
-        и будет выглядеть, будто сломались аккаунты.
+        * метка бана ложится на АДРЕС УЗЛА (ключ пула), а не на аккаунт;
+        * аккаунт НЕ помечается `is_banned` и не уходит в «ЗАБАНЕН (IP)»;
+        * живая сессия НЕ гасится через `stop()`: если игра идёт, пусть
+          идёт — сервер сам решит, отпускать её или нет;
+        * аккаунт паркуется: до `parked_until` он не переподключается,
+          чтобы не биться в закрытый IP и не ловить лимит частых входов;
+        * если есть свободный узел, аккаунт сразу переезжает на него.
 
-        Возвращает, что сделано: какие ключи забанены, кого перевели.
+        Возвращает, что сделано: какие ключи забанены, кого перевели,
+        кого припарковали.
         """
         proxy = (bot.proxy or "").strip()
+        node_key = str(getattr(bot, "proxy_node", "") or "")
         pool = getattr(self, "proxy_pool", None)
-        banned_keys: list[str] = []
-        if proxy and pool is not None:
-            try:
-                banned_keys = pool.mark_banned(proxy, reason=reason)
-            except Exception as exc:
-                print(f"[!] Не смог пометить прокси забаненным: {exc!r}")
 
-        # Все, кто сидел на этом адресе, переезжают на другой. Иначе они
-        # будут биться в ту же стену при каждом перезаходе.
-        moved: list[int] = []
-        marked: list[int] = []
-        if proxy:
-            for other in list(self.bots.values()):
-                if (other.proxy or "").strip() != proxy:
-                    continue
-                if other.is_banned:
+        banned_keys: list[str] = []
+        if pool is not None:
+            for target in (proxy, node_key):
+                if not target:
                     continue
                 try:
-                    other.cancel_reconnect()
-                    other.stop()
-                except Exception:
-                    pass
-                new_proxy = self.swap_proxy(other, reason="IP заблокирован античитом")
-                if new_proxy:
-                    moved.append(other.bot_id)
-                else:
-                    # Менять не на что: рабочих узлов нет. Тогда честно
-                    # помечаем аккаунт, чтобы он не долбился впустую.
-                    other.is_banned = True
-                    other.ban_reason = f"IP заблокирован, замена не найдена"
-                    other.ban_kind = "ip"
-                    other.banned_at = time.time()
-                    other.status = "ЗАБАНЕН (IP)"
-                    other.add_log("[!] Адрес забанен, рабочих узлов для замены нет")
-                    marked.append(other.bot_id)
-        if moved or marked:
+                    for key in pool.mark_banned(target, reason=reason) or []:
+                        if key not in banned_keys:
+                            banned_keys.append(key)
+                except Exception as exc:
+                    print(f"[!] Не смог пометить {target} забаненным: {exc!r}")
+
+        # Кого задело. Сравниваем по УЗЛУ, а не по строке прокси: мост
+        # 127.0.0.1:10808 один на всех, а узлы за ним разные, и гасить всю
+        # пачку за один закрытый адрес нельзя.
+        affected = []
+        if proxy or node_key:
+            for other in list(self.bots.values()):
+                if getattr(other, "is_banned", False):
+                    continue
+                if not _same_address(other, proxy, node_key):
+                    continue
+                affected.append(other)
+
+        moved: list[int] = []
+        parked: list[int] = []
+        for other in affected:
+            if _session_is_live(other):
+                # Игра идёт — сессию не трогаем. Новый адрес подхватится
+                # при следующем входе; сейчас только откладываем его.
+                _park_bot(other, f"адрес {proxy or '—'} заблокирован (идёт игра)")
+                parked.append(other.bot_id)
+                continue
+
+            new_proxy = self.swap_proxy(other, reason="IP заблокирован античитом")
+            if new_proxy:
+                moved.append(other.bot_id)
+                continue
+
+            # Менять не на что: рабочих узлов нет. Аккаунт не убиваем и не
+            # баним — он живой, просто ждёт свободный адрес.
+            _park_bot(
+                other,
+                f"адрес {proxy or '—'} заблокирован, свободного узла нет",
+            )
+            parked.append(other.bot_id)
+
+        # Человеческая строка в лог: что закрыто, сколько народа на адресе
+        # и что с ними стало. Раньше тут было «помечено N», и по логу
+        # нельзя было понять, что аккаунты живы и просто ждут узел.
+        names = ", ".join(
+            str(getattr(self.bots.get(i), "nickname", i)) for i in parked
+        )
+        print(
+            f"[!] IP-бан: забанен адрес {proxy or '—'}"
+            + (f" (узел {node_key})" if node_key else "")
+            + f" | аккаунтов на адресе: {len(affected)}"
+            + f" | переведено: {len(moved)}"
+            + f" | припарковано: {len(parked)}"
+            + (f" [{names}]" if names else "")
+            + " | аккаунты не забанены",
+            flush=True,
+        )
+        if parked:
+            print(
+                f"[ПАРКОВКА] аккаунты ждут свободный адрес, вход после "
+                f"{time.strftime('%H:%M:%S', time.localtime(time.time() + IP_PARK_SECONDS))}",
+                flush=True,
+            )
+
+        if moved or parked:
+            # Причина нужна в логе записи: без неё непонятно, кто и зачем
+            # переписал accounts.json в этом прогоне.
+            self._accounts_save_reason = (
+                f"IP-бан {proxy or 'свой IP'}: переведено {len(moved)}, "
+                f"припарковано {len(parked)} | {str(reason)[:80]}"
+            )
             self.save_accounts()
-        print(f"[!] IP-бан: забанен адрес {proxy or '—'}, "
-              f"переведено {len(moved)}, помечено {len(marked)}")
 
         # Отчёт в Telegram: событие на весь адрес, а не на один бот.
         try:
@@ -2745,22 +3419,28 @@ class BotManager:
                         "",
                         f"Адрес: <code>{proxy or 'свой IP'}</code>",
                         f"Причина: <code>{reason or 'блокировка по IP'}</code>",
+                        f"Аккаунтов на адресе: <b>{len(affected)}</b>",
                     ]
                     if moved:
-                        names = ", ".join(
+                        got = ", ".join(
                             self.bots[i].nickname for i in moved if i in self.bots)
                         lines.append(f"Переведены на другой узел: <b>{len(moved)}</b>")
+                        lines.append(f"<i>{got[:300]}</i>")
+                    if parked:
+                        lines.append(f"Припаркованы (аккаунты целы): <b>{len(parked)}</b>")
                         lines.append(f"<i>{names[:300]}</i>")
-                    if marked:
-                        lines.append(f"Без замены, помечены: <b>{len(marked)}</b>")
                     lines.append("")
-                    lines.append("Адрес исключён из пула и больше не выдаётся.")
+                    lines.append(
+                        "Адрес исключён из пула. Аккаунты не забанены: "
+                        "ждут свободный узел."
+                    )
                     tg.bot.send_message(owner, "\n".join(lines))
         except Exception as exc:
             print(f"[!] Не смог отправить отчёт об IP-бане: {exc!r}")
 
-        return {"proxy": proxy, "banned_keys": banned_keys,
-                "moved": moved, "marked": marked}
+        return {"proxy": proxy, "node_key": node_key,
+                "banned_keys": banned_keys, "affected": len(affected),
+                "moved": moved, "parked": parked}
 
     def swap_proxy(self, bot, *, reason: str = "") -> str:
         """Заменить боту прокси на рабочий и перезайти.
@@ -2799,6 +3479,10 @@ class BotManager:
         bot.proxy_node = self._node_key_for(new_proxy)
         bot._auto_proxy_tried = False
         try:
+            self._accounts_save_reason = (
+                f"смена прокси {bot.nickname}: {current or 'свой IP'} → {new_proxy}"
+                + (f" ({reason})" if reason else "")
+            )
             self.save_accounts()
         except Exception:
             pass
@@ -2850,17 +3534,33 @@ class BotManager:
             if now - last < PROXY_SWAP_COOLDOWN:
                 continue
             try:
-                if pool.is_banned(proxy):
-                    bot._proxy_swap_at = now
-                    self.swap_proxy(bot, reason="адрес забанен")
-                    continue
-                ok, why = pool.verify_before_connect(proxy)
+                banned = bool(pool.is_banned(proxy))
+                if not banned:
+                    ok, why = pool.verify_before_connect(proxy)
             except Exception:
                 continue
-            if ok:
+            if not banned and ok:
+                continue
+            # Адрес закрыт, а игра ещё идёт: сессию сами не гасим. Аккаунт
+            # паркуем, а переезд случится, когда сервер отпустит сессию —
+            # тогда бот перестанет быть «живым» и его заберёт swap_proxy.
+            if banned and _session_is_live(bot):
+                bot._proxy_swap_at = now
+                already = False
+                park_left = getattr(bot, "park_remaining", None)
+                if callable(park_left):
+                    try:
+                        already = park_left() > 0.0
+                    except Exception:
+                        already = False
+                if not already:
+                    _park_bot(bot, f"адрес {proxy} забанен (идёт игра)")
                 continue
             bot._proxy_swap_at = now
-            self.swap_proxy(bot, reason=why or "прокси не отвечает")
+            self.swap_proxy(
+                bot,
+                reason="адрес забанен" if banned else (why or "прокси не отвечает"),
+            )
 
     def delete_selected(self, bot_ids: list[int]) -> list[int]:
         """Удалить выбранные аккаунты. Возвращает те, что реально удалены.
@@ -3336,6 +4036,7 @@ def print_help():
   /proxy <ID|all> <узел|none>       - Прокси конкретному боту
   /task <lvl|quest|mine|factory|bus|stop> [ID] - Назначить задачу боту
   /switch <ID>      - Выбрать активного бота для консольных команд
+  /project [br|arz] - Показать или переключить игровой проект
   /logs [ID]        - Посмотреть последние логи бота
   /unban <ID>       - Снять статус бана с аккаунта
   /del <ID>         - Удалить бота из списка и accounts.json
@@ -3715,7 +4416,7 @@ def handle_proxy_command(manager, line: str) -> None:
 
 def main():
     print("=" * 70)
-    print("   Black Russia Headless RakSAMP Bot Client [Multi-Account]   ")
+    print("   Multi-Project Headless RakSAMP Bot Client [Multi-Account]   ")
     print("=" * 70)
 
     def _add_admin(current, raw):
@@ -3736,6 +4437,7 @@ def main():
     # Разбор аргументов для Telegram Bot
     tg_token = None
     tg_admin = None
+    project_arg = None
     filtered_args = []
     i = 1
     while i < len(sys.argv):
@@ -3745,6 +4447,12 @@ def main():
             i += 2
         elif arg.startswith("--tg="):
             tg_token = arg.split("=", 1)[1]
+            i += 1
+        elif arg in ("--project", "--proj") and i + 1 < len(sys.argv):
+            project_arg = sys.argv[i + 1]
+            i += 2
+        elif arg.startswith("--project="):
+            project_arg = arg.split("=", 1)[1]
             i += 1
         elif arg in ("--admin", "--tg-admin") and i + 1 < len(sys.argv):
             # Админов может быть несколько: --admin 111 --admin 222
@@ -3764,6 +4472,22 @@ def main():
         tg_token = os.environ.get("TG_BOT_TOKEN")
     if not tg_admin and os.environ.get("TG_ADMIN_ID"):
         tg_admin = _add_admin(None, os.environ["TG_ADMIN_ID"])
+
+    # Проект из командной строки или переменной окружения. Меняем активный
+    # проект ДО создания менеджера: он читает проект один раз и по нему
+    # поднимает реестр, список серверов и суффикс HTTP-пинга. Переменная —
+    # разовый override на этот запуск: сразу после применения снимаем её и
+    # сбрасываем кэш, иначе она перебивала бы переключение из Telegram
+    # до самого перезапуска (файл меняется, а active_key() читает её).
+    env_project = os.environ.get("BR_PROJECT", "").strip()
+    if project_arg or env_project:
+        try:
+            chosen = projects_mod.set_active(project_arg or env_project)
+            print(f"[*] Проект: {chosen.title} ({chosen.key})")
+        except Exception as _exc:
+            print(f"[!] Проект '{project_arg or env_project}' не распознан: {_exc}")
+        os.environ.pop("BR_PROJECT", None)
+        projects_mod.reset_cache()
 
     manager = BotManager()
 
@@ -3802,10 +4526,14 @@ def main():
         manager.add_bot(target_server, nickname, password=password)
     elif len(filtered_args) in (1, 2):
         print("[-] Ошибка: Для запуска через аргументы пароль обязателен!")
-        print("Использование: python3 bot.py <сервер> <никнейм> <пароль> [--tg ТОКЕН] [--admin ID]")
+        print("Использование: python3 bot.py <сервер> <никнейм> <пароль> [--project br|arz] [--tg ТОКЕН] [--admin ID]")
     else:
         if manager.bots:
-            print(f"\n[i] Найдено {len(manager.bots)} сохраненных аккаунтов из {os.path.basename(ACCOUNTS_FILE)}.")
+            print(
+                f"\n[i] Проект: {manager.project.title}. "
+                f"Найдено {len(manager.bots)} сохраненных аккаунтов из "
+                f"{os.path.basename(manager.accounts_file)}."
+            )
             manager.list_bots()
             print("Введите /startall чтобы запустить всех, или /menu для перехода в меню.\n")
         elif background:
@@ -3910,6 +4638,29 @@ def main():
             else:
                 print("[-] Ошибка: Пароль обязателен!")
                 print("Использование: /add <сервер> <никнейм> <пароль> [прокси]")
+
+        elif line.startswith("/project"):
+            parts = line.split(maxsplit=1)
+            if len(parts) >= 2 and parts[1].strip():
+                try:
+                    report = manager.switch_project(parts[1].strip())
+                except Exception as exc:
+                    print(f"[-] Не переключил: {exc}")
+                else:
+                    if report.get("changed"):
+                        print(
+                            f"[*] Проект: {report['project']['title']} | "
+                            f"остановлено {report['stopped']}, "
+                            f"загружено {report['loaded']} "
+                            f"({os.path.basename(manager.accounts_file)})"
+                        )
+                    else:
+                        print(f"[*] Уже активен: {report['project']['title']}")
+            else:
+                for item in projects_mod.describe():
+                    mark = "*" if item["active"] else " "
+                    print(f" {mark} {item['key']:<6} {item['title']}")
+                print("Использование: /project <br|arz>")
 
         elif line.startswith("/switch"):
             parts = line.split()

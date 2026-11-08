@@ -1,97 +1,69 @@
+# ==========================================================================
+#  Black Russia — что НЕ едет в репозиторий
+# ==========================================================================
+#  Главное правило: исходники (*.py, JSON-профили, шаблоны) едут ВСЕГДА.
+#  Раньше здесь стоял глобальный *.py, и новые модули молча оставались на
+#  машине разработчика. После клона бот падал с ModuleNotFoundError:
+#  logic.minigames, br.client, projects и т.д. Тесты при этом «проходили»,
+#  потому что файлы лежали рядом. Больше так не делаем.
+
+# --- артефакты запуска ----------------------------------------------------
 *.log
 *.pid
-__pycache__/
 *.pyc
-*.jpg
-br/
-*.py
-!bot.py
-!tg_controller.py
-!ai_controller.py
-!br_servers.py
-!raknet_core.py
-!logic/delta_teleport.py
-!logic/spawn.py
-!test_spawn_unit.py
-!test_spawn_watchdog.py
-!test_delta_teleport_unit.py
-!test_delta_tp_spawn.py
-!probe_spawn_select.py
+*.pyo
+__pycache__/
+.pytest_cache/
 .sess/
-_diag/
-!logic/captcha.py
-!logic/farm.py
-!logic/npc_dialog.py
-!logic/shop.py
-!logic/calls.py
-!logic/paint.py
-!logic/quest_helpers.py
-!logic/menu.py
-!test_menu.py
-!logic/nicks.py
-!test_nicks.py
-!test_confirm.py
-!test_ban_replace.py
-!logic/undermap.py
-!test_quest_helpers.py
-!test_regressions.py
-!test_farm_flow.py
-!test_undermap.py
-!logic/vpn_sub.py
-!logic/vpn_probe.py
-!logic/proxy_pool.py
-!test_proxy_pool.py
-!test_proxy_integration.py
-!test_spawn_status.py
-!logic/farm_probe.py
-!test_farm_probe.py
-!test_reconnect.py
-!test_ban_detect.py
-!test_menuscan.py
-!test_button_style.py
-!test_multi_admin.py
-!test_no_duplicates.py
-!test_vpn_bridge.py
-!logic/vpn_bridge.py
-!test_vpn_pool_bridge.py
-!test_vpn_bridge_integration.py
+.tess_tmp/
+.probe/
+_web/
+.vercel
 
-# резервная копия, которую пишет save_accounts
+# --- локальное состояние и кеши -------------------------------------------
+.servers_cache.json
+.servers_cache_*.json
+bot_settings.json
+projects.json
+
+# --- аккаунты и секреты ---------------------------------------------------
+# Рабочие списки аккаунтов живут только на машине. Корневой accounts.json
+# в репозитории уже есть исторически, а бэкапы и тестовые копии не коммитим.
 accounts.json.bak
 accounts.json.tmp
-!test_settings.py
-!logic/settings.py
-bot_settings.json
-!test_batch_wizard.py
-!test_live_view.py
-!run_tests.py
 accounts.test.json
 accounts.test.json.bak
+br/accounts.json
+_one_*.json
+_one_*.json.bak
 
-# установщик на сервер — не диагностика, должен ехать в репозитории
-!deploy/
-!deploy/install_singbox.sh
-!test_xray_config.py
-!test_callback_limit.py
+# --- картинки, видео, дампы, обученные шаблоны ----------------------------
+*.jpg
+*.mp4
+*.pkl
+captcha_samples/
 
-# Веб-панель RakCRMP: состояние (очередь, снимки, хеш пароля) не коммитим
-_web/
-# Исключения из общего *.py: код панели и моста
-!logic/web_bridge.py
-!logic/humanizer.py
-!logic/baninfo.py
-!test_humanizer.py
-!test_baninfo.py
-!web/
-!web/*.py
-!web/static/
-!web/static/*
-!test_web_panel.py
-.vercel
-!logic/lvl_engine.py
-!logic/real_world.py
-!logic/immortal.py
-!test_lvl_engine.py
-!test_real_world.py
-!test_immortal.py
-!test_proxy_ban.py
+# --- тяжёлые разведочные и сторонние каталоги -----------------------------
+_apk/
+_sb/
+_src/
+_vpn_bridge/
+_vps_cmp/
+landing/
+rakocr/
+rccheat/
+видео/
+_sub.txt
+_srv_probe.json
+_run_murmansk_loop.out
+_run_murmansk_loop.sh
+
+# --- черновые скрипты разведки -------------------------------------------
+# Одноразовые пробы протокола и обёртки для замеров в КОРНЕ репозитория.
+# Код бота их не импортирует, в репозитории им делать нечего.
+# Шаблон привязан к корню намеренно: иначе `_*.py` съедал бы __init__.py
+# и __main__.py внутри пакетов.
+/probe_*.py
+/_agent_*.py
+/_*.py
+/_test_*.py

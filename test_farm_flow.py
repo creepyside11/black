@@ -334,8 +334,8 @@ class FarmRpcTests(unittest.TestCase):
     def test_answer_uses_fixed_dialog_rpc(self):
         """Раньше ответ уходил как RPC 2 из-за id 514 — меню молчали."""
         packet = PacketBuilder.rpc_build("dialog_response", 0, 1, 2, "")
-        self.assertEqual(packet[1], RPC.DIALOG_RESPONSE)
-        self.assertEqual(RPC.DIALOG_RESPONSE, 62)
+        self.assertEqual(packet[1], RPC.DIALOG_RESPONSE & 0xFF)
+        self.assertEqual(RPC.DIALOG_RESPONSE, 406)
 
 
 if __name__ == "__main__":

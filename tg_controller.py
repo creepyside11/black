@@ -204,6 +204,11 @@ class TelegramBotController:
             types.InlineKeyboardButton("🌐 Прокси и VPN", callback_data="vpn_menu", style="primary")
         )
         markup.row(
+            types.InlineKeyboardButton(
+                f"🌍 Проект: {self._project_title()}",
+                callback_data="project_menu", style="primary"),
+        )
+        markup.row(
             types.InlineKeyboardButton("⚙️ Настройки", callback_data="settings_menu", style="primary")
         )
         markup.row(
@@ -222,6 +227,9 @@ class TelegramBotController:
             pwd = settings.base_password or "<i>не задан</i>"
             text = (
                 f"<b>⚙️ Настройки бота</b>\n\n"
+                f"🌍 Проект: <b>{self._project_title()}</b>\n"
+                f"<i>Список серверов, реестр аккаунтов и зона входа берутся "
+                f"у активного проекта.</i>\n\n"
                 f"🔑 Базовый пароль: <code>{pwd}</code>\n"
                 f"<i>Его получают все новые аккаунты: при массовой регистрации "
                 f"и при автозамене забаненных.</i>\n\n"
@@ -231,6 +239,9 @@ class TelegramBotController:
                 f"<i>Какой адрес получит новый аккаунт, когда старый уйдёт "
                 f"в бан и его заменит свежий.</i>"
             )
+            markup.add(types.InlineKeyboardButton(
+                f"🌍 Проект: {self._project_title()}",
+                callback_data="project_menu", style="success"))
             markup.add(types.InlineKeyboardButton(
                 "🔑 Изменить базовый пароль",
                 callback_data="set_base_password", style="success"))
@@ -911,11 +922,174 @@ class TelegramBotController:
 
         lines = [
             f"<b>🤖 Панель управления ботами</b>",
+            f"🌍 Проект: <b>{self._project_title()}</b>",
             "",
             f"Всего: <b>{total}</b> · Онлайн: <b>{online}</b> · Бан: <b>{banned}</b>",
             f"Страница <b>{page}</b> из <b>{total_pages}</b>",
         ]
         return "\n".join(lines), markup
+
+    # ---------- проекты ----------
+
+    def _project(self):
+        """Активный проект. Импорт внутри: без bot.py контроллер тоже живёт."""
+        project = getattr(self.manager, "project", None)
+        if project is not None:
+            return project
+        try:
+            import projects as projects_mod
+
+            return projects_mod.active_project()
+        except Exception:
+            return None
+
+    def _project_title(self) -> str:
+        project = self._project()
+        return getattr(project, "title", "Black Russia")
+
+    def _render_projects(self, chat_id, message_id=None, callback_id=None):
+        """Экран переключения проекта.
+
+        Показываем всё, что отличает проекты друг от друга: список серверов,
+        реестр аккаунтов и зону HTTP-пинга. Иначе переключение выглядит как
+        кнопка без последствий, а потом «аккаунты пропали» — они не пропали,
+        они в своём файле.
+        """
+        try:
+            import projects as projects_mod
+
+            items = projects_mod.describe()
+        except Exception as exc:
+            self.bot.send_message(chat_id, f"❌ Реестр проектов недоступен: {exc}")
+            if callback_id:
+                try:
+                    self.bot.answer_callback_query(callback_id)
+                except Exception:
+                    pass
+            return
+
+        current = self._project()
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        lines = ["<b>🌍 Проект</b>", ""]
+        for item in items:
+            mark = "✅ " if item.get("active") else ""
+            lines.append(
+                f"{mark}<b>{item['title']}</b> (<code>{item['key']}</code>)"
+            )
+            if item.get("note"):
+                lines.append(f"   <i>{item['note']}</i>")
+            if not item.get("has_servers_api"):
+                lines.append("   <i>⚠️ адрес списка серверов не задан</i>")
+            if item.get("active"):
+                continue
+            markup.add(types.InlineKeyboardButton(
+                f"{item['short']} · {item['title']}",
+                callback_data=f"project_ask:{item['key']}", style="primary"))
+
+        accounts_file = getattr(self.manager, "accounts_file", "") or ""
+        lines += [
+            "",
+            f"Активный: <b>{getattr(current, 'title', '—')}</b>",
+            f"Реестр аккаунтов: <code>{os.path.basename(accounts_file) or '—'}</code>",
+            f"Состояние: <b>{len(self.manager.bots)}</b> аккаунт(ов) в памяти",
+            "",
+            "<i>Переключение сохраняет текущий реестр, останавливает ботов и "
+            "поднимает аккаунты другого проекта. Запущенные боты одного проекта "
+            "в другом не видны — у каждого свой файл.</i>",
+        ]
+        markup.add(types.InlineKeyboardButton(
+            "⬅️ Назад в настройки", callback_data="settings", style="primary"))
+
+        text = "\n".join(lines)
+        if message_id is None:
+            self.bot.send_message(chat_id, text, reply_markup=markup)
+        else:
+            try:
+                self.bot.edit_message_text(
+                    text, chat_id=chat_id, message_id=message_id, reply_markup=markup)
+            except Exception:
+                self.bot.send_message(chat_id, text, reply_markup=markup)
+        if callback_id:
+            try:
+                self.bot.answer_callback_query(callback_id)
+            except Exception:
+                pass
+
+    def _render_project_confirm(self, key, chat_id, message_id=None, callback_id=None):
+        """Шаг подтверждения перед переключением.
+
+        Переключение останавливает запущенную ферму — это не та кнопка,
+        которую стоит нажимать случайно, промахнувшись по списку на
+        телефоне. Поэтому: выбор проекта -> подтверждение -> действие.
+        """
+        try:
+            import projects as projects_mod
+
+            target = projects_mod.get_project(key)
+            active = projects_mod.active_project()
+        except Exception as exc:
+            self.bot.send_message(chat_id, f"❌ Проект не найден: {exc}")
+            if callback_id:
+                try:
+                    self.bot.answer_callback_query(callback_id)
+                except Exception:
+                    pass
+            return
+
+        if target.key == active.key:
+            self._render_projects(chat_id, message_id, callback_id)
+            return
+
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(types.InlineKeyboardButton(
+            f"✅ Переключить на {target.title}",
+            callback_data=f"project_do:{target.key}", style="success"))
+        markup.add(types.InlineKeyboardButton(
+            "↩️ Отмена", callback_data="project_menu", style="primary"))
+        text = (
+            f"<b>🌍 Переключить проект?</b>\n\n"
+            f"Сейчас: <b>{active.title}</b>\n"
+            f"Станет: <b>{target.title}</b>\n\n"
+            f"Будет сделано:\n"
+            f"1. Реестр <code>{os.path.basename(getattr(self.manager, 'accounts_file', '') or '')}</code> "
+            f"сохранится на диск.\n"
+            f"2. Все запущенные боты (<b>{len(self.manager.bots)}</b>) остановятся.\n"
+            f"3. Поднимутся аккаунты <b>{target.title}</b> из "
+            f"<code>{os.path.basename(target.accounts_path)}</code>.\n\n"
+            f"<i>Данные не удаляются: аккаунты первого проекта останутся в "
+            f"своём файле и вернутся, когда проект включат обратно.</i>"
+        )
+        if message_id is None:
+            self.bot.send_message(chat_id, text, reply_markup=markup)
+        else:
+            try:
+                self.bot.edit_message_text(
+                    text, chat_id=chat_id, message_id=message_id, reply_markup=markup)
+            except Exception:
+                self.bot.send_message(chat_id, text, reply_markup=markup)
+        if callback_id:
+            try:
+                self.bot.answer_callback_query(callback_id)
+            except Exception:
+                pass
+
+    def switch_project(self, key: str, chat_id=None) -> str:
+        """Переключить проект и вернуть текст отчёта. Из Telegram и панели."""
+        try:
+            report = self.manager.switch_project(key)
+        except Exception as exc:
+            return f"❌ Не переключил: {exc}"
+        target = report.get("project") or {}
+        previous = report.get("previous") or {}
+        if not report.get("changed"):
+            return f"🌍 Уже активен проект <b>{target.get('title')}</b>."
+        return (
+            f"🌍 Проект переключён: <b>{previous.get('title')}</b> → "
+            f"<b>{target.get('title')}</b>\n"
+            f"⏹ Остановлено: <b>{report.get('stopped', 0)}</b>\n"
+            f"📂 Загружено: <b>{report.get('loaded', 0)}</b> "
+            f"(<code>{os.path.basename(getattr(self.manager, 'accounts_file', '') or '')}</code>)"
+        )
 
     def _start_live_refresh(self):
         """Фоновая нить автообновления окон."""
@@ -1097,6 +1271,37 @@ class TelegramBotController:
             sent = self.bot.send_message(message.chat.id, text, reply_markup=markup)
             # Главное окно тоже живое: статусы обновляются без /start.
             self._remember_view(message.chat.id, getattr(sent, "message_id", None), "list", page=1)
+
+        @self.bot.message_handler(commands=["project", "projects", "проект"])
+        def cmd_project(message):
+            """Переключение проекта одной командой: /project arz."""
+            if not self._is_authorized(message.from_user.id):
+                self.bot.reply_to(message, "⛔️ Доступ запрещен.")
+                return
+            self.active_chats.add(message.chat.id)
+            parts = (message.text or "").split(maxsplit=1)
+            argument = parts[1].strip() if len(parts) > 1 else ""
+            if not argument:
+                self._render_projects(message.chat.id)
+                return
+            import projects as projects_mod
+
+            key = projects_mod.resolve_key(argument)
+            if not key:
+                titles = ", ".join(
+                    f"{item['key']} ({item['title']})"
+                    for item in projects_mod.describe())
+                self.bot.reply_to(
+                    message,
+                    f"❌ Не знаю проект <code>{argument}</code>.\n"
+                    f"Есть: {titles}\n\n"
+                    f"Пример: <code>/project arz</code>")
+                return
+            self.bot.reply_to(message, self.switch_project(key))
+            text, markup = self._list_text(1)
+            sent = self.bot.send_message(message.chat.id, text, reply_markup=markup)
+            self._remember_view(
+                message.chat.id, getattr(sent, "message_id", None), "list", page=1)
 
         @self.bot.callback_query_handler(func=lambda call: True)
         def handle_callbacks(call):
@@ -1372,6 +1577,19 @@ class TelegramBotController:
 
             elif data == "settings":
                 self._render_settings(chat_id, message_id, call.id)
+
+            elif data == "project_menu":
+                self._render_projects(chat_id, message_id, call.id)
+
+            elif data.startswith("project_ask:"):
+                self._render_project_confirm(
+                    data.split(":", 1)[1], chat_id, message_id, call.id)
+
+            elif data.startswith("project_do:"):
+                key = data.split(":", 1)[1]
+                text = self.switch_project(key)
+                self.bot.send_message(chat_id, text)
+                self._render_projects(chat_id, message_id, call.id)
 
             elif data == "set_replace_proxy":
                 self._render_replace_proxy(chat_id, message_id, call.id)

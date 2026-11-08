@@ -40,6 +40,22 @@ STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "_vpn
 BINARY_CANDIDATES = ("sing-box", "/usr/local/bin/sing-box", "/usr/bin/sing-box",
                      "/opt/sing-box/sing-box")
 
+# Резолверы для самого sing-box.
+#
+# Ему не виден системный DNS Android: Go читает /etc/resolv.conf, которого в
+# Termux нет, и падает на дефолт [::1]:53 — «connection refused». Из-за этого
+# sing-box не разрешал даже имя VPN-узла, то есть ни один узел не мог отнести
+# ни байта, при этом SOCKS5 отвечал «ok» на CONNECT ещё до похода в сеть, и
+# узел выглядел живым. Отсюда и брался статус «no_udp» на живых узлах.
+DNS_SERVERS = ("1.1.1.1", "8.8.8.8")
+
+# Явный резолвер по умолчанию. В sing-box 1.14 outbound с именем вместо IP
+# без него не декодируется вовсе: «missing domain resolver ... set
+# ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true». Имя в конфиг всё равно
+# попадает, если системный резолвер не ответил, — тогда узел обязан
+# подняться своим DNS, а не упасть конфигом.
+DNS_TAG = "dns0"
+
 
 class BridgeError(Exception):
     """Мост не смог подняться."""
@@ -471,24 +487,76 @@ def _parse_ss(link: str) -> dict | None:
     }
 
 
+def resolve_server(outbound: dict) -> dict:
+    """Подставить IP узла вместо его имени.
+
+    sing-box не умеет резолвить на этом устройстве (см. DNS_SERVERS), а
+    системный резолвер Android у нас под рукой — Python. Поэтому имя узла
+    разрешаем сами и отдаём sing-box готовый адрес. Имя остаётся там, где
+    оно несёт смысл: в `tls.server_name` для REALITY/SNI.
+
+    Не разрешилось — оставляем имя как было: тогда у sing-box есть шанс
+    через свой DNS, но молча ломать узел нельзя.
+    """
+    server = str(outbound.get("server") or "")
+    if not server or _is_ipv4(server):
+        return outbound
+    try:
+        ip = socket.gethostbyname(server)
+    except OSError:
+        return outbound
+    if not _is_ipv4(ip):
+        return outbound
+    resolved = dict(outbound)
+    resolved["server"] = ip
+    return resolved
+
+
+def _is_ipv4(value: str) -> bool:
+    try:
+        socket.inet_aton(value)
+    except OSError:
+        return False
+    return value.count(".") == 3
+
+
 def build_config(node_key: str, outbound: dict, port: int) -> dict:
-    """Конфиг sing-box: SOCKS5 на 127.0.0.1:port -> один outbound."""
+    """Конфиг sing-box: SOCKS5 на 127.0.0.1:port -> один outbound.
+
+    Поле sniff во входящем — legacy: объявлено устаревшим в sing-box 1.11
+    и УДАЛЕНО в 1.13. С установленным 1.14.3 конфиг с ним не декодируется
+    вовсе («legacy inbound fields ... removed in sing-box 1.13.0»), процесс
+    падает на старте, и НИ ОДИН узел не поднимается — весь прокси-слой
+    лежит. Переезд официальный: sniff переехал в действие правила route.
+
+    Блок dns обязателен по той же причине, по которой его не было раньше:
+    без него у sing-box нет рабочего резолвера вообще.
+    """
     return {
         "log": {"level": "warn", "timestamp": True},
+        "dns": {
+            "servers": [
+                {"type": "udp", "server": ip, "tag": f"dns{index}"}
+                for index, ip in enumerate(DNS_SERVERS)
+            ],
+        },
         "inbounds": [
             {
                 "type": "socks",
                 "tag": "in",
                 "listen": "127.0.0.1",
                 "listen_port": int(port),
-                "sniff": True,
             }
         ],
         "outbounds": [
             dict(outbound, tag="out"),
             {"type": "direct", "tag": "direct"},
         ],
-        "route": {"rules": [], "final": "out"},
+        "route": {
+            "rules": [{"action": "sniff"}],
+            "final": "out",
+            "default_domain_resolver": {"server": DNS_TAG},
+        },
     }
 
 
@@ -511,6 +579,19 @@ class VpnBridge:
         self.log = log
         self._procs: dict[str, subprocess.Popen] = {}
         self._ports: dict[str, int] = {}
+        # Кто сейчас играет через мост: key -> число держателей.
+        #
+        # Без этого учёта периодическая перепроверка пула гасила мост под
+        # живой сессией: узел не прошёл пробу — процесс убит (код -15),
+        # у бота рвётся соединение, и выглядит это как «аккаунт вылетел
+        # без причины». Живой бот важнее красивой сводки.
+        self._busy: dict[str, int] = {}
+        # То же, но по номеру порта. Мост мог поднять прошлый процесс, и
+        # тогда ключ узла нам неизвестен — а порт известен всегда, он и
+        # записан в аккаунте бота.
+        self._busy_ports: dict[int, int] = {}
+        # Мосты, которые надо погасить, как только освободятся.
+        self._pending_stop: set[str] = set()
         self._lock = threading.RLock()
         self._reap_orphans()
 
@@ -594,6 +675,8 @@ class VpnBridge:
         if not outbound:
             self._note(f"[МОСТ] не разобрал ссылку узла {key}")
             return None
+        # Имя узла -> IP: у sing-box здесь нет рабочего резолвера.
+        outbound = resolve_server(outbound)
 
         with self._lock:
             proc = self._procs.get(key)
@@ -655,7 +738,10 @@ class VpnBridge:
         # Порт освобождаем вместе с процессом: иначе упавший мост навсегда
         # держит за собой номер, и следующий узел с той же коллизией уедет
         # на соседний.
-        self._ports.pop(key, None)
+        port = self._ports.pop(key, None)
+        if port:
+            # Метка занятости по порту больше не к чему относиться.
+            self._busy_ports.pop(int(port), None)
         if proc is None:
             return
         try:
@@ -668,13 +754,102 @@ class VpnBridge:
         except Exception:
             pass
 
-    def stop(self, key: str) -> None:
+    # --- занятость моста ---
+
+    def acquire(self, key: str, port: int | None = None) -> None:
+        """Отметить мост занятым: через него играет живая сессия.
+
+        Счётчик, а не флаг: на одном узле может сидеть несколько ботов, и
+        первый ушедший не должен освобождать мост для остальных.
+
+        Держим и ключ, и порт. Ключ защищает мост, даже если он поднят
+        заново на другом порту; порт — если ключ неизвестен (мост поднял
+        прошлый процесс, и в аккаунте записан только адрес).
+        """
         with self._lock:
+            if key:
+                self._busy[key] = self._busy.get(key, 0) + 1
+            if port:
+                self._busy_ports[int(port)] = self._busy_ports.get(int(port), 0) + 1
+
+    def release(self, key: str, port: int | None = None) -> None:
+        """Снять метку занятости. Отложенная остановка сработает здесь."""
+        with self._lock:
+            if key and self._busy.get(key, 0) > 0:
+                count = self._busy[key] - 1
+                if count:
+                    self._busy[key] = count
+                else:
+                    self._busy.pop(key, None)
+            if port:
+                number = int(port)
+                count = self._busy_ports.get(number, 0) - 1
+                if count > 0:
+                    self._busy_ports[number] = count
+                else:
+                    self._busy_ports.pop(number, None)
+            self._run_pending_locked()
+
+    def _held_locked(self, key: str) -> bool:
+        """Занят ли мост. Вызывать под локом."""
+        if self._busy.get(key, 0) > 0:
+            return True
+        port = self._ports.get(key)
+        return bool(port) and self._busy_ports.get(int(port), 0) > 0
+
+    def _run_pending_locked(self) -> None:
+        """Погасить то, что ждало освобождения. Вызывать под локом."""
+        for key in list(self._pending_stop):
+            if self._held_locked(key):
+                continue
+            self._pending_stop.discard(key)
             self._kill(key)
 
-    def stop_all(self) -> None:
+    def is_busy(self, key: str) -> bool:
+        with self._lock:
+            return self._held_locked(key)
+
+    def busy_keys(self) -> list[str]:
+        with self._lock:
+            return [key for key in self._procs if self._held_locked(key)]
+
+    def busy_ports(self) -> list[int]:
+        with self._lock:
+            return sorted(number for number, count in self._busy_ports.items()
+                          if count > 0)
+
+    def pending_stops(self) -> list[str]:
+        with self._lock:
+            return sorted(self._pending_stop)
+
+    def stop(self, key: str, *, force: bool = False) -> None:
+        """Погасить мост.
+
+        Занятый мост НЕ гасится: остановка откладывается до release().
+        Иначе перепроверка пула или сторож рубят туннель под работающим
+        ботом. force — для выключения и для тех мест, где мост снимается
+        вместе с самим узлом: тогда терять нечего.
+        """
+        with self._lock:
+            if not force and self._held_locked(key):
+                if key not in self._pending_stop:
+                    self._pending_stop.add(key)
+                    self._note(
+                        f"[МОСТ] {key[:48]} занят живой сессией — погашу, "
+                        "когда бот отключится"
+                    )
+                return
+            self._pending_stop.discard(key)
+            self._kill(key)
+
+    def stop_all(self, *, force: bool = True) -> None:
+        """Погасить всё. По умолчанию force: это выключение, а не уборка."""
         with self._lock:
             for key in list(self._procs):
+                if not force and self._held_locked(key):
+                    self._pending_stop.add(key)
+                    continue
+                self._pending_stop.discard(key)
                 self._kill(key)
 
     def running(self) -> list[str]:
