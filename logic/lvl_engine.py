@@ -243,6 +243,9 @@ def run_cycle(
         world = enter_real_world(
             bot, timeout=world_timeout, fallback_warp=False, log=say,
         )
+        if world.get("status") == "disconnected":
+            say("[LVL] соединение разорвалось во время проверки мира; ждём переподключения")
+            return {"status": "disconnected", "station": None, "players": 0}
         station = current_station(bot) or world.get("station")
         bot.lvl_spawn_name = station
         players = world.get("players") or []

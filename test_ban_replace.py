@@ -1,161 +1,35 @@
-"""Автозамена забаненных аккаунтов.
-
-Раньше замена срабатывала только если в тексте бана встречалось слово из
-узкого списка: «бот», «чит», «кликер», «постороннее ПО». Сервер в
-большинстве случаев пишет другое — «автобан сервера (без админа и
-причины)» или «Ваш игровой аккаунт заблокирован, вход невозможен», — и
-замена не создавалась. Из 105 банов в логе замену получили 16.
-"""
-
+"""Бан не создаёт новые аккаунты и не удаляет исходную запись."""
 import threading
-import time
 import unittest
 from unittest import mock
-
 import bot as botmod
 
-
 class FakeBot:
-    def __init__(self, bot_id=1, nickname="Sotka_NaCapte", server="NOVGOROD"):
-        self.bot_id = bot_id
-        self.nickname = nickname
-        self.server_name = server
-        self.password = "pass123"
-        self.default_task_name = "lvl"
-        self.proxy = ""
-        self.status = "В игре (заспавнен)"
-        self.is_banned = False
-        self.banned_at = 0.0
-        self.ban_admin = ""
-        self.ban_reason = ""
-        self.ban_kind = ""
-        self.ban_duration = ""
-        self.stopping = False
-        self.logs = []
+    def __init__(self):
+        self.bot_id=1;self.nickname='Test_Account';self.server_name='NOVGOROD'
+        self.password='example';self.default_task_name='lvl';self.proxy=''
+        self.status='В игре';self.is_banned=False;self.banned_at=0.0
+        self.logs=[];self.stopping=False
+    def add_log(self,text):self.logs.append(text)
+    def stop(self,banned=False):self.status='ЗАБАНЕН' if banned else 'Остановлен'
+    def cancel_reconnect(self):pass
 
-    def add_log(self, text):
-        self.logs.append(text)
-
-    def stop(self, banned=False):
-        self.status = "ЗАБАНЕН" if banned else "Остановлен"
-
-    def cancel_reconnect(self):
-        pass
-
-
-class ReplacementTests(unittest.TestCase):
+class BanKeepsAccountTests(unittest.TestCase):
     def setUp(self):
-        self.manager = botmod.BotManager.__new__(botmod.BotManager)
-        self.manager._lock = threading.Lock()
-        self.manager.bots = {}
-        self.manager.settings = None
-        self.manager.tg_controller = None
-        self.manager.accounts_file = "/dev/null"
-        self.manager.save_accounts = lambda: None
-        self.manager._replace_lock = threading.Lock()
-        self.manager._replace_recent = []
-
-        self.created = []
-        self.manager.add_bot = lambda **kw: (
-            self.created.append(kw) or mock.Mock(bot_id=99, nickname="New_Nick",
-                                                 default_task_name="lvl",
-                                                 start=lambda: None))
-
-        # Троттлинг в тестах не должен спать по-настоящему.
-        self._patches = [
-            mock.patch.object(botmod, "REPLACE_INTERVAL", 0.0),
-            mock.patch.object(botmod, "REPLACE_FIRST_DELAY", (0.0, 0.0)),
-            mock.patch.object(botmod, "REPLACE_PER_HOUR", 20),
-        ]
-        for p in self._patches:
-            p.start()
-
-    def tearDown(self):
-        for p in self._patches:
-            p.stop()
-
-    def ban(self, reason, raw=""):
-        b = FakeBot()
-        self.manager.mark_bot_banned(b, reason=reason, raw=raw)
-        # Замена идёт в отдельном потоке — ждём её.
-        for _ in range(200):
-            if self.created:
-                break
-            time.sleep(0.01)
-        return b
-
-    # --- причина больше не важна ---
-
-    def test_auto_ban_triggers_replacement(self):
-        """«автобан сервера (без админа и причины)» — раньше не заменялся."""
-        self.ban("автобан сервера (без админа и причины)")
-        self.assertEqual(len(self.created), 1)
-
-    def test_blocked_account_message_triggers_replacement(self):
-        """«Ваш игровой аккаунт заблокирован, вход невозможен»."""
-        self.ban("Ваш игровой аккаунт заблокирован, вход невозможен.")
-        self.assertEqual(len(self.created), 1)
-
-    def test_anticheat_ban_triggers_replacement(self):
-        self.ban("Античит, код 25")
-        self.assertEqual(len(self.created), 1)
-
-    def test_admin_bot_ban_triggers_replacement(self):
-        self.ban("Чат: Администратор Maks_Almazov навсегда заблокировал "
-                 "игрока Sharay_Makuh. Причина: BOT")
-        self.assertEqual(len(self.created), 1)
-
-    def test_automation_ban_triggers_replacement(self):
-        self.ban("за автоматизация) · навсегда")
-        self.assertEqual(len(self.created), 1)
-
-    # --- исключение: IP-бан ---
-
-    def test_connection_ban_does_not_replace(self):
-        """IP-бан: новый аккаунт с того же адреса забанят так же."""
-        self.ban("Пакет CONNECTION_BANNED (0x19)")
-        self.assertEqual(self.created, [])
-
-    # --- защита от повторов и лавины ---
-
-    def test_second_call_does_not_replace_twice(self):
-        b = FakeBot()
-        self.manager.mark_bot_banned(b, reason="автобан сервера")
-        for _ in range(200):
-            if self.created:
-                break
-            time.sleep(0.01)
-        self.assertEqual(len(self.created), 1)
-        # Тот же бот, тот же бан — второй раз не заменяем.
-        self.manager.mark_bot_banned(b, reason="автобан сервера")
-        time.sleep(0.15)
-        self.assertEqual(len(self.created), 1)
-
-    def test_hourly_limit_caps_replacements(self):
-        with mock.patch.object(botmod, "REPLACE_PER_HOUR", 3):
-            self.manager._replace_recent = []
-            for i in range(6):
-                b = FakeBot(bot_id=100 + i)
-                self.manager.mark_bot_banned(b, reason="автобан сервера")
-            for _ in range(500):
-                if len(self.created) >= 3:
-                    break
-                time.sleep(0.01)
-            time.sleep(0.3)
-        self.assertEqual(len(self.created), 3)
-
-    def test_replacement_uses_same_server(self):
-        self.ban("автобан сервера")
-        self.assertEqual(self.created[0]["target_server"], "NOVGOROD")
-
-    def test_replacement_keeps_password(self):
-        self.ban("автобан сервера")
-        self.assertEqual(self.created[0]["password"], "pass123")
-
-    def test_replacement_asks_for_generated_nick(self):
-        self.ban("автобан сервера")
-        self.assertIsNone(self.created[0]["nickname"])
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+        self.manager=botmod.BotManager.__new__(botmod.BotManager)
+        self.bot=FakeBot();self.manager.bots={1:self.bot};self.manager._lock=threading.Lock()
+        self.manager.tg_controller=None;self.manager.save_accounts=mock.Mock();self.manager.add_bot=mock.Mock()
+        self.manager.handle_ip_ban=mock.Mock()
+    def test_account_ban_keeps_original_and_never_creates_new_one(self):
+        self.manager.mark_bot_banned(self.bot,reason='Ваш игровой аккаунт заблокирован')
+        self.assertTrue(self.bot.is_banned);self.assertIs(self.manager.bots[1],self.bot)
+        self.assertEqual(self.bot.nickname,'Test_Account');self.manager.add_bot.assert_not_called()
+        self.manager.save_accounts.assert_called_once()
+    def test_duplicate_notice_does_not_duplicate_save_or_create(self):
+        self.manager.mark_bot_banned(self.bot,reason='Ваш игровой аккаунт заблокирован')
+        self.manager.mark_bot_banned(self.bot,reason='Ваш игровой аккаунт заблокирован')
+        self.manager.save_accounts.assert_called_once();self.manager.add_bot.assert_not_called()
+    def test_address_ban_does_not_mark_account(self):
+        self.manager.mark_bot_banned(self.bot,reason='CONNECTION_BANNED (0x19)')
+        self.assertFalse(self.bot.is_banned);self.manager.handle_ip_ban.assert_called_once()
+        self.manager.add_bot.assert_not_called();self.manager.save_accounts.assert_not_called()

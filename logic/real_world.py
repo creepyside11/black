@@ -139,9 +139,11 @@ def finish_spawn(bot) -> str:
     return "sent"
 
 
-def wait_players(bot, timeout: float, *, log=None, quiet: bool = False) -> list[dict]:
+def wait_players(bot, timeout: float, *, log=None, quiet: bool = False, expected_session=None) -> list[dict]:
     deadline = time.monotonic() + max(0.0, timeout)
     while time.monotonic() < deadline:
+        if expected_session is not None and bot.session is not expected_session:
+            return []
         if not getattr(bot.session, "connected", False):
             return []
         players = streamed_players(bot)
@@ -183,7 +185,7 @@ def warp_to_station(bot, *, log=None) -> dict:
     return {"ok": result.get("status") == "arrived", "station": name, **result}
 
 
-def _wait_spawn_allowed(bot, deadline: float, *, log=None) -> str:
+def _wait_spawn_allowed(bot, deadline: float, *, log=None, expected_session=None) -> str:
     """Дождаться, пока сервер разрешит спавн, и отправить его один раз.
 
     Возвращает то же, что finish_spawn: sent / already / not_allowed /
@@ -193,6 +195,8 @@ def _wait_spawn_allowed(bot, deadline: float, *, log=None) -> str:
     """
     last = "not_allowed"
     while True:
+        if expected_session is not None and bot.session is not expected_session:
+            return "offline"
         state = finish_spawn(bot)
         if state in ("sent", "already"):
             return state
@@ -209,15 +213,19 @@ def ensure(bot, *, timeout: float = PROOF_TIMEOUT, enter_timeout: float = ENTER_
     """Довести бота до общего мира. Возвращает отчёт, а не молчание."""
     started = time.monotonic()
     deadline = started + max(1.0, enter_timeout)
+    session = getattr(bot, "session", None)
+    def disconnected():
+        return session is None or getattr(bot, "session", None) is not session or not getattr(session, "connected", False)
 
     # 1. Ждём игру.
     while time.monotonic() < deadline:
-        if position(bot) is not None:
+        if getattr(bot, "session", None) is not session:
+            return {"status": "disconnected", "players": [], "position": None}
+        if not disconnected() and position(bot) is not None:
             break
-        if not getattr(bot.session, "connected", False):
-            time.sleep(POLL)
-            continue
         time.sleep(POLL)
+    if disconnected():
+        return {"status": "disconnected", "players": [], "position": None}
     pos = position(bot)
     if pos is None:
         return {"status": "not_in_game", "players": [], "position": None}
@@ -234,12 +242,16 @@ def ensure(bot, *, timeout: float = PROOF_TIMEOUT, enter_timeout: float = ENTER_
     # Spawn. Опрос безопасен: отправка внутри защищена _rpc_spawn_queued,
     # поэтому RPC уходит ровно один раз за вход.
     spawn_state = _wait_spawn_allowed(
-        bot, time.monotonic() + SPAWN_WAIT, log=log)
+        bot, time.monotonic() + SPAWN_WAIT, log=log, expected_session=session)
+    if disconnected():
+        return {"status": "disconnected", "players": [], "position": None, "spawn": spawn_state}
     if spawn_state == "sent":
         _log(log, "[МИР] финальный Spawn отправлен после меню")
 
     # 3. Ждём других игроков.
-    players = wait_players(bot, timeout, log=log)
+    players = wait_players(bot, timeout, log=log, expected_session=session)
+    if disconnected():
+        return {"status": "disconnected", "players": [], "position": None, "spawn": spawn_state}
     if players:
         _log(log, f"[МИР] подтверждён: рядом {len(players)} игрок(ов)")
         return {
@@ -254,7 +266,9 @@ def ensure(bot, *, timeout: float = PROOF_TIMEOUT, enter_timeout: float = ENTER_
     if fallback_warp:
         moved = warp_to_station(bot, log=log)
         if moved.get("ok"):
-            players = wait_players(bot, timeout, log=log)
+            players = wait_players(bot, timeout, log=log, expected_session=session)
+            if disconnected():
+                return {"status": "disconnected", "players": [], "position": None, "spawn": spawn_state}
             if players:
                 _log(log, f"[МИР] подтверждён после перехода: рядом {len(players)}")
                 return {

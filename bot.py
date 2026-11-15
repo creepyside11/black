@@ -1979,87 +1979,9 @@ class BotManager:
             else:
                 self.tg_controller.broadcast(alert_text)
 
-        # 2. Автозамена: новый аккаунт взамен забаненного.
-        #
-        # Раньше замена срабатывала только если в тексте бана встречалось
-        # слово из узкого списка: «бот», «чит», «кликер», «постороннее ПО».
-        # Сервер в большинстве случаев пишет другое — «автобан сервера
-        # (без админа и причины)» или «Ваш игровой аккаунт заблокирован,
-        # вход невозможен» — и ни одно слово не совпадало, замена не
-        # создавалась. Из 105 банов в логе замену получили 16.
-        #
-        # Замену не делаем только в одном случае: IP-бан (kick 999,
-        # CONNECTION_BANNED). Он на адрес, а не на аккаунт — новый ник с
-        # того же IP забанят так же, и регистрация сгорит впустую.
-        ip_banned = _is_address_ban(reason, raw)
-        if ip_banned:
-            # Сюда больше не попадаем: адресный бан разобран выше и до
-            # выставления is_banned. Ветка оставлена как страховка, чтобы
-            # ни один путь не пометил АККАУНТ за чужой IP.
-            self.handle_ip_ban(bot, reason=reason or "connection banned")
-            return
-        if not ip_banned and not getattr(bot, "_replaced", False):
-            bot._replaced = True
-
-            def _create_replacement():
-                # Пароль берём базовый из настроек: он одинаков для всех
-                # новых аккаунтов, и в реестре не плодятся разные пароли.
-                # Если настройки пусты — пароль забаненного.
-                settings = getattr(self, "settings", None)
-                pwd = settings.password_or(bot.password) if settings else bot.password
-                task = bot.default_task_name
-                if not task and settings is not None:
-                    task = settings.default_task
-
-                # Сериализуем замены: одновременно создаётся ровно одна,
-                # с паузой между попытками и лимитом в час. Без этого
-                # волна банов порождала полсотни регистраций разом, и
-                # сервер отвечал блокировкой за частые входы.
-                with self._replace_lock:
-                    now_ts = time.time()
-                    self._replace_recent = [
-                        t for t in self._replace_recent if now_ts - t < 3600.0
-                    ]
-                    if len(self._replace_recent) >= REPLACE_PER_HOUR:
-                        print(
-                            f"[-] Автозамена: лимит {REPLACE_PER_HOUR} в час "
-                            f"исчерпан, #{bot.bot_id} [{bot.nickname}] без замены"
-                        )
-                        bot.add_log(
-                            f"[!] Замена не создана: лимит {REPLACE_PER_HOUR} "
-                            f"аккаунтов в час исчерпан."
-                        )
-                        return
-
-                    if self._replace_recent:
-                        wait = self._replace_recent[-1] + REPLACE_INTERVAL - time.time()
-                        if wait > 0:
-                            time.sleep(min(wait, REPLACE_INTERVAL))
-                    else:
-                        # Первая замена после паузы — не мгновенно, чтобы не
-                        # совпасть с самим баном.
-                        time.sleep(random.uniform(*REPLACE_FIRST_DELAY))
-
-                    print(f"[*] Создаем новый аккаунт взамен забаненного бота на сервере {bot.server_name}...")
-                    self._replace_recent.append(time.time())
-                    new_bot = self.add_bot(
-                        target_server=bot.server_name,
-                        nickname=None,  # None -> сгенерировать реалистичный ник
-                        password=pwd,
-                        auto_regen_nick=True,
-                        proxy=bot.proxy,
-                        default_task=task,
-                    )
-                if new_bot:
-                    notice = (
-                        f"♻️ <b>Автозамена забаненного бота!</b>\n"
-                        f"На сервере <b>{bot.server_name}</b> создан новый бот: #{new_bot.bot_id} <b>{new_bot.nickname}</b>.\n"
-                        f"Задача: <code>{new_bot.default_task_name}</code>. Запускаем..."
-                    )
-                    if hasattr(self, "tg_controller") and self.tg_controller:
-                        self.tg_controller.broadcast(notice)
-                    new_bot.start()
-            threading.Thread(target=_create_replacement, daemon=True).start()
+        # Оставляем исходный аккаунт в реестре: новый автоматически не
+        # создаём. Уведомление о бане выше содержит доступные данные.
+        bot.add_log("[АККАУНТ] Автозамена отключена; запись сохранена.")
 
     def start_monitor_loop(self):
         """Запуск непрерывного 24/7 фонового мониторинга ботнета"""
@@ -2545,9 +2467,6 @@ class BotManager:
                         b, reason=f"Пакет CONNECTION_BANNED (0x19){detail}"
                     )
                     return
-                if reason_code == 2 and getattr(b, "auto_regen_nick", False):
-                    self.replace_bot_nickname(b)
-                    return
                 # 2 = аккаунт уже в сети. Сервер ещё держит призрачную сессию —
                 # ломиться сразу бессмысленно, он будет кикать по кругу.
                 if reason_code == 2:
@@ -2570,8 +2489,10 @@ class BotManager:
             b = self._find_bot_by_session_or_api(bot_obj)
             if b:
                 b.add_log(f"[АВТОРИЗАЦИЯ] Статус: {state}")
-                if state == "logging_in" and getattr(b, "auto_regen_nick", False):
-                    self.replace_bot_nickname(b)
+                if state in ("registering", "logging_in", "submitted", "authenticated"):
+                    # После начала регистрации или входа этот ник нельзя
+                    # удалять и заменять при повторном подключении.
+                    b.auto_regen_nick = False
                 if state == "authenticated":
                     # Только после логина имеет смысл выбирать вокзал
                     b.begin_spawn_watchdog()

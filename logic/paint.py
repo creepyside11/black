@@ -25,6 +25,7 @@ HEX_KEYS = ("h", "hex", "col", "color", "c")
 
 # Имена чёрного во всех видах, какие сервер может прислать.
 BLACK_WORDS = ("чёрн", "черн", "black", "угол", "смоль")
+COLOR_NAME = re.compile(r"\b(?:ч[её]рн\w*|бел(?:ый|ая|ое|ые|ого)|красн\w*|зел[её]н\w*|син(?:ий|яя|ее|ие)|ж[её]лт\w*|сер(?:ый|ая|ое|ые)|серебр\w*|фиолет\w*|оранж\w*|black|white|red|green|blue|yellow|gray|grey|silver)\b", re.IGNORECASE)
 
 # Ключевые слова пункта «покрасить» в меню.
 PAINT_WORDS = ("покрас", "цвет", "перекрас", "paint", "color")
@@ -141,6 +142,20 @@ class ColorPalette:
             options.append(ColorOption(option_id, name, hex_color, raw=row))
 
         if not options:
+            return None
+        # Другие интерфейсы тоже содержат списки {id, n}; числовые ID не
+        # являются цветами. Требуем явный цветовой признак в самих строках.
+        def has_color_evidence(option):
+            name = option.name.lower()
+            if COLOR_NAME.search(name):
+                return True
+            row = option.raw
+            for key in ("h", "hex", "col", "color"):
+                if key in row and normalize_hex(row[key]) is not None:
+                    return True
+            color = row.get("c")
+            return isinstance(color, str) and normalize_hex(color) is not None
+        if not any(has_color_evidence(option) for option in options):
             return None
         return cls(options, raw=dict(payload))
 

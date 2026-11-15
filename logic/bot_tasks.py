@@ -238,7 +238,8 @@ class LevelRunnerTask(BaseTask):
                     time.sleep(5)
                     continue
                 if not self._iterate():
-                    time.sleep(self.RETRY_DELAY)
+                    delay = 1.0 if self._report.get("status") == "disconnected" else self.RETRY_DELAY
+                    time.sleep(delay)
             except Exception as exc:
                 self._log(f"[LVL] цикл упал: {exc!r}")
                 time.sleep(10)
@@ -279,12 +280,16 @@ class LevelRunnerTask(BaseTask):
             return
         point = tuple(float(v) for v in point)
         station = report.get("station")
+        session = self.bot.session
         while self.running:
-            if not getattr(self.bot.session, "connected", False):
-                time.sleep(5)
-                continue
+            if self.bot.session is not session or not getattr(session, "connected", False):
+                self._log("[LVL] соединение изменилось; после входа проверю мир заново")
+                return
             time.sleep(self.HOLD_POLL)
             if not self.running:
+                return
+            if self.bot.session is not session or not getattr(session, "connected", False):
+                self._log("[LVL] соединение изменилось; после входа проверю мир заново")
                 return
             try:
                 pos = self.bot.api.getbotposition() if self.bot.api else None

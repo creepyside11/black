@@ -231,13 +231,10 @@ class TelegramBotController:
                 f"<i>Список серверов, реестр аккаунтов и зона входа берутся "
                 f"у активного проекта.</i>\n\n"
                 f"🔑 Базовый пароль: <code>{pwd}</code>\n"
-                f"<i>Его получают все новые аккаунты: при массовой регистрации "
-                f"и при автозамене забаненных.</i>\n\n"
+                f"<i>Он используется для новых аккаунтов при массовой регистрации.</i>\n\n"
                 f"🎯 Задача по умолчанию: <code>{settings.default_task}</code>\n"
                 f"📦 Лимит партии: <b>{settings.batch_limit}</b>\n"
-                f"🌐 Прокси при автозамене: <b>{self._replace_proxy_label(settings)}</b>\n"
-                f"<i>Какой адрес получит новый аккаунт, когда старый уйдёт "
-                f"в бан и его заменит свежий.</i>"
+                f"<i>Автоматическая замена аккаунтов отключена.</i>"
             )
             markup.add(types.InlineKeyboardButton(
                 f"🌍 Проект: {self._project_title()}",
@@ -251,9 +248,6 @@ class TelegramBotController:
             markup.add(types.InlineKeyboardButton(
                 f"📦 Лимит партии: {settings.batch_limit}",
                 callback_data="set_batch_limit", style="primary"))
-            markup.add(types.InlineKeyboardButton(
-                f"🌐 Прокси при автозамене: {settings.replace_proxy}",
-                callback_data="set_replace_proxy", style="primary"))
         markup.add(types.InlineKeyboardButton(
             "⬅️ Назад в меню", callback_data="page:1", style="primary"))
 
@@ -309,8 +303,7 @@ class TelegramBotController:
 
         text = (
             "<b>🌐 Прокси при автозамене аккаунта</b>\n\n"
-            "Когда аккаунт уходит в бан и вместо него создаётся новый, "
-            "какой адрес ему дать.\n\n"
+            "Автозамена сейчас отключена; настройки ниже не запускают её.\n\n"
             "<b>inherit</b> — тот же, что был у старого. Новый аккаунт "
             "не светит свежий IP рядом со старым.\n"
             "<b>pool</b> — рабочий узел из пула.\n"
