@@ -864,6 +864,7 @@ class BotAPI(JsonAPI):
         blocking: bool = True,
         on_progress=None,
         human: bool = True,
+        abort_check=None,
     ):
         """Телепорт delta-методом: путь режется на шаги, каждый шаг — свой sync.
 
@@ -924,7 +925,8 @@ class BotAPI(JsonAPI):
                 face_movement=face_movement,
                 jitter=0.05 if jitter is None else jitter,
                 settle_packets=3 if settle_packets is None else settle_packets,
-                abort_check=lambda: not self.session.connected,
+                abort_check=lambda: (not self.session.connected or
+                                     (abort_check is not None and bool(abort_check()))),
                 on_progress=on_progress,
                 human=human,
             )

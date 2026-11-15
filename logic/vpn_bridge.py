@@ -27,6 +27,7 @@ import shutil
 import socket
 import subprocess
 import threading
+from collections import deque
 import time
 import urllib.parse
 
@@ -64,8 +65,10 @@ class BridgeError(Exception):
 def find_binary() -> str | None:
     """Путь к sing-box или None."""
     env = os.environ.get("SING_BOX_BIN")
-    if env and os.path.exists(env):
-        return env
+    if env:
+        path = shutil.which(env) if not os.path.isabs(env) else env
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
     for cand in BINARY_CANDIDATES:
         path = shutil.which(cand) if "/" not in cand else (cand if os.path.exists(cand) else None)
         if path:
@@ -593,6 +596,7 @@ class VpnBridge:
         # Мосты, которые надо погасить, как только освободятся.
         self._pending_stop: set[str] = set()
         self._lock = threading.RLock()
+        self._start_locks = {}
         self._reap_orphans()
 
     # --- служебное ---
@@ -634,7 +638,9 @@ class VpnBridge:
                 pass
 
     def available(self) -> bool:
-        return bool(self.binary and os.path.exists(self.binary))
+        if not self.binary:
+            self.binary = find_binary()
+        return bool(self.binary and os.path.isfile(self.binary) and os.access(self.binary, os.X_OK))
 
     def _config_path(self, key: str) -> str:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
@@ -668,12 +674,20 @@ class VpnBridge:
     # --- жизненный цикл ---
 
     def start(self, key: str, link: str) -> str | None:
+        """Поднять мост под узел. Параллельные старты одного узла объединяются."""
+        with self._lock:
+            start_lock = self._start_locks.setdefault(key, threading.Lock())
+        with start_lock:
+            return self._start_one(key, link)
+
+    def _start_one(self, key: str, link: str) -> str | None:
         """Поднять мост под узел. Возвращает socks-адрес или None."""
         if not self.available():
+            self._note("[МОСТ] sing-box не найден. В Termux установите: pkg install sing-box")
             return None
         outbound = parse_link(link)
         if not outbound:
-            self._note(f"[МОСТ] не разобрал ссылку узла {key}")
+            self._note("[МОСТ] не удалось разобрать ссылку узла")
             return None
         # Имя узла -> IP: у sing-box здесь нет рабочего резолвера.
         outbound = resolve_server(outbound)
@@ -684,6 +698,9 @@ class VpnBridge:
             if proc is not None and proc.poll() is None and known and socks_alive(known):
                 return f"socks5://127.0.0.1:{known}"
 
+            # Освобождаем старый процесс ДО выделения нового порта.
+            # _kill удаляет запись о порте и потому не должен вызываться после _alloc_port.
+            self._kill(key)
             try:
                 port = self._alloc_port(key)
             except RuntimeError as exc:
@@ -698,39 +715,60 @@ class VpnBridge:
                 with open(cfg_path, "w", encoding="utf-8") as f:
                     json.dump(cfg, f, ensure_ascii=False, indent=2)
             except OSError as exc:
-                self._note(f"[МОСТ] не записал конфиг {key}: {exc}")
+                self._ports.pop(key, None)
+                self._note(f"[МОСТ] не записал конфиг: {exc}")
                 return None
-
-            # Порт мог остаться занятым прошлым процессом — снимаем.
-            self._kill(key)
 
             try:
                 proc = subprocess.Popen(
                     [self.binary, "run", "-c", cfg_path],
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                 )
             except OSError as exc:
-                self._note(f"[МОСТ] sing-box не запустился для {key}: {exc}")
+                self._ports.pop(key, None)
+                self._note(f"[МОСТ] sing-box не запустился: {exc}")
                 return None
 
             self._procs[key] = proc
             self._ports[key] = port
+            stderr_tail = deque(maxlen=8)
+            def drain_stderr():
+                try:
+                    while True:
+                        chunk = proc.stderr.read1(1024)
+                        if not chunk: break
+                        stderr_tail.append(chunk)
+                except (OSError, ValueError):
+                    pass
+                finally:
+                    proc.stderr.close()
+            stderr_thread = threading.Thread(target=drain_stderr, daemon=True, name="singbox-stderr")
+            stderr_thread.start()
 
         # Ждём, пока SOCKS-порт начнёт принимать. Дольше 8 секунд ждать
         # смысла нет: либо поднялся, либо конфиг неверный.
         deadline = time.monotonic() + 8.0
         while time.monotonic() < deadline:
             if proc.poll() is not None:
-                self._note(f"[МОСТ] sing-box упал для {key} (код {proc.returncode})")
-                self._kill(key)
+                stderr_thread.join(timeout=.2)
+                detail = b"".join(stderr_tail).decode("utf-8", errors="replace").lower()
+                if "address already in use" in detail: hint = "порт уже занят"
+                elif "deprecated" in detail or "removed" in detail: hint = "конфигурация несовместима с версией sing-box"
+                elif "permission denied" in detail: hint = "нет разрешения на запуск или запись"
+                elif "dns" in detail or "resolve" in detail: hint = "ошибка DNS или адреса узла"
+                else: hint = "проверьте конфигурацию и версию sing-box"
+                self._note(f"[МОСТ] sing-box завершился (код {proc.returncode}): {hint}")
+                with self._lock:
+                    if self._procs.get(key) is proc: self._kill(key)
                 return None
             if socks_alive(port):
                 return url
             time.sleep(0.2)
 
-        self._note(f"[МОСТ] порт {port} не открылся для {key}")
-        self._kill(key)
+        self._note(f"[МОСТ] локальный порт {port} не открылся")
+        with self._lock:
+            if self._procs.get(key) is proc: self._kill(key)
         return None
 
     def _kill(self, key: str) -> None:

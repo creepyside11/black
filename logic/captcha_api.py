@@ -36,12 +36,8 @@ from logic.captcha import (
 
 DEFAULT_API_URL = "https://rakocr.vercel.app/api/v1/solve"
 
-# Ключ создан из настроек OpenRouter (dots-studio/dots-3-note-preview:free).
-# Переопределяется переменной окружения RAKOCR_KEY.
-DEFAULT_API_KEY = (
-    "rko_jc3j9r9DI35c8G95.u_Cw5a-7Y09cGkhB0i8oeQ."
-    "xiNY447eqzCiVbryr9-LubufUwwJ8BwNWENaGc1FrJGKgE5j6jBfV13Jti-nhhjn5RjAtbmTecgeLXpZ_H-MQi-wYpTrvbdU2lyDTSDD_1yckvHbIqIwhLNH47lYBLwsminpV5hrQdAEY5XU8QmUr4VOJfeGSxSug7oZJHDnAVlaJvPmzNpcrRO5qHdyaZlrDKxgFORZN5YDPyCPqijsNZ6JqvE_Qb2vRt3wdkcn7vLeVWY"
-)
+# Ключ должен быть задан явно; встроенных учётных данных нет.
+DEFAULT_API_KEY = ""
 
 # Модель отвечает за 5-10 секунд, но запас нужен: 60 секунд названы как
 # верхняя граница, плюс сеть.
@@ -116,6 +112,9 @@ def solve_bytes(image, *, api_key=None, api_url=None, timeout=SOLVE_TIMEOUT,
 
     key = api_key or os.environ.get("RAKOCR_KEY") or DEFAULT_API_KEY
     url = api_url or os.environ.get("RAKOCR_URL") or DEFAULT_API_URL
+    if not key:
+        log("[rakocr] ключ не указан")
+        return None
 
     payload = {
         "image_base64": base64.b64encode(image).decode("ascii"),

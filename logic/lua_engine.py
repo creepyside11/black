@@ -100,7 +100,7 @@ HEX_BYTES = 2048                # сколько байт пакета отда�
 TRANSCRIPT_LINES = 200          # сколько строк Lua-логов держим в памяти
 
 # Действия, меняющие мир. Без armed=True не исполняются, а логируются.
-MUTATING_ACTIONS = frozenset({"walk", "tp", "pickup", "send_rpc", "send_json"})
+MUTATING_ACTIONS = frozenset({"walk", "drive", "tp", "pickup", "send_rpc", "send_packet", "send_json", "chat", "keys", "vehicle", "spawn_select", "dialog", "solve_captcha", "stop_movement", "immortality", "route_save"})
 
 # Дальше цели при ходьбе считаем дошедшими.
 WALK_COMPLETION_DISTANCE = 0.5
@@ -503,7 +503,20 @@ class LuaScript:
         max_response_bytes=DEFAULT_MAX_RESPONSE_BYTES,
         seed=None,
         tick_interval=0.5,
+        bot=None,
+        mode="addon",
+        schedule=None,
+        should_stop=None,
+        captcha_handler=None,
+        route_handler=None,
     ):
+        self.captcha_handler = captcha_handler
+        self.route_handler = route_handler
+        self.route_status = {}
+        self.should_stop = should_stop or (lambda: False)
+        self.bot = bot
+        self.mode = mode
+        self.schedule = schedule
         self.path = os.path.abspath(str(path))
         self.api = api
         self.log = log or print
@@ -525,6 +538,8 @@ class LuaScript:
         self.stats = {"calls": 0, "actions": 0, "sent": 0, "skipped": 0,
                       "errors": 0, "dropped": 0}
         self._load_timeout = max(float(call_timeout), DEFAULT_LOAD_TIMEOUT) * 2
+        self.movement_id = None
+        self.initial_actions = []
 
     # --- состояние ---
 
@@ -571,11 +586,34 @@ class LuaScript:
                         for line in list(self.server_tail() or [])][-TAIL_LINES:]
             except Exception:
                 tail = []
-        return {"pos": point, "now": float(self.clock()), "tail": tail}
+        session = getattr(self.api, "session", None)
+        connected = bool(session and getattr(session, "connected", False))
+        vehicle_id = health = money = interior = None
+        if self.api is not None:
+            try:
+                player = self.api.session.players.bot
+                vehicle_id = int(player.get_current_vehicle_id())
+            except Exception:
+                pass
+            for name in ("health", "money", "interior"):
+                try:
+                    value = getattr(self.api, "getbot" + name)()
+                    if isinstance(value, (int, float)):
+                        if name == "health": health = value
+                        elif name == "money": money = value
+                        else: interior = value
+                except Exception:
+                    pass
+        from logic.lua_settings import load_settings
+        settings = load_settings(self.path)
+        return {"settings": settings, "route": self.route_status, "pos": point, "now": float(self.clock()), "tail": tail,
+                "connected": connected, "vehicle_id": vehicle_id,
+                "health": health, "money": money, "interior": interior,
+                "bot_id": getattr(self.bot, "bot_id", None), "mode": self.mode}
 
     # --- загрузка ---
 
-    def load(self):
+    def load(self, *, execute_actions=True):
         if self.failed:
             raise LuaScriptError(self.failed)
         if self.loaded:
@@ -601,8 +639,12 @@ class LuaScript:
         self.loaded = True
         self._say(f"загружен ({self.engine.lua_version or 'lua'}), "
                   f"режим {'БОЕВОЙ' if self.armed else 'ХОЛОСТОЙ'}, seed={seed}")
-        # on_load тоже может попросить действий — исполняем их тем же шлюзом.
-        self.execute_all(answer.get("actions") or [])
+        # A caller can defer these actions to its worker instead of blocking
+        # the console during br.sleep or a long-running movement in on_load.
+        self.initial_actions = answer.get("actions") or []
+        if execute_actions:
+            self.execute_all(self.initial_actions)
+            self.initial_actions = []
         return self
 
     def _absorb(self, answer):
@@ -654,6 +696,8 @@ class LuaScript:
     def execute_all(self, actions):
         results = []
         for action in actions:
+            if self.should_stop():
+                break
             results.append(self.execute(action))
         return results
 
@@ -675,13 +719,56 @@ class LuaScript:
             return {"kind": kind, "status": "skipped", "detail": detail}
 
         try:
+            if kind in MUTATING_ACTIONS and kind != "route_save":
+                session = getattr(self.api, "session", None)
+                if not session or not getattr(session, "connected", False):
+                    raise LuaScriptError("нет подключения к серверу")
             if kind == "walk":
-                self._api("MoveToCoord", float(action["x"]), float(action["y"]),
+                self.movement_id = self._api("MoveToCoord", float(action["x"]), float(action["y"]),
                           float(action["z"]), mode="walk",
                           completion_distance=WALK_COMPLETION_DISTANCE)
+            elif kind == "drive":
+                self.movement_id = self._api("MoveToCoord", float(action["x"]), float(action["y"]),
+                          float(action["z"]), mode="vehicle", completion_distance=1.0)
+            elif kind == "stop_movement":
+                self._api("StopMoveToCoord")
+            elif kind == "immortality":
+                from logic import immortal
+                if self.bot is None: raise LuaScriptError("нет бота")
+                if action.get("enabled"): immortal.enable(self.bot, log=self.log)
+                else: immortal.stop(self.bot, log=self.log)
+            elif kind == "chat":
+                self._api("sendchat", str(action.get("text") or ""))
+            elif kind == "keys":
+                self._api("SetKey", keys=int(action.get("keys") or 0),
+                          lr=int(action.get("lr") or 0), ud=int(action.get("ud") or 0))
+            elif kind == "vehicle":
+                self._api("setbotvehicle", int(action.get("id") or 0), seat_id=int(action.get("seat") or 0))
+            elif kind == "spawn_select":
+                if self.bot is None: raise LuaScriptError("нет бота для выбора спавна")
+                from logic.spawn import select_spawn
+                if not select_spawn(self.bot, int(action["index"]), delay=0):
+                    raise LuaScriptError("выбор спавна не отправлен")
+            elif kind == "dialog":
+                session = getattr(self.api, "session", None)
+                if not session: raise LuaScriptError("нет сессии для диалога")
+                if not session.send_dialog_response(int(action["id"]), int(action.get("response", 1)),
+                                                    int(action.get("item", 0)), str(action.get("text") or "")):
+                    raise LuaScriptError("ответ на диалог не отправлен")
+            elif kind == "solve_captcha":
+                if self.captcha_handler is None:
+                    raise LuaScriptError("решатель капчи не подключён")
+                if not self.captcha_handler(action.get("data")):
+                    raise LuaScriptError("капча отсутствует или уже обрабатывается")
+            elif kind in ("route_start", "route_pause", "route_resume", "route_stop", "route_save"):
+                if self.route_handler is None: raise LuaScriptError("маршруты не подключены")
+                self.route_handler(action)
+            elif kind == "after":
+                if self.schedule is None: raise LuaScriptError("таймеры не подключены")
+                self.schedule(float(action["sec"]), str(action["name"]), action.get("data") or {})
             elif kind == "tp":
                 self._api("DeltaTeleportTo", float(action["x"]), float(action["y"]),
-                          float(action["z"]))
+                          float(action["z"]), abort_check=lambda: bool(self.sleep(0)))
             elif kind == "pickup":
                 pickup_id = action.get("id")
                 if pickup_id is None:
@@ -690,16 +777,22 @@ class LuaScript:
                     self._api("pickup_interact", int(pickup_id))
             elif kind == "send_rpc":
                 payload = bytes.fromhex(str(action.get("payload_hex") or ""))
-                self._api("SendRPC", int(action["rpc_id"]), payload)
+                rpc_id = int(action["rpc_id"])
+                if not 0 <= rpc_id <= 511: raise ValueError("rpc_id вне диапазона 0..511")
+                self._api("SendRPC", rpc_id, payload)
+            elif kind == "send_packet":
+                payload = bytes.fromhex(str(action.get("payload_hex") or ""))
+                packet_id = int(action["packet_id"])
+                if not 0 <= packet_id <= 255: raise ValueError("packet_id вне диапазона 0..255")
+                self._api("SendPacket", packet_id, payload)
             elif kind == "send_json":
-                self._send_json(int(action["interface_id"]), action.get("payload"))
+                self._send_json(int(action["interface_id"]), action.get("payload"),
+                                str(action.get("packet_name") or "interface_sync"))
             elif kind == "sleep":
                 seconds = min(max(float(action.get("sec") or 0.0), 0.0), MAX_SLEEP_SECONDS)
                 self.sleep(seconds)
             else:
                 raise LuaScriptError(f"неизвестное действие: {kind!r}")
-        except LuaScriptError:
-            raise
         except Exception as exc:
             self.stats["errors"] += 1
             detail = f"{kind} {self._describe(action)} упал: {exc!r}"
@@ -715,30 +808,43 @@ class LuaScript:
         method = getattr(self.api, name, None)
         if method is None:
             raise LuaScriptError(f"действие {name}: у api нет метода {name}")
-        return method(*args, **kwargs)
+        result = method(*args, **kwargs)
+        if result is False:
+            raise LuaScriptError(f"{name}: действие не принято")
+        return result
 
-    def _send_json(self, interface_id, payload):
+    def _send_json(self, interface_id, payload, packet_name="interface_sync"):
+        from samp.sender import PACKET_DELIVERY
+        if packet_name not in PACKET_DELIVERY or not packet_name.startswith("interface_"):
+            raise LuaScriptError("неизвестный тип доставки интерфейса")
         session = getattr(self.api, "session", None)
         sender = getattr(session, "send_json", None)
         if sender is None:
             raise LuaScriptError("действие send_json: у сессии нет send_json")
-        return sender(interface_id, payload, packet_name="lua_bridge")
+        result = sender(interface_id, payload, packet_name=packet_name)
+        if result is False:
+            raise LuaScriptError("send_json: сессия не подключена или отправка не удалась")
+        return result
 
     @staticmethod
     def _describe(action):
         kind = str(action.get("kind") or "")
-        if kind in ("walk", "tp"):
-            return (f"({float(action.get('x', 0)):.1f}, "
-                    f"{float(action.get('y', 0)):.1f}, "
-                    f"{float(action.get('z', 0)):.1f})")
+        if kind in ("walk", "drive", "tp"):
+            def display(value):
+                try: return f"{float(value):.1f}"
+                except (ValueError, TypeError): return repr(value)[:30]
+            return "(" + ", ".join(display(action.get(k)) for k in ("x", "y", "z")) + ")"
         if kind == "pickup":
             return "с земли" if action.get("id") is None else f"pickup id={action.get('id')}"
         if kind == "send_rpc":
-            return f"rpc {action.get('rpc_id')} тело {action.get('payload_hex') or '—'}"
+            return f"rpc {action.get('rpc_id')} (данные скрыты)"
+        if kind == "chat":
+            return "текст скрыт"
         if kind == "send_json":
             return f"интерфейс {action.get('interface_id')}"
         if kind == "sleep":
-            return f"{float(action.get('sec') or 0):.2f} с"
+            try: return f"{float(action.get('sec') or 0):.2f} с"
+            except (ValueError, TypeError): return repr(action.get('sec'))[:30]
         return repr(action)[:120]
 
     # --- подписка на события бота ---
@@ -826,6 +932,12 @@ class LuaScript:
     # --- остановка ---
 
     def close(self, *, force=False):
+        if self.movement_id is not None and self.api is not None:
+            try:
+                self.api.StopMoveToCoord(self.movement_id, reason="lua_stopped")
+            except Exception:
+                pass
+            self.movement_id = None
         try:
             self.engine.close(force=force)
         except Exception as exc:

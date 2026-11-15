@@ -550,22 +550,9 @@ class CaptchaAnswerer:
 
 
 def default_chain(log=None):
-    """Цепочка по умолчанию: сначала внешний сервис, потом локальный OCR.
-
-    Локальный OCR ошибается на неоднозначных символах (l/1/i, V/v), а
-    vision-модель читает те же картинки правильно. Оставляем его как
-    запасной путь на случай, когда сервис недоступен.
-    """
-    solvers = []
-    if os.environ.get("RAKOCR_DISABLE") != "1":
-        try:
-            from logic.captcha_api import RakOCRSolver
-
-            solvers.append(RakOCRSolver(log=log))
-        except Exception:
-            pass
-    solvers.append(ImageUrlSolver(log=log or (lambda msg: None)))
-    return SolverChain(solvers)
+    """Распознавание изображений через настроенную vision-модель."""
+    from logic.openai_captcha import OpenAICaptchaSolver
+    return SolverChain([PacketTextSolver(), OpenAICaptchaSolver(log=log)])
 
 
 _default_answerer = None

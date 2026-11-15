@@ -18,3 +18,7 @@ certifi
 # numpy>=1.24
 # opencv-python-headless
 # pytesseract
+
+# Vision для автокапчи
+openai>=1.30,<3
+python-dotenv>=1,<2

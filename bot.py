@@ -581,6 +581,9 @@ class BotInstance:
         # Подряд идущие неудачные попытки подключения
         self.connect_failures = 0
 
+        self.lua_spawn_control = False
+        self.lua_ui_control = False
+        self.lua_runtime = None
         self.session = None
         self.api = None
         self.network = None
@@ -858,7 +861,7 @@ class BotInstance:
         """Доводит спавн до конца: бот должен уйти из зоны авторизации."""
         from logic.spawn import SpawnWatchdog, is_spawned_position
 
-        if self.stopping or self.is_banned:
+        if self.stopping or self.is_banned or getattr(self, "lua_spawn_control", False) is True:
             return
         if self.spawn_watchdog is not None and self.spawn_watchdog.running:
             return
@@ -984,7 +987,7 @@ class BotInstance:
 
         json_ui = JsonUIConfig(
             console_output=False,
-            auto_close_cinematic=True,
+            auto_close_cinematic=not getattr(self, "lua_ui_control", False),
         )
 
         server_names_map = {}
@@ -1036,10 +1039,14 @@ class BotInstance:
 
         if self.proxy:
             try:
-                self.session.proxy.connect(self.proxy, timeout=5.0)
-                self.add_log(f"Настроен SOCKS5 прокси: {self.proxy}")
+                if self.session.proxy.connect(self.proxy, timeout=5.0) is False:
+                    self.add_log("Ошибка настройки прокси: подключение отменено")
+                    return False
+                self.add_log("SOCKS5 прокси настроен")
             except Exception as e:
-                self.add_log(f"Ошибка настройки прокси {self.proxy}: {e}")
+                self.add_log(f"Ошибка настройки прокси: {type(e).__name__}")
+                return False
+        return True
 
     def _try_auto_proxy(self) -> bool:
         """Прямой вход не проходит — подобрать прокси из пула.
@@ -1140,7 +1147,15 @@ class BotInstance:
         self.cancel_reconnect()
         self.stopping = False
         self.status = "Подключение..."
-        self.setup_session()
+        try:
+            prepared = self.setup_session()
+        except Exception as exc:
+            self.add_log(f"Не удалось подготовить подключение: {type(exc).__name__}")
+            prepared = False
+        if prepared is False:
+            self.status = "Ошибка настройки подключения"
+            self._release_proxy_bridge()
+            return False
 
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
@@ -1441,13 +1456,22 @@ class BotInstance:
             self.active_task = BusDriverTask(self)
             self.active_task.start()
             return "Бот водителя автобуса запущен"
+        elif task_type in ("farm", "harvest", "ферма"):
+            from logic.farm_task import FarmTask
+            self.active_task = FarmTask(self)
+            self.active_task.start()
+            return "Бот сборщика урожая запущен"
         elif task_type in ("stop", "none", "off"):
             return "Авто-задача остановлена"
         else:
             return ("Неизвестный тип задачи. Доступно: 'lvl', 'lvl_old', 'quest', "
-                "'mine', 'factory', 'bus', 'stop'")
+                "'mine', 'factory', 'bus', 'farm', 'stop'")
 
     def stop(self, banned: bool = False):
+        runtime = getattr(self, "lua_runtime", None)
+        if runtime:
+            runtime.stop()
+            self.lua_runtime = None
         self.stopping = True
         self.cancel_reconnect()
         # Мост больше не наш: освобождаем сразу, иначе отложенная уборка
@@ -2083,7 +2107,7 @@ class BotManager:
                 b.stats_next_at = 0.0
                 b.stats_pending = False
                 b.add_log("Подключение установлено, мир загружен")
-                if b.default_task_name and not b.active_task:
+                if b.default_task_name and not b.active_task and getattr(b, "lua_spawn_control", False) is not True:
                     b.set_task(b.default_task_name)
 
         @emitter.on("onSpawn")
@@ -2112,6 +2136,10 @@ class BotManager:
             )
 
             payload = data if isinstance(data, dict) else {}
+            if getattr(b, "lua_spawn_control", False) is True:
+                if is_spawn_menu(payload):
+                    remember_spawn_menu(payload, b)
+                return
 
             if is_spawn_menu(payload):
                 items = remember_spawn_menu(payload, b)
@@ -2216,6 +2244,8 @@ class BotManager:
                 if os.environ.get("BR_TRACE_JSON"):
                     body = re.sub(r'\{[0-9a-fA-F]{6}\}', '', str(info))
                     b.add_log(f"[ДИАЛОГ-ТЕЛО] {body[:400]!r}")
+                if getattr(b, "manual_web_control", False):
+                    return
                 if b.active_task and hasattr(b.active_task, "on_dialog"):
                     b.active_task.on_dialog(d_id, style, title, info, b1, b2)
 
@@ -2424,6 +2454,13 @@ class BotManager:
                 except Exception as exc:
                     b.add_log(f"[АВТОСБОР] ошибка обработки диалога: {exc}")
 
+        @emitter.on("onReceiveRPC", sync=True)
+        def _on_raw_farm_rpc(bot_obj, rpc_id, payload, *args, **kwargs):
+            b = self._find_bot_by_session_or_api(bot_obj)
+            task = getattr(b, "active_task", None) if b else None
+            if task and hasattr(task, "on_receive_rpc"):
+                task.on_receive_rpc(rpc_id, payload)
+
         @emitter.on("OnShowTextDraw")
         def _on_textdraw(bot_obj, textdraw_id, info, *args, **kwargs):
             b = self._find_bot_by_session_or_api(bot_obj)
@@ -2545,10 +2582,11 @@ class BotManager:
             if b:
                 b.add_log(f"[ВХОДЯЩИЙ ЗВОНОК] {header}: {text}")
                 try:
-                    b.quest_helpers.on_json(
-                        65,
-                        {"o": 1, "t": notif_type, "h": header, "s": text, "b": button},
-                    )
+                    if getattr(b, "lua_ui_control", False) is not True:
+                        b.quest_helpers.on_json(
+                            65,
+                            {"o": 1, "t": notif_type, "h": header, "s": text, "b": button},
+                        )
                 except Exception as exc:
                     b.add_log(f"[ЗВОНОК] помощник упал: {exc!r}")
                 if b.active_task and hasattr(b.active_task, "on_call_notification"):
@@ -2566,7 +2604,7 @@ class BotManager:
                     pass
             # Помощники сюжетки видят всё: диалоги НПС, ларёк, звонки, палитру.
             try:
-                handled = b.quest_helpers.on_json(interface_id, json_data)
+                handled = None if getattr(b, "lua_ui_control", False) is True else b.quest_helpers.on_json(interface_id, json_data)
             except Exception as exc:
                 b.add_log(f"[ПОМОЩНИК] сбой на iid={interface_id}: {exc!r}")
                 handled = None
@@ -2575,7 +2613,7 @@ class BotManager:
             # Почему именно так и что проверено как нерабочее — logic/captcha.py.
             try:
                 from logic.captcha import handle_captcha
-                if handle_captcha(b, interface_id, json_data):
+                if getattr(b, "lua_ui_control", False) is not True and handle_captcha(b, interface_id, json_data):
                     handled = True
             except Exception as exc:
                 b.add_log(f"[КАПЧА] сбой на iid={interface_id}: {exc!r}")
@@ -2584,8 +2622,10 @@ class BotManager:
             # сразу. Разбор режимов — logic/minigames.py.
             try:
                 from logic.minigames import handle_minigame
-                if handle_minigame(b, interface_id, json_data):
-                    handled = True
+                task = getattr(b, "active_task", None)
+                if getattr(b, "lua_ui_control", False) is not True and not (task and getattr(task, "running", False) and getattr(task, "handles_own_minigame", False) and interface_id == 31):
+                    if handle_minigame(b, interface_id, json_data):
+                        handled = True
             except Exception as exc:
                 b.add_log(f"[МИНИ-ИГРА] сбой на iid={interface_id}: {exc!r}")
             if b.active_task and hasattr(b.active_task, "on_receive_json"):
@@ -2609,7 +2649,8 @@ class BotManager:
             if not b:
                 return
             try:
-                b.quest_helpers.on_npc_dialog(name, text, buttons, model)
+                if getattr(b, "lua_ui_control", False) is not True:
+                    b.quest_helpers.on_npc_dialog(name, text, buttons, model)
             except Exception as exc:
                 b.add_log(f"[НПС] помощник упал: {exc!r}")
             if b.active_task and hasattr(b.active_task, "on_npc_dialog"):
@@ -3002,11 +3043,14 @@ class BotManager:
 
         # Ключ из пула («HAPP») превращаем в socks5://... до создания бота,
         # иначе в accounts.json уедет имя вместо адреса.
-        if proxy:
+        if proxy and str(proxy).strip().lower() not in ("none", "0", "off", "no", "direct", "-"):
             resolved = self.resolve_proxy(proxy)
             if not resolved:
-                print(f"[-] Прокси не годится: {proxy}. Бот пойдёт со своего IP.")
+                print("[-] Прокси не годится: аккаунт не создан.")
+                return None
             proxy = resolved
+        else:
+            proxy = ""
 
         password = password.strip()
 
@@ -3707,6 +3751,13 @@ class BotManager:
             return ""
         if proxy_clean.lower() in ("none", "0", "off", "no", "direct", "-"):
             return ""
+        # Ссылка VPN-узла не является SOCKS: сначала ищем его в пуле.
+        if proxy_clean.lower().startswith(("vless://", "vmess://", "trojan://", "ss://")):
+            pool = getattr(self, "proxy_pool", None)
+            node = next((n for n in pool.nodes() if n.raw == proxy_clean), None) if pool else None
+            if node is None and pool:
+                node = pool.find_node(proxy_clean)
+            return pool.socks_url_for(node) if node else ""
         # Ссылка уже готова — берём как есть
         if "://" in proxy_clean:
             if proxy_clean.startswith("http://"):
@@ -3738,6 +3789,7 @@ class BotManager:
             raw = (proxy_str or "").strip()
             if raw.lower() in ("none", "0", "off", "no", "direct", "-"):
                 bot.proxy = ""
+                bot.proxy_node = ""
             else:
                 resolved = self.resolve_proxy(raw)
                 if not resolved:
@@ -3789,7 +3841,7 @@ class BotManager:
         return bot.proxy or ""
 
     def apply_proxy_to_bots(self, proxy_str: str, bot_ids: list[int] | None = None) -> dict:
-        """Раздать прокси пачке ботов. Пустой список — всем.
+        """Раздать прокси пачке ботов. Только None означает «всем».
 
         Сначала проверка прокси, потом раздача: если прокси мёртв, ни одному
         боту он не достанется.
@@ -3807,9 +3859,11 @@ class BotManager:
         with self._lock:
             targets = (
                 [self.bots[bid] for bid in bot_ids if bid in self.bots]
-                if bot_ids
+                if bot_ids is not None
                 else list(self.bots.values())
             )
+            if not targets:
+                return {"ok": False, "reason": "аккаунты не найдены", "applied": []}
             node_key = self._node_key_for(resolved)
             for bot in targets:
                 bot.proxy = resolved
@@ -4028,13 +4082,17 @@ def print_help():
   /stop <ID|1,2,3>  - Остановить бота или нескольких через запятую
   /batch <сервер> <кол-во> <пароль> [прокси] - Создать пачку ботов с авто-никами
   /add <сервер> <ник> <пароль> [прокси]      - Добавить аккаунт вручную
+  /singbox [status|start|stop]       - локальный sing-box с конфигом _sb/config.json
   /vpn                              - Прокси и VPN-подписки: отчёт
   /vpn add [имя] <ссылка>           - Добавить VPN-подписку
   /vpn local <имя> <socks5://...>   - Добавить прокси вручную
   /vpn ping                         - Перепроверить все узлы сейчас
   /vpn use <узел> [ID|all]          - Применить прокси к ботам
   /proxy <ID|all> <узел|none>       - Прокси конкретному боту
-  /task <lvl|quest|mine|factory|bus|stop> [ID] - Назначить задачу боту
+  /task <lvl|quest|mine|factory|bus|farm|stop> [ID] - Назначить задачу боту
+  /lua help                          - Lua-скрипты и загрузчик
+  /luatest list                      - тестовые Lua-скрипты
+  /luatest run <файл.lua> [события.json] - офлайн-полигон
   /switch <ID>      - Выбрать активного бота для консольных команд
   /project [br|arz] - Показать или переключить игровой проект
   /logs [ID]        - Посмотреть последние логи бота
@@ -4225,6 +4283,7 @@ def interactive_menu(manager: BotManager):
                             new_proxy = input(f"Введите новый прокси для #{bid} (или 'none'/'0' для сброса на свой IP): ").strip()
                             if new_proxy.lower() in ("none", "0", "off", "no"):
                                 target_b.proxy = ""
+                                target_b.proxy_node = ""
                                 print(f"[+] У бота #{bid} сброшен прокси на собственный IP.")
                             else:
                                 target_b.proxy = new_proxy
@@ -4242,8 +4301,10 @@ def _parse_bot_ids(text: str, manager) -> list[int] | None:
     text = (text or "").strip().lower()
     if not text or text in ("all", "все", "*"):
         return None
-    ids = [int(part) for part in text.split(",") if part.strip().isdigit()]
-    return ids or None
+    parts = [part.strip() for part in text.split(",")]
+    if not parts or any(not part.isdigit() for part in parts):
+        raise ValueError("укажите ID через запятую или all")
+    return list(dict.fromkeys(int(part) for part in parts))
 
 
 def handle_vpn_command(manager, line: str) -> None:
@@ -4277,7 +4338,7 @@ def handle_vpn_command(manager, line: str) -> None:
             name, url = "", rest[0]
         else:
             name, url = rest[0], rest[1]
-        print(f"[*] Тяну подписку {url} ...")
+        print("[*] Загружаю подписку...")
         try:
             nodes = pool.add_subscription(url, name=name)
         except Exception as exc:
@@ -4295,11 +4356,15 @@ def handle_vpn_command(manager, line: str) -> None:
             return
         name, proxy = rest[0], rest[1]
         try:
-            pool.add_manual(proxy, name=name)
+            node = pool.add_manual(proxy, name=name)
         except Exception as exc:
             print(f"[-] Не вышло: {exc}")
             return
-        ok, reason = pool.verify_before_connect(proxy)
+        resolved = pool.socks_url_for(node)
+        if not resolved:
+            print(f"[!] {name} добавлен, но мост sing-box не запущен; проверьте установку и /vpn ping")
+            return
+        ok, reason = pool.verify_before_connect(resolved)
         if ok:
             print(f"[+] {name}: {reason}")
         else:
@@ -4333,21 +4398,23 @@ def handle_vpn_command(manager, line: str) -> None:
             print("Использование: /vpn use <ключ|имя|адрес> [id,id|all]")
             return
         needle = parts[2]
-        bot_ids = _parse_bot_ids(parts[3], manager) if len(parts) > 3 else None
+        try:
+            bot_ids = _parse_bot_ids(parts[3], manager) if len(parts) > 3 else None
+        except ValueError as exc:
+            print(f"[-] {exc}")
+            return
         found = pool.find(needle)
         if found is None:
             print(f"[-] Узел не найден: {needle}")
             return
-        if not found.node.is_direct:
-            print(
-                f"[-] {found.node.protocol.upper()} боту не годится: "
-                "нужен внешний клиент, бот умеет socks5/http."
-            )
-            return
         if not found.usable:
             print(f"[-] Узел не работает: {found.reason or 'проверка не прошла'}")
             return
-        report = manager.apply_proxy_to_bots(found.node.proxy_url(), bot_ids)
+        resolved = pool.socks_url_for(found.node)
+        if not resolved:
+            print("[-] Мост sing-box не поднялся; проверьте его установку и /vpn ping")
+            return
+        report = manager.apply_proxy_to_bots(resolved, bot_ids)
         if not report["ok"]:
             print(f"[-] Не применила: {report['reason']}")
             return
@@ -4369,7 +4436,8 @@ def handle_vpn_command(manager, line: str) -> None:
             return
         for index, bot in enumerate(targets):
             bot.proxy = working[index % len(working)]
-        manager.save_accounts()
+            bot.proxy_node = manager._node_key_for(bot.proxy)
+        manager.save_accounts(force=True)
         print(
             f"[+] Роздано {len(working)} прокси на {len(targets)} ботов "
             f"(по кругу)."
@@ -4396,6 +4464,15 @@ def handle_proxy_command(manager, line: str) -> None:
         return
     target, value = parts[1], parts[2]
     if target.lower() in ("all", "все", "*"):
+        if value.lower() in ("none", "0", "off", "no", "direct", "-"):
+            with manager._lock:
+                targets = list(manager.bots.values())
+                for bot in targets:
+                    bot.proxy = ""
+                    bot.proxy_node = ""
+            manager.save_accounts(force=True)
+            print(f"[+] Прокси сброшен у {len(targets)} ботов.")
+            return
         report = manager.apply_proxy_to_bots(value, None)
         if not report["ok"]:
             print(f"[-] Не применила: {report['reason']}")
@@ -4490,6 +4567,9 @@ def main():
         projects_mod.reset_cache()
 
     manager = BotManager()
+    from logic.singbox_service import SingBoxService
+    manager.singbox_service = SingBoxService()
+    manager.singbox_service.start(quiet_missing=True)
 
     # Мост веб-панели. Панель — отдельный процесс: она не поднимает второй
     # менеджер и не лезет в accounts.json, иначе два клиента на один ник
@@ -4571,6 +4651,25 @@ def main():
 
         elif line in ("/menu", "menu"):
             interactive_menu(manager)
+
+        elif line == "/luatest" or line.startswith("/luatest "):
+            from logic.lua_sandbox import run as run_lua_test, ROOT as LUA_TEST_ROOT
+            import shlex
+            try:
+                args = shlex.split(line)
+                if len(args) == 2 and args[1] == "list":
+                    os.makedirs(LUA_TEST_ROOT, exist_ok=True)
+                    names = sorted(f for f in os.listdir(LUA_TEST_ROOT) if f.endswith(".lua"))
+                    print("Тестовые скрипты: " + (", ".join(names) or "нет файлов"))
+                elif len(args) in (3, 4) and args[1] == "run":
+                    run_lua_test(args[2], args[3] if len(args) == 4 else None)
+                else:
+                    print("Использование: /luatest list | /luatest run файл.lua [события.json]")
+            except Exception as exc:
+                print(f"[ПОЛИГОН] Ошибка: {exc}")
+        elif line == "/lua" or line.startswith("/lua "):
+            from logic.lua_runtime import handle_command
+            handle_command(manager, line)
 
         elif line in ("/list", "list"):
             manager.list_bots()
@@ -4689,6 +4788,19 @@ def main():
                 print("[-] Ошибка: Пароль обязателен!")
                 print("Использование: /batch <сервер> <кол-во> <пароль> [прокси|список]")
 
+        elif line == "/singbox" or line.startswith("/singbox "):
+            parts = line.split()
+            cmd = parts[1] if len(parts) > 1 else "status"
+            service = manager.singbox_service
+            if cmd == "start" and len(parts) == 2: service.start()
+            elif cmd == "stop" and len(parts) == 2:
+                service.stop(); print("[sing-box] Остановлен процесс, запущенный программой")
+            elif cmd == "status" and len(parts) <= 2:
+                st = service.status()
+                print(f"[sing-box] процесс={'запущен' if st['running'] else 'не запущен'}, бинарник={'найден' if st['binary'] else 'не найден'}, конфиг={'есть' if st['configured'] else 'нет'}")
+                if st['error']: print('[sing-box] ' + st['error'])
+                print('[sing-box] Узлы /vpn запускаются отдельными мостами по необходимости; для них используйте /vpn')
+            else: print("Использование: /singbox status | start | stop")
         elif line.startswith("/vpn"):
             handle_vpn_command(manager, line)
 

@@ -11,6 +11,15 @@
 
 set -euo pipefail
 
+# В Termux устанавливаем нативный пакет: Linux-бинарник из архива и /usr/local
+# не подходят для обычного Android без root.
+if [ -n "${PREFIX:-}" ] && command -v pkg >/dev/null 2>&1; then
+    pkg install sing-box -y
+    sing-box version
+    echo "Установка завершена. Запустите программу и введите /singbox status."
+    exit 0
+fi
+
 ARCH="$(uname -m)"
 case "$ARCH" in
     x86_64|amd64) SB_ARCH="amd64" ;;

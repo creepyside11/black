@@ -560,9 +560,9 @@ class FarmRunner:
                 self.cycles += 1
                 return f"мини-игра закрыта, собрано {self.kg:.1f} кг"
             if elapsed > 180.0:
-                self.state = S_TO_DROPOFF
-                self.cycles += 1
-                return f"мини-игра не закрылась за {elapsed:.0f}с, иду сдавать"
+                self.state = S_RETRY
+                self._retry_at = time.time() + 10.0
+                return f"нет подтверждения сбора за {elapsed:.0f}с, повторяю"
             return f"играю, собрано {self.kg:.1f} кг"
 
         if elapsed > 180.0:

@@ -195,7 +195,8 @@ class ProxyPool:
         self.running = False
         # Мост VLESS/VMess/Trojan/SS -> SOCKS5. Без него такие узлы из
         # подписки остаются жёлтыми: живой, но применить некуда.
-        if bridge is None and bridge_available():
+        if bridge is None:
+            # Ленивая проверка бинарника: после pkg install перезапуск не обязателен.
             bridge = VpnBridge(log=self.log)
         self.bridge = bridge
 

@@ -33,7 +33,7 @@ accounts.json.bak
 accounts.json.tmp
 accounts.test.json
 accounts.test.json.bak
-br/accounts.json
+br/accounts.local.json
 _one_*.json
 _one_*.json.bak
 
@@ -67,3 +67,10 @@ _run_murmansk_loop.sh
 /_agent_*.py
 /_*.py
 /_test_*.py
+# Локальные секреты
+.env
+
+# Личные аккаунты и настройки не включаются в репозиторий
+/accounts.local.json
+/accounts_arz.json
+/proxies_pool.json

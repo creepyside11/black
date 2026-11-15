@@ -1,0 +1,6 @@
+{
+  "events": [
+    {"at": 0, "name": "on_spawn", "args": {}},
+    {"at": 1, "name": "on_chat", "args": {"message": "Тестовое сообщение"}}
+  ]
+}

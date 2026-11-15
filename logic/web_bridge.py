@@ -105,6 +105,8 @@ class WebBridge:
         self._thread = None
         self._last_snapshot = 0.0
         self._lock = threading.Lock()
+        from logic.manual_web import ManualWeb
+        self.manual = ManualWeb(manager)
 
     def start(self) -> None:
         if self.running:
@@ -119,6 +121,7 @@ class WebBridge:
 
     def stop(self) -> None:
         self.running = False
+        self.manual.close()
 
     def _sweep(self) -> None:
         """Убрать протухшие файлы: панель могла умереть, не дождавшись."""
@@ -191,6 +194,26 @@ class WebBridge:
             raise ValueError(f"неизвестная команда: {cmd}")
         with self._lock:
             return handler(args)
+
+    def _manual_bot(self, args):
+        bot = self.manager.bots.get(int(args['id']))
+        if bot is None: raise ValueError('аккаунт не найден')
+        return bot
+
+    def _cmd_manual_start(self,args):
+        bot=self._manual_bot(args);self.manual.begin(bot);return {'ok':True}
+
+    def _cmd_manual_stop(self,args):
+        bot=self._manual_bot(args);self.manual.stop(bot);return {'ok':True}
+
+    def _cmd_manual_state(self,args):
+        return self.manual.state(self._manual_bot(args))
+
+    def _cmd_manual_chat(self,args):
+        self.manual.chat(self._manual_bot(args),args.get('text',''));return {'ok':True}
+
+    def _cmd_manual_answer(self,args):
+        self.manual.answer(self._manual_bot(args),args);return {'ok':True}
 
     def _cmd_ping(self, args):
         return {"pong": True, "pid": os.getpid()}
@@ -449,7 +472,7 @@ class WebBridge:
     def _cmd_proxy_all(self, args):
         proxy = str(args.get("proxy") or "")
         result = self.manager.apply_proxy_to_bots(
-            proxy, bot_ids=args.get("ids") or None)
+            proxy, bot_ids=args.get("ids"))
         return result
 
     def _cmd_goal_many(self, args):

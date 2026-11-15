@@ -83,13 +83,18 @@ class EventEmitter:
     def off(self, event: str, func: Callable, key: Hashable = None) -> None:
         if key is None:
             listeners = self._listeners.get(event, [])
-            if func in listeners:
-                listeners.remove(func)
-            return
-
-        listeners = self._keyed_listeners.get(event, {}).get(key, [])
+        else:
+            listeners = self._keyed_listeners.get(event, {}).get(key, [])
         if func in listeners:
             listeners.remove(func)
+        # A function can be subscribed to more than one event. Keep its sync
+        # status until the last subscription is removed, then release it.
+        still_registered = any(func in group for group in list(self._listeners.values()))
+        if not still_registered:
+            still_registered = any(func in group for keyed in list(self._keyed_listeners.values())
+                                   for group in list(keyed.values()))
+        if not still_registered:
+            self._sync_listeners.discard(func)
 
     def has_listeners(self, event: str, key: Hashable = None) -> bool:
         if self._listeners.get(event):

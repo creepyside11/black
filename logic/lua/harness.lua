@@ -53,6 +53,15 @@ local MAX_LOG_LEN = 2000
 -- ============================ JSON =========================================
 
 local json = {}
+-- Keep empty arrays and null values distinct across the JSON bridge.
+local array_marks = setmetatable({}, { __mode = 'k' })
+local json_null = {}
+local function make_array(t)
+  local result = t or {}
+  if real_type(result) ~= 'table' then real_error('array expects a table', 0) end
+  array_marks[result] = true
+  return result
+end
 
 local JSON_ESCAPES = {
   ['"'] = '\\"', ['\\'] = '\\\\', ['\b'] = '\\b', ['\f'] = '\\f',
@@ -77,21 +86,21 @@ local function encode_number(value)
 end
 
 local function is_array(value)
-  local count = 0
+  if array_marks[value] then return true end
+  local count, max_index = 0, 0
   for key in real_pairs(value) do
-    if real_type(key) ~= 'number' then
-      return false
-    end
+    if real_type(key) ~= 'number' or key < 1 or key % 1 ~= 0 then return false end
     count = count + 1
+    if key > max_index then max_index = key end
   end
-  return count > 0
+  return count > 0 and count == max_index
 end
 
 local encode_value
 
 encode_value = function(value, depth)
   local kind = real_type(value)
-  if value == nil then
+  if value == nil or value == json_null then
     return 'null'
   elseif kind == 'boolean' then
     return value and 'true' or 'false'
@@ -213,7 +222,7 @@ decode_value = function(text, index)
       end
     end
   elseif ch == '[' then
-    local arr = {}
+    local arr = make_array()
     index = skip_space(text, index + 1)
     if text:sub(index, index) == ']' then
       return arr, index + 1
@@ -239,7 +248,7 @@ decode_value = function(text, index)
   elseif ch == 'f' and text:sub(index, index + 4) == 'false' then
     return false, index + 5
   elseif ch == 'n' and text:sub(index, index + 3) == 'null' then
-    return nil, index + 4
+    return json_null, index + 4
   end
   local number = text:match('^[-+0-9.eE]+', index)
   if number then
@@ -306,6 +315,8 @@ end
 -- ============================== br =========================================
 
 local br = {}
+br.null = json_null
+br.array = make_array
 br.version = '1'
 br.armed = false
 br.script = SCRIPT_PATH
@@ -317,7 +328,7 @@ end
 
 br.pos = function()
   local point = snapshot.pos
-  if real_type(point) ~= 'table' then
+  if point == json_null or real_type(point) ~= 'table' then
     return nil
   end
   return { x = point.x, y = point.y, z = point.z }
@@ -397,7 +408,16 @@ br.send_rpc = function(rpc_id, payload_hex)
   return emit_action({ kind = 'send_rpc', rpc_id = rid, payload_hex = hex:lower() })
 end
 
-br.send_json = function(interface_id, payload)
+br.send_packet = function(packet_id, payload_hex)
+  local id = as_number(packet_id)
+  local hex = payload_hex or ''
+  if not id or real_type(hex) ~= 'string' or #hex % 2 ~= 0 or hex:find('[^0-9a-fA-F]') then
+    push_log('send_packet: нужен номер и hex-строка с чётной длиной'); return false
+  end
+  return emit_action({kind='send_packet', packet_id=id, payload_hex=hex:lower()})
+end
+
+br.send_json = function(interface_id, payload, packet_name)
   local iid = as_number(interface_id)
   if not iid then
     push_log('send_json: interface_id должен быть числом')
@@ -407,7 +427,11 @@ br.send_json = function(interface_id, payload)
     push_log('send_json: payload должен быть таблицей')
     return false
   end
-  return emit_action({ kind = 'send_json', interface_id = iid, payload = payload })
+  if packet_name ~= nil and real_type(packet_name) ~= 'string' then
+    push_log('send_json: packet_name должен быть строкой'); return false
+  end
+  return emit_action({ kind = 'send_json', interface_id = iid, payload = payload,
+                       packet_name = packet_name or 'interface_sync' })
 end
 
 br.sleep = function(seconds)
@@ -420,6 +444,75 @@ br.sleep = function(seconds)
     sec = 3600
   end
   return emit_action({ kind = 'sleep', sec = sec })
+end
+
+-- Функции отправляют действие мосту. Они не ждут его выполнения.
+br.drive = function(x, y, z) return emit_move('drive', x, y, z) end
+br.stop_movement = function() return emit_action({kind='stop_movement'}) end
+br.immortality = function(enabled) return emit_action({kind='immortality', enabled=enabled and true or false}) end
+br.chat = function(text) return emit_action({kind='chat', text=real_tostring(text or '')}) end
+br.keys = function(keys, lr, ud) return emit_action({kind='keys', keys=keys or 0, lr=lr or 0, ud=ud or 0}) end
+br.vehicle = function(id, seat) return emit_action({kind='vehicle', id=id, seat=seat or 0}) end
+br.spawn_select = function(index) return emit_action({kind='spawn_select', index=index}) end
+br.dialog = function(id, response, item, text)
+  return emit_action({kind='dialog', id=id, response=response or 1, item=item or 0, text=text or ''})
+end
+br.solve_captcha = function(data) return emit_action({kind='solve_captcha', data=data}) end
+br.after = function(seconds, name, data)
+  if real_type(seconds) ~= 'number' or seconds < 0 or seconds > 3600 or real_type(name) ~= 'string' then
+    push_log('after: нужны секунды от 0 до 3600 и имя события'); return false
+  end
+  return emit_action({kind='after', sec=seconds, name=name, data=data or {}})
+end
+-- Асинхронный контроллер маршрутов; события приходят отдельно.
+br.route_start = function(name, mode, options)
+  if real_type(name) ~= 'string' or (options ~= nil and real_type(options) ~= 'table') then
+    push_log('route_start: нужны имя маршрута, режим и необязательная таблица настроек'); return false
+  end
+  return emit_action({kind='route_start', route=name, mode=mode or 'walk', options=options or {}})
+end
+br.route_save = function(name, points)
+  if real_type(name) ~= 'string' or real_type(points) ~= 'table' then
+    push_log('route_save: нужны имя и массив точек'); return false
+  end
+  return emit_action({kind='route_save', route=name, points=make_array(points)})
+end
+br.route_pause = function() return emit_action({kind='route_pause'}) end
+br.route_resume = function() return emit_action({kind='route_resume'}) end
+br.route_stop = function() return emit_action({kind='route_stop'}) end
+br.route_status = function() return snapshot.route end
+
+br.interact = function(id) return br.send_rpc(436, br.u32(id)) end
+br.select_textdraw = function(id) return br.send_rpc(437, br.u16(id)) end
+local function ashex(bytes)
+  return (bytes:gsub('.', function(c) return string.format('%02x', string.byte(c)) end))
+end
+br.u16 = function(n) return ashex(string.pack('<I2', n)) end
+br.u32 = function(n) return ashex(string.pack('<I4', n)) end
+br.npc = function(button) return br.send_json(63, {bk=button or 0}, 'interface_npc_dialog_response') end
+-- Settings are non-secret values configured for this script in the VPS panel.
+br.settings = function() return snapshot.settings or {} end
+br.setting = function(key, default)
+  local settings = snapshot.settings or {}
+  local value = settings[key]
+  if value == nil or value == json_null then return default end
+  return value
+end
+br.connected = function() return snapshot.connected == true end
+local function optional(value)
+  if value == json_null then return nil end
+  return value
+end
+br.vehicle_id = function() return optional(snapshot.vehicle_id) end
+br.health = function() return optional(snapshot.health) end
+br.money = function() return optional(snapshot.money) end
+br.interior = function() return optional(snapshot.interior) end
+br.mode = function() return optional(snapshot.mode) end
+br.bot_id = function() return optional(snapshot.bot_id) end
+br.event = function(name, fn)
+  if real_type(name) ~= 'string' or real_type(fn) ~= 'function' then return false end
+  handlers[name] = fn
+  return true
 end
 
 br.emit = emit_action
@@ -515,7 +608,7 @@ local function do_load(msg)
   if not ok then
     return false, 'ошибка при выполнении тела скрипта: ' .. real_tostring(body_error)
   end
-  handlers = collect_handlers(chunk_env)
+  for name, fn in real_pairs(collect_handlers(chunk_env)) do handlers[name] = fn end
   loaded = true
   return true
 end

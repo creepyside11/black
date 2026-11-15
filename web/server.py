@@ -344,6 +344,7 @@ class Handler(BaseHTTPRequestHandler):
             "add", "add_many", "proxy_bot", "proxy_all", "proxy_many",
             "vpn_status", "vpn_refresh", "vpn_use", "vpn_ban", "vpn_unban",
             "vpn_sub_add", "settings", "ping", "switch_project",
+            "manual_start", "manual_stop", "manual_state", "manual_chat", "manual_answer",
         }
         if name not in allowed:
             self._json({"error": f"неизвестная команда: {name}"}, 404)
