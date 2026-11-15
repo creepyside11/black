@@ -224,6 +224,12 @@ class LuaRuntime:
                 wait = min(0.1, max(0.0, next_tick-time.monotonic()))
                 try: name, data = self.events.get(timeout=wait)
                 except queue.Empty: continue
+                # A new API may appear while queue.get() waits: the first
+                # spawn event must use that API, not the previous session.
+                current_api = getattr(self.bot, 'api', None)
+                if current_api is not self.script.api:
+                    self.script.movement_id = None
+                    self.script.api = current_api
                 if name == 'on_move_end':
                     self.route.on_move_end(data.get('movement'), data.get('status'))
                 self._feed(name, data)

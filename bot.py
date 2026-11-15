@@ -1147,12 +1147,38 @@ class BotInstance:
         self.cancel_reconnect()
         self.stopping = False
         self.status = "Подключение..."
+        lua_prepared = None
+        task_name = getattr(self, "default_task_name", "") or ""
+        runtime = getattr(self, "lua_runtime", None)
+        if task_name.startswith("lua:") and runtime and runtime.running:
+            from logic.lua_runtime import resolve_script
+            try:
+                expected_path = resolve_script(task_name[4:])
+            except ValueError as exc:
+                self.status = "Ошибка Lua-скрипта"; self.add_log(f"[LUA] {exc}"); self._release_proxy_bridge(); return False
+            if runtime.mode != "bot" or os.path.realpath(runtime.path) != expected_path:
+                self.status = "Ошибка Lua-скрипта"
+                self.add_log("[LUA] Другой Lua-скрипт уже запущен. Сначала остановите его.")
+                self._release_proxy_bridge(); return False
+        if task_name.startswith("lua:") and not (runtime and runtime.running):
+            if getattr(self, "active_task", None):
+                self.active_task.stop(); self.active_task = None
+            try:
+                from logic.lua_telegram import prepare_runtime
+                lua_prepared = prepare_runtime(self, task_name[4:], mode="bot")
+            except Exception as exc:
+                self.status = "Ошибка Lua-скрипта"
+                self.add_log(f"[LUA] Запуск отменён: {type(exc).__name__}: {exc}")
+                self._release_proxy_bridge()
+                return False
         try:
             prepared = self.setup_session()
         except Exception as exc:
             self.add_log(f"Не удалось подготовить подключение: {type(exc).__name__}")
             prepared = False
         if prepared is False:
+            if lua_prepared is not None:
+                lua_prepared.stop(); self.lua_runtime = None
             self.status = "Ошибка настройки подключения"
             self._release_proxy_bridge()
             return False
@@ -3024,12 +3050,15 @@ class BotManager:
             self._nick_index[bot.nickname] = bot
 
         self.save_accounts(force=True)
-        bot.start()
-        if default_task:
+        started = bot.start()
+        if default_task and not default_task.startswith("lua:"):
             bot.set_task(default_task)
+        if not started:
+            print(f"[!] Аккаунт #{bot_id} создан, но запуск не удался: {bot.status}")
 
         px_label = f" [Прокси: {proxy}]" if proxy else " [Свой IP]"
-        print(f"[+] Бот #{bot_id} ({nickname}) запущен на сервере {clean_name} ({ip}:{port}){px_label}")
+        state_label = "запущен" if started else "добавлен (не запущен)"
+        print(f"[+] Бот #{bot_id} ({nickname}) {state_label} на сервере {clean_name} ({ip}:{port}){px_label}")
         return bot
 
     def generate_random_nickname(self) -> str:

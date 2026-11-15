@@ -3,6 +3,7 @@ import time
 import math
 import os
 import re
+import html
 import telebot
 from telebot import types
 from ai_controller import AICommander, load_ai_config, save_ai_config
@@ -209,12 +210,58 @@ class TelegramBotController:
                 callback_data="project_menu", style="primary"),
         )
         markup.row(
+            types.InlineKeyboardButton("🧩 Lua: загрузить и запустить", callback_data="lua_menu", style="primary"),
             types.InlineKeyboardButton("⚙️ Настройки", callback_data="settings_menu", style="primary")
         )
         markup.row(
             types.InlineKeyboardButton("🔄 Обновить список", callback_data=f"page:{page}", style="primary")
         )
         return markup, total_bots, total_pages
+
+    def _lua_admin(self, user_id, chat):
+        return bool(self.admin_ids) and user_id in self.admin_ids and getattr(chat, "type", "") == "private" and getattr(chat, "id", None) == user_id
+
+    def _lua_files_menu(self, chat_id, context, *, bid=None, page=1):
+        from logic.lua_runtime import list_scripts
+        from logic.lua_telegram import NAME
+        files = [f for f in list_scripts() if NAME.fullmatch(f) and '..' not in f][:100]
+        if context == 'batch':
+            state = self.user_states.get(chat_id) or {}
+            if state.get('action') != 'batch_task':
+                self.bot.send_message(chat_id, 'Шаг создания устарел. Начните заново.'); return
+            state['lua_files'] = files
+        else:
+            self.user_states[chat_id] = {'action':'lua_select', 'files':files, 'bid':bid, 'page':page}
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        for index, name in enumerate(files):
+            prefix = 'batch_lua_pick' if context == 'batch' else 'lua_pick'
+            markup.add(types.InlineKeyboardButton(name[:55], callback_data=f'{prefix}:{index}', style='primary'))
+        markup.add(types.InlineKeyboardButton('⬅️ Назад', callback_data='lua_menu', style='primary'))
+        self.bot.send_message(chat_id, 'Выберите Lua-файл.' if files else 'Файлов пока нет. Загрузите .lua через меню Lua.', reply_markup=markup)
+
+    def _lua_start(self, bot_id, name, mode):
+        from logic.lua_telegram import prepare_runtime
+        with self.manager._lock:
+            bot = self.manager.bots.get(bot_id)
+        if bot is None: raise ValueError('Аккаунт не найден.')
+        if mode == 'bot':
+            # Сохранённая задача запускается внутри bot.start до создания сессии.
+            from logic.lua_runtime import resolve_script
+            resolve_script(name)
+            if getattr(getattr(bot, 'session', None), 'connected', False) or (getattr(bot, 'thread', None) and bot.thread.is_alive()):
+                raise ValueError('Сначала остановите аккаунт: Lua-бот должен запуститься до входа.')
+            previous = bot.default_task_name
+            bot.default_task_name = 'lua:' + name
+            try:
+                if not bot.start():
+                    raise ValueError('Не удалось запустить аккаунт. Проверьте его лог и установленный Lua 5.4.')
+            except Exception:
+                bot.default_task_name = previous
+                raise
+            self.manager.save_accounts(force=True)
+        else:
+            prepare_runtime(bot, name, mode='addon')
+        return bot
 
     # ---------- настройки ----------
 
@@ -494,6 +541,8 @@ class TelegramBotController:
                 markup.row(buttons[i], buttons[i + 1])
             else:
                 markup.row(buttons[i])
+        markup.row(types.InlineKeyboardButton(
+            "🧩 Выбрать Lua-бота", callback_data="batch_lua", style="primary"))
         markup.row(types.InlineKeyboardButton(
             "✖️ Отмена", callback_data="batch_cancel", style="danger"))
         self.bot.send_message(
@@ -834,6 +883,7 @@ class TelegramBotController:
 
         markup.row(btn, types.InlineKeyboardButton(
             "📜 Логи", callback_data=f"bot_logs:{bid}:{page}", style="primary"))
+        markup.row(types.InlineKeyboardButton("🧩 Lua", callback_data=f"lua_account:{bid}:{page}", style="primary"))
         markup.row(
             types.InlineKeyboardButton("🔄 Обновить статы (/mm)",
                                        callback_data=f"bot_check_stats:{bid}:{page}", style="success"),
@@ -1305,6 +1355,101 @@ class TelegramBotController:
             data = call.data
             chat_id = call.message.chat.id
             message_id = call.message.message_id
+
+            if data == 'lua_menu':
+                if not self._lua_admin(call.from_user.id, call.message.chat):
+                    self.bot.answer_callback_query(call.id, 'Нужен личный чат и заданный ID администратора.', show_alert=True); return
+                self.bot.answer_callback_query(call.id)
+                markup=types.InlineKeyboardMarkup(row_width=1)
+                markup.add(types.InlineKeyboardButton('📤 Загрузить .lua', callback_data='lua_upload', style='success'))
+                markup.add(types.InlineKeyboardButton('📄 Список файлов', callback_data='lua_list', style='primary'))
+                self.bot.send_message(chat_id, 'Lua-файлы: загрузите файл, затем выберите аккаунт → Lua. Загружайте только доверенные скрипты.', reply_markup=markup)
+                return
+            if data == 'lua_upload':
+                if not self._lua_admin(call.from_user.id, call.message.chat):
+                    self.bot.answer_callback_query(call.id, 'Доступ запрещён.', show_alert=True); return
+                self.user_states[chat_id]={'action':'lua_upload'}
+                self.bot.answer_callback_query(call.id)
+                self.bot.send_message(chat_id, 'Отправьте документ .lua в UTF-8 до 256 КБ. Существующий файл не перезаписывается. /cancel — отмена.')
+                return
+            if data == 'lua_list':
+                if not self._lua_admin(call.from_user.id, call.message.chat):
+                    self.bot.answer_callback_query(call.id, 'Доступ запрещён.', show_alert=True); return
+                from logic.lua_runtime import list_scripts
+                files=list_scripts()[:35]
+                self.bot.answer_callback_query(call.id)
+                self.bot.send_message(chat_id, '<b>Lua-файлы (первые 35)</b>\n'+('\n'.join(html.escape(f[:90]) for f in files) if files else 'Пока нет файлов.'))
+                return
+            if data == 'batch_lua':
+                if not self._lua_admin(call.from_user.id, call.message.chat):
+                    self.bot.answer_callback_query(call.id, 'Доступ запрещён.', show_alert=True); return
+                self.bot.answer_callback_query(call.id);self._lua_files_menu(chat_id,'batch');return
+            if data.startswith('batch_lua_pick:'):
+                if not self._lua_admin(call.from_user.id, call.message.chat):
+                    self.bot.answer_callback_query(call.id, 'Доступ запрещён.', show_alert=True); return
+                state=self.user_states.get(chat_id) or {};idx=data.partition(':')[2]
+                files=state.get('lua_files',[])
+                if state.get('action')!='batch_task' or not idx.isdigit() or int(idx)>=len(files):
+                    self.bot.answer_callback_query(call.id, 'Выбор устарел.', show_alert=True);return
+                from logic.lua_runtime import resolve_script
+                try:resolve_script(files[int(idx)])
+                except ValueError:
+                    self.bot.answer_callback_query(call.id, 'Файл недоступен.', show_alert=True);return
+                self.bot.answer_callback_query(call.id)
+                self._ask_batch_proxy(chat_id,state['server'],state['count'],state['password'],'lua:'+files[int(idx)]);return
+            if data.startswith('lua_account:'):
+                if not self._lua_admin(call.from_user.id, call.message.chat):
+                    self.bot.answer_callback_query(call.id, 'Доступ запрещён.', show_alert=True); return
+                parts=data.split(':')
+                if len(parts)!=3 or not parts[1].isdigit() or not parts[2].isdigit():
+                    self.bot.answer_callback_query(call.id, 'Некорректный аккаунт.', show_alert=True);return
+                bid,page=int(parts[1]),int(parts[2]);self.bot.answer_callback_query(call.id)
+                markup=types.InlineKeyboardMarkup(row_width=1)
+                markup.add(types.InlineKeyboardButton('▶️ Запустить Lua',callback_data=f'lua_choose:{bid}:{page}',style='success'))
+                markup.add(types.InlineKeyboardButton('⏹ Остановить Lua',callback_data=f'lua_stop:{bid}:{page}',style='danger'))
+                self.bot.send_message(chat_id,'Lua для аккаунта #'+str(bid),reply_markup=markup);return
+            if data.startswith('lua_choose:'):
+                if not self._lua_admin(call.from_user.id, call.message.chat):
+                    self.bot.answer_callback_query(call.id, 'Доступ запрещён.', show_alert=True); return
+                parts=data.split(':')
+                if len(parts)!=3 or not parts[1].isdigit() or not parts[2].isdigit():
+                    self.bot.answer_callback_query(call.id, 'Некорректный аккаунт.', show_alert=True);return
+                self.bot.answer_callback_query(call.id);self._lua_files_menu(chat_id,'account',bid=int(parts[1]),page=int(parts[2]));return
+            if data.startswith('lua_pick:'):
+                if not self._lua_admin(call.from_user.id, call.message.chat):
+                    self.bot.answer_callback_query(call.id, 'Доступ запрещён.', show_alert=True); return
+                state=self.user_states.get(chat_id) or {};idx=data.partition(':')[2];files=state.get('files',[])
+                if state.get('action')!='lua_select' or not idx.isdigit() or int(idx)>=len(files):
+                    self.bot.answer_callback_query(call.id, 'Выбор устарел.', show_alert=True);return
+                state['selected']=files[int(idx)]
+                markup=types.InlineKeyboardMarkup(row_width=1)
+                markup.add(types.InlineKeyboardButton('Дополнение к аккаунту',callback_data='lua_run:addon',style='primary'))
+                markup.add(types.InlineKeyboardButton('Самостоятельный бот до входа',callback_data='lua_run:bot',style='success'))
+                self.bot.answer_callback_query(call.id);self.bot.send_message(chat_id,'Выберите режим для '+html.escape(state['selected']),reply_markup=markup);return
+            if data.startswith('lua_run:'):
+                if not self._lua_admin(call.from_user.id, call.message.chat):
+                    self.bot.answer_callback_query(call.id, 'Доступ запрещён.', show_alert=True); return
+                state=self.user_states.get(chat_id) or {};mode=data.partition(':')[2]
+                if state.get('action')!='lua_select' or mode not in ('addon','bot') or not state.get('selected'):
+                    self.bot.answer_callback_query(call.id, 'Выбор устарел.', show_alert=True);return
+                self.bot.answer_callback_query(call.id, 'Запускаю…')
+                try:
+                    self._lua_start(state['bid'],state['selected'],mode)
+                except Exception as exc:
+                    self.bot.send_message(chat_id,'Не удалось запустить Lua: '+html.escape(str(exc)));return
+                self.user_states.pop(chat_id,None);self.bot.send_message(chat_id,'✅ Lua запущен. Проверяйте события и ошибки в логах аккаунта.');return
+            if data.startswith('lua_stop:'):
+                if not self._lua_admin(call.from_user.id, call.message.chat):
+                    self.bot.answer_callback_query(call.id, 'Доступ запрещён.', show_alert=True); return
+                parts=data.split(':');bid=int(parts[1]) if len(parts)==3 and parts[1].isdigit() else -1
+                with self.manager._lock:bot=self.manager.bots.get(bid)
+                if bot is None:self.bot.answer_callback_query(call.id,'Аккаунт не найден.',show_alert=True);return
+                runtime=getattr(bot,'lua_runtime',None)
+                if runtime:runtime.stop();bot.lua_runtime=None
+                if (getattr(bot,'default_task_name','') or '').startswith('lua:'):
+                    bot.default_task_name='stop';self.manager.save_accounts(force=True)
+                self.bot.answer_callback_query(call.id,'Lua остановлен')
+                self.bot.send_message(chat_id,'Lua-скрипт остановлен. Сам аккаунт остаётся подключённым, если он был в игре.');return
 
             if data.startswith("page:"):
                 page = int(data.split(":")[1])
@@ -2286,6 +2431,31 @@ class TelegramBotController:
             if message.chat.id in self.user_states:
                 del self.user_states[message.chat.id]
             self.bot.reply_to(message, "Действие отменено.")
+
+        @self.bot.message_handler(content_types=['document'])
+        def handle_lua_document(message):
+            if not self._lua_admin(message.from_user.id, message.chat): return
+            state=self.user_states.get(message.chat.id) or {}
+            if state.get('action')!='lua_upload': return
+            from logic.lua_telegram import MAX_SCRIPT_BYTES, NAME, store_script
+            doc=message.document
+            filename=getattr(doc,'file_name','') or ''
+            if not doc or not NAME.fullmatch(filename) or '..' in filename:
+                self.bot.reply_to(message, 'Нужно безопасное имя с расширением .lua: латиница, цифры, точка, _ или -.');return
+            if not doc.file_size or doc.file_size>MAX_SCRIPT_BYTES:
+                self.bot.reply_to(message, 'Нужен .lua размером до 256 КБ.');return
+            try:
+                info=self.bot.get_file(doc.file_id)
+                if getattr(info,'file_size',None) is not None and info.file_size>MAX_SCRIPT_BYTES:raise ValueError('Файл больше 256 КБ.')
+                data=self.bot.download_file(info.file_path)
+                name=store_script(filename,data)
+            except ValueError as exc:
+                self.bot.reply_to(message,'Не удалось сохранить файл: '+html.escape(str(exc)));return
+            except Exception:
+                # Telegram exceptions may contain the bot token in a URL.
+                self.bot.reply_to(message,'Не удалось скачать или сохранить файл. Попробуйте снова.');return
+            self.user_states.pop(message.chat.id,None)
+            self.bot.reply_to(message,'✅ Файл сохранён: <code>'+html.escape(name)+'</code>. Запуск — через аккаунт → Lua или при массовом создании.')
 
         @self.bot.message_handler(func=lambda msg: True)
         def handle_user_text(message):
