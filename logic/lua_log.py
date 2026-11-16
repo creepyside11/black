@@ -26,6 +26,9 @@ def sink(bot):
     def write(message):
         text = str(message).replace('\r', ' ').replace('\n', ' ')
         clean = _SECRET.sub(lambda m: m.group(1) + '=[СКРЫТО]', text)[:4000]
-        bot.add_log(clean)
+        formatted = bot.add_log(clean)
+        lua_logs = getattr(bot, 'lua_logs', None)
+        if lua_logs is not None:
+            lua_logs.append(formatted if isinstance(formatted, str) else clean)
         logger.info(clean)
     return write

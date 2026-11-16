@@ -41,6 +41,27 @@ def save_proxy_to_file(name: str, proxy_str: str):
 VPN_PAGE_SIZE = 8
 
 
+def _format_account_logs(bot, lua_only=False):
+    """Build a Telegram-safe, bounded tail for one account."""
+    source = getattr(bot, 'lua_logs', ()) if lua_only else getattr(bot, 'logs', ())
+    lines = list(source or ())[-30:]
+    if not lines:
+        return '<i>(Логов Lua пока нет)</i>' if lua_only else '<i>(Логов пока нет)</i>'
+    # Telegram limits a message to 4096 characters. Bound the escaped text as
+    # well: HTML entities expand, and a single Lua message can be long.
+    tail = []
+    size = 0
+    for line in reversed(lines):
+        clean = html.escape(str(line), quote=False)
+        if len(clean) > 3000:
+            clean = html.escape(str(line)[-450:], quote=False)
+        if size + len(clean) + 1 > 3400:
+            break
+        tail.append(clean)
+        size += len(clean) + 1
+    return '<code>' + '\n'.join(reversed(tail)) + '</code>'
+
+
 class TelegramBotController:
     def __init__(self, token: str, manager, admin_id=None):
         self.token = token.strip()
@@ -1954,8 +1975,9 @@ class TelegramBotController:
                 call.data = f"page:{page}"
                 handle_callbacks(call)
 
-            elif data.startswith("bot_logs:"):
-                _, bid_s, page_s = data.split(":")
+            elif data.startswith(("bot_logs:", "bot_lua_logs:")):
+                kind, bid_s, page_s = data.split(":")
+                lua_only = kind == "bot_lua_logs"
                 bid = int(bid_s)
                 page = int(page_s)
                 with self.manager._lock:
@@ -1965,20 +1987,15 @@ class TelegramBotController:
                     self.bot.answer_callback_query(call.id, "Бот не найден!")
                     return
 
-                logs_list = list(b.logs)
-                if not logs_list:
-                    log_text = "<i>(Логов пока нет)</i>"
-                else:
-                    # Берем последние 15 записей логов
-                    tail = logs_list[-15:]
-                    # Чистим теги HTML
-                    cleaned = [l.replace("<", "&lt;").replace(">", "&gt;") for l in tail]
-                    log_text = "\n".join(cleaned)
-
-                text = f"<b>📜 Последние логи #{b.bot_id} [{b.nickname}]:</b>\n\n<code>{log_text}</code>"
+                log_text = _format_account_logs(b, lua_only=lua_only)
+                title = 'Логи Lua' if lua_only else 'Последние логи'
+                text = f"<b>📜 {title} #{b.bot_id} [{html.escape(str(b.nickname))}]:</b>\n\n{log_text}"
                 markup = types.InlineKeyboardMarkup(row_width=2)
                 markup.row(
-                    types.InlineKeyboardButton("🔄 Обновить логи", callback_data=f"bot_logs:{bid}:{page}", style="primary"),
+                    types.InlineKeyboardButton("🔄 Обновить логи", callback_data=f"{kind}:{bid}:{page}", style="primary"),
+                    types.InlineKeyboardButton("📜 Все логи" if lua_only else "🧩 Логи Lua", callback_data=f"{'bot_logs' if lua_only else 'bot_lua_logs'}:{bid}:{page}", style="primary"),
+                )
+                markup.row(
                     types.InlineKeyboardButton("⬅️ Назад к боту", callback_data=f"bot_view:{bid}:{page}", style="primary")
                 )
                 try:

@@ -110,6 +110,20 @@ class FlowTests(unittest.TestCase):
  def test_menu_shows_account_start_and_stop(self):
   self.call('lua_account:4:1');buttons=[b.callback_data for row in self.c.bot.sent[-1][2].keyboard for b in row]
   self.assertIn('lua_choose:4:1',buttons);self.assertIn('lua_stop:4:1',buttons)
+ def test_account_logs_toggle_escapes_text_and_survives_chat_noise(self):
+  b=NS(bot_id=4,nickname='Nick',logs=['обычная строка']*40,lua_logs=['[lua test.lua] a < b & c'])
+  self.c.manager.bots[4]=b;self.c.bot.edit_message_text=mock.Mock()
+  self.call('bot_logs:4:1')
+  args,kw=self.c.bot.edit_message_text.call_args
+  buttons=[x.callback_data for row in kw['reply_markup'].keyboard for x in row]
+  self.assertIn('bot_lua_logs:4:1',buttons)
+  self.call('bot_lua_logs:4:1')
+  args,kw=self.c.bot.edit_message_text.call_args
+  self.assertIn('a &lt; b &amp; c',args[0]);self.assertNotIn('обычная строка',args[0])
+  self.assertIn('bot_logs:4:1',[x.callback_data for row in kw['reply_markup'].keyboard for x in row])
+ def test_long_log_is_bounded(self):
+  b=NS(logs=['<&'*5000],lua_logs=[])
+  self.assertLess(len(tg._format_account_logs(b)),3500)
 
 class ExistingAccountFlowTests(FlowTests):
  def test_both_modes_pass_selected_file_and_account(self):

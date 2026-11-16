@@ -543,6 +543,8 @@ class BotInstance:
             self.harvester.start(self)
 
         self.logs = deque(maxlen=MAX_LOG_HISTORY)
+        # Отдельный хвост не вытесняется шумными игровыми событиями.
+        self.lua_logs = deque(maxlen=200)
         self.status = "ЗАБАНЕН" if self.is_banned else "Остановлен"
         self.connected_time = None
         self.thread = None

@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 import unittest
+from collections import deque
 from unittest.mock import patch
 from logic.events import emitter
 from logic.lua_runtime import LuaRuntime, resolve_script
@@ -64,6 +65,21 @@ class Integration(unittest.TestCase):
         bot=Bot(1);r=self.start(bot,'''br.event('on_custom', function(e) br.log('value=' .. e.value) end)
           function on_load(e) br.after(0.01, 'on_custom', {value=7}) end''')
         self.assertTrue(until(lambda:any('value=7' in x for x in bot.logs)))
+    def test_print_and_br_log_reach_account_log_and_separate_history(self):
+        from tg_controller import _format_account_logs
+        bot=Bot(91); bot.logs=deque(maxlen=3); bot.lua_logs=deque(maxlen=200)
+        self.start(bot,'''print('при загрузке <test> & ok')
+            function on_load(e) br.log('password=secret') end
+            function on_chat(e) print('из события', e.message) end''')
+        emitter.emit('onShowChat',bot.api,'hello')
+        self.assertTrue(until(lambda:any('из события' in x for x in bot.lua_logs)))
+        text=_format_account_logs(bot, lua_only=True)
+        self.assertIn('при загрузке &lt;test&gt; &amp; ok',text)
+        self.assertIn('password=[СКРЫТО]',text)
+        self.assertNotIn('secret',text)
+        for i in range(20): bot.add_log('шум чата')
+        self.assertIn('при загрузке',_format_account_logs(bot, lua_only=True))
+        self.assertFalse(any('при загрузке' in line for line in bot.logs))
     def test_callback_errors_stop_with_trace(self):
         bot=Bot(1);r=self.start(bot,'''function on_chat(e) error('bad script') end''')
         emitter.emit('onShowChat',bot.api,'x')
