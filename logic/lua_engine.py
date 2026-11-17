@@ -100,7 +100,7 @@ HEX_BYTES = 2048                # сколько байт пакета отда�
 TRANSCRIPT_LINES = 200          # сколько строк Lua-логов держим в памяти
 
 # Действия, меняющие мир. Без armed=True не исполняются, а логируются.
-MUTATING_ACTIONS = frozenset({"walk", "drive", "tp", "pickup", "send_rpc", "send_packet", "send_json", "chat", "keys", "vehicle", "spawn_select", "dialog", "solve_captcha", "stop_movement", "immortality", "route_save"})
+MUTATING_ACTIONS = frozenset({"walk", "drive", "tp", "pickup", "send_rpc", "send_packet", "send_json", "chat", "keys", "vehicle", "spawn_select", "dialog", "solve_captcha", "stop_movement", "immortality", "route_save", "store_set", "store_delete", "store_clear"})
 
 # Дальше цели при ходьбе считаем дошедшими.
 WALK_COMPLETION_DISTANCE = 0.5
@@ -513,10 +513,19 @@ class LuaScript:
         self.captcha_handler = captcha_handler
         self.route_handler = route_handler
         self.route_status = {}
+        self.observed = {'dialog': None, 'checkpoint': None}
         self.should_stop = should_stop or (lambda: False)
         self.bot = bot
         self.mode = mode
         self.schedule = schedule
+        self.named_timer_handler = None
+        self.storage = None
+        if bot is not None:
+            try:
+                from logic.lua_storage import LuaStorage
+                self.storage = LuaStorage(bot, os.path.abspath(str(path)))
+            except (ValueError, OSError):
+                pass
         self.path = os.path.abspath(str(path))
         self.api = api
         self.log = log or print
@@ -606,10 +615,17 @@ class LuaScript:
                     pass
         from logic.lua_settings import load_settings
         settings = load_settings(self.path)
+        account = {"nickname": getattr(self.bot, "nickname", None),
+                   "server": getattr(self.bot, "server_name", None),
+                   "status": getattr(self.bot, "status", None),
+                   "level": getattr(self.bot, "level_str", None),
+                   "target_level": getattr(self.bot, "target_lvl", None)}
         return {"settings": settings, "route": self.route_status, "pos": point, "now": float(self.clock()), "tail": tail,
                 "connected": connected, "vehicle_id": vehicle_id,
                 "health": health, "money": money, "interior": interior,
-                "bot_id": getattr(self.bot, "bot_id", None), "mode": self.mode}
+                "bot_id": getattr(self.bot, "bot_id", None), "mode": self.mode,
+                "account": _json_safe(account), "observed": _json_safe(self.observed),
+                "storage": _json_safe(self.storage.snapshot()) if self.storage else None}
 
     # --- загрузка ---
 
@@ -698,7 +714,12 @@ class LuaScript:
         for action in actions:
             if self.should_stop():
                 break
-            results.append(self.execute(action))
+            result = self.execute(action)
+            if isinstance(action, dict):
+                tag = action.get('tag')
+                if isinstance(tag, str) and 0 < len(tag) <= 64:
+                    result['tag'] = tag
+            results.append(result)
         return results
 
     # --- исполнение действий ---
@@ -719,7 +740,7 @@ class LuaScript:
             return {"kind": kind, "status": "skipped", "detail": detail}
 
         try:
-            if kind in MUTATING_ACTIONS and kind != "route_save":
+            if kind in MUTATING_ACTIONS and kind not in ("route_save", "store_set", "store_delete", "store_clear"):
                 session = getattr(self.api, "session", None)
                 if not session or not getattr(session, "connected", False):
                     raise LuaScriptError("нет подключения к серверу")
@@ -766,6 +787,12 @@ class LuaScript:
             elif kind == "after":
                 if self.schedule is None: raise LuaScriptError("таймеры не подключены")
                 self.schedule(float(action["sec"]), str(action["name"]), action.get("data") or {})
+            elif kind in ("timer_start", "timer_cancel"):
+                if self.named_timer_handler is None: raise LuaScriptError("именованные таймеры не подключены")
+                self.named_timer_handler(action)
+            elif kind in ("store_set", "store_delete", "store_clear"):
+                if self.storage is None: raise LuaScriptError("хранилище недоступно: нужны ник и сервер")
+                self.storage.apply(kind, action.get('key'), action.get('value'))
             elif kind == "tp":
                 self._api("DeltaTeleportTo", float(action["x"]), float(action["y"]),
                           float(action["z"]), abort_check=lambda: bool(self.sleep(0)))
@@ -845,6 +872,10 @@ class LuaScript:
         if kind == "sleep":
             try: return f"{float(action.get('sec') or 0):.2f} с"
             except (ValueError, TypeError): return repr(action.get('sec'))[:30]
+        if kind in ('timer_start', 'timer_cancel'):
+            return f"таймер {str(action.get('id') or '')[:64]} (данные скрыты)"
+        if kind in ('store_set', 'store_delete', 'store_clear'):
+            return 'данные хранилища скрыты'
         return repr(action)[:120]
 
     # --- подписка на события бота ---

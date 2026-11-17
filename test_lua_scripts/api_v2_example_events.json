@@ -1,0 +1,6 @@
+{
+  "events": [
+    {"at": 0.25, "name": "on_checkpoint", "args": {"x": 100, "y": 200, "z": 20, "radius": 2}},
+    {"at": 0.5, "name": "on_dialog", "args": {"id": 0, "style": 2, "title": "Меню игрока", "text": "{FFFFFF}1. Статистика\n2. Настройки", "button1": "Выбрать", "button2": "Назад"}}
+  ]
+}

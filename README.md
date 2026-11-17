@@ -137,6 +137,7 @@ python3 -m web.server
 
 - [Начало работы и состав сборки](START_RU.md)
 - [Команды, события и API Lua](LUA_GUIDE_RU.md)
+- [Lua API v2: таймеры, хранилище и примеры](docs/LUA_API_V2_RU.md)
 - [Управление через веб](RUCHNOE_UPRAVLENIE_WEB.md)
 - [ИИ-капча](AI_CAPTCHA.md)
 - [Отчёт о проверке сборки](OTCHET_PROVERKI.md)

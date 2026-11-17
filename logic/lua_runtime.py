@@ -2,6 +2,7 @@
 from __future__ import annotations
 import heapq
 import itertools
+import math
 import os
 import queue
 import threading
@@ -44,6 +45,7 @@ class LuaRuntime:
         self.events = queue.Queue(maxsize=MAX_EVENTS)
         self.stop_event = threading.Event()
         self._timers = []
+        self._named_timers = {}
         self._seq = itertools.count()
         self._subscriptions = []
         self._thread = None
@@ -60,6 +62,7 @@ class LuaRuntime:
                                 sleep=lambda n:self.stop_event.wait(n),
                                 should_stop=self.stop_event.is_set,
                                 captcha_handler=self.request_captcha, route_handler=self._route_action)
+        self.script.named_timer_handler = self._named_timer_action
 
     def _route_action(self, action):
         kind = action["kind"]
@@ -83,7 +86,37 @@ class LuaRuntime:
             raise LuaScriptError('некорректный таймер')
         if len(self._timers) >= MAX_TIMERS:
             raise LuaScriptError('слишком много таймеров')
-        heapq.heappush(self._timers, (time.monotonic()+seconds, next(self._seq), name, _json_safe(data)))
+        heapq.heappush(self._timers, (time.monotonic()+seconds, next(self._seq), name, _json_safe(data), None, None))
+
+    def _named_timer_action(self, action):
+        timer_id = action.get('id')
+        if not isinstance(timer_id, str) or not 1 <= len(timer_id) <= 64:
+            raise LuaScriptError('id таймера должен быть строкой длиной 1–64')
+        if action['kind'] == 'timer_cancel':
+            self._named_timers.pop(timer_id, None)
+            self._timers[:] = [item for item in self._timers if item[4] != timer_id]
+            heapq.heapify(self._timers)
+            return
+        try:
+            delay, repeat = float(action['sec']), float(action.get('repeat') or 0)
+        except (KeyError, TypeError, ValueError):
+            raise LuaScriptError('неверная задержка таймера')
+        event = action.get('name')
+        if not math.isfinite(delay) or not 0 <= delay <= 3600 or not math.isfinite(repeat) or (repeat != 0 and not .05 <= repeat <= 3600):
+            raise LuaScriptError('неверная задержка или интервал таймера')
+        if not isinstance(event, str) or not event.startswith('on_') or len(event) > 100:
+            raise LuaScriptError('имя события таймера должно начинаться с on_')
+        remaining = [item for item in self._timers if item[4] != timer_id]
+        if len(remaining) >= MAX_TIMERS:
+            raise LuaScriptError('слишком много таймеров')
+        self._timers[:] = remaining
+        heapq.heapify(self._timers)
+        generation = next(self._seq)
+        data = action.get('data', {})
+        timer = {'generation': generation, 'repeat': repeat, 'count': 0,
+                 'name': event, 'data': _json_safe(data)}
+        self._named_timers[timer_id] = timer
+        heapq.heappush(self._timers, (time.monotonic()+delay, next(self._seq), event, timer['data'], timer_id, generation))
 
     def _enqueue(self, name, payload):
         if self.stop_event.is_set(): return
@@ -194,6 +227,14 @@ class LuaRuntime:
         return self
 
     def _feed(self, name, data):
+        if name == 'on_dialog':
+            self.script.observed['dialog'] = _json_safe(data)
+        elif name == 'on_checkpoint':
+            self.script.observed['checkpoint'] = _json_safe(data)
+        elif name == 'on_checkpoint_clear':
+            self.script.observed['checkpoint'] = None
+        elif name in ('on_disconnect', 'on_connect'):
+            self.script.observed = {'dialog': None, 'checkpoint': None}
         self.script.route_status = self.route.report()
         results = self.script.feed(name, data)
         if name == 'on_route_point': self.route.point_pending = False
@@ -215,8 +256,20 @@ class LuaRuntime:
                     self.script.api = current_api
                 now = time.monotonic()
                 while self._timers and self._timers[0][0] <= now:
-                    _, _, name, data = heapq.heappop(self._timers)
-                    self._feed(name, data)
+                    _, _, name, data, timer_id, generation = heapq.heappop(self._timers)
+                    timer = self._named_timers.get(timer_id) if timer_id is not None else None
+                    if timer_id is None:
+                        self._feed(name, data)
+                    elif timer is not None and timer['generation'] == generation:
+                        timer['count'] += 1
+                        if not timer['repeat']: self._named_timers.pop(timer_id, None)
+                        self._feed(name, {'timer_id': timer_id, 'data': data, 'count': timer['count']})
+                        if timer['repeat'] and self._named_timers.get(timer_id) is timer and not self.stop_event.is_set():
+                            if len(self._timers) >= MAX_TIMERS:
+                                self._named_timers.pop(timer_id, None)
+                                self.log('[LUA] Повтор таймера отменён: достигнут предел таймеров.')
+                            else:
+                                heapq.heappush(self._timers, (time.monotonic()+timer['repeat'], next(self._seq), name, data, timer_id, generation))
                 if now >= next_tick:
                     self.route.tick()
                     self._feed('on_tick', {})

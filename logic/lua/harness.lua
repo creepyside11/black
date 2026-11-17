@@ -318,6 +318,7 @@ local br = {}
 br.null = json_null
 br.array = make_array
 br.version = '1'
+br.api_version = 2
 br.armed = false
 br.script = SCRIPT_PATH
 
@@ -464,6 +465,26 @@ br.after = function(seconds, name, data)
   end
   return emit_action({kind='after', sec=seconds, name=name, data=data or {}})
 end
+-- Именованный таймер заменяет таймер с тем же id. Интервал 0 = один раз.
+br.timer_start = function(id, seconds, event, data, interval)
+  if real_type(id) ~= 'string' or #id < 1 or #id > 64 or real_type(seconds) ~= 'number'
+     or seconds ~= seconds or seconds < 0 or seconds > 3600 then
+    push_log('timer_start: нужен id и задержка 0..3600'); return false
+  end
+  event = event or 'on_timer'
+  interval = interval or 0
+  if real_type(event) ~= 'string' or event:sub(1,3) ~= 'on_' or #event > 100
+     or real_type(interval) ~= 'number' or interval ~= interval
+     or (interval ~= 0 and (interval < 0.05 or interval > 3600)) then
+    push_log('timer_start: неверное событие или период'); return false
+  end
+  if data == nil then data={} end
+  return emit_action({kind='timer_start', id=id, sec=seconds, name=event, data=data, ['repeat']=interval})
+end
+br.timer_cancel = function(id)
+  if real_type(id) ~= 'string' or #id < 1 or #id > 64 then return false end
+  return emit_action({kind='timer_cancel', id=id})
+end
 -- Асинхронный контроллер маршрутов; события приходят отдельно.
 br.route_start = function(name, mode, options)
   if real_type(name) ~= 'string' or (options ~= nil and real_type(options) ~= 'table') then
@@ -498,6 +519,27 @@ br.setting = function(key, default)
   if value == nil or value == json_null then return default end
   return value
 end
+br.storage_get = function(key, default)
+  local value=snapshot.storage
+  if real_type(key) ~= 'string' or real_type(value) ~= 'table' or value == json_null then return default end
+  if value[key] == nil then return default end
+  return value[key]
+end
+br.storage_all = function()
+  if real_type(snapshot.storage) ~= 'table' or snapshot.storage == json_null then return nil end
+  local copy={}
+  for key,value in real_pairs(snapshot.storage) do copy[key]=value end
+  return copy
+end
+br.storage_set = function(key, value)
+  if real_type(key) ~= 'string' or #key < 1 or #key > 64 or value == nil then return false end
+  return emit_action({kind='store_set',key=key,value=value})
+end
+br.storage_delete = function(key)
+  if real_type(key) ~= 'string' or #key < 1 or #key > 64 then return false end
+  return emit_action({kind='store_delete',key=key})
+end
+br.storage_clear = function() return emit_action({kind='store_clear'}) end
 br.connected = function() return snapshot.connected == true end
 local function optional(value)
   if value == json_null then return nil end
@@ -509,6 +551,122 @@ br.money = function() return optional(snapshot.money) end
 br.interior = function() return optional(snapshot.interior) end
 br.mode = function() return optional(snapshot.mode) end
 br.bot_id = function() return optional(snapshot.bot_id) end
+br.account = function()
+  local value = snapshot.account
+  if real_type(value) ~= 'table' or value == json_null then return nil end
+  return {nickname=optional(value.nickname), server=optional(value.server),
+          status=optional(value.status), level=optional(value.level),
+          target_level=optional(value.target_level)}
+end
+br.last_dialog = function()
+  local observations=snapshot.observed
+  if real_type(observations) ~= 'table' then return nil end
+  local dialog=optional(observations.dialog)
+  if real_type(dialog) ~= 'table' then return nil end
+  return {id=dialog.id, style=dialog.style, title=dialog.title, text=dialog.text,
+          button1=dialog.button1, button2=dialog.button2}
+end
+br.checkpoint = function()
+  local observations=snapshot.observed
+  if real_type(observations) ~= 'table' then return nil end
+  local point=optional(observations.checkpoint)
+  if real_type(point) ~= 'table' then return nil end
+  return {x=point.x,y=point.y,z=point.z,radius=point.radius}
+end
+
+-- Вспомогательные функции ничего не отправляют серверу.
+br.strip_colors = function(text)
+  return (real_tostring(text or ''):gsub('{%x%x%x%x%x%x}', ''))
+end
+br.lower = function(text)
+  local upper={'А','Б','В','Г','Д','Е','Ё','Ж','З','И','Й','К','Л','М','Н','О','П','Р','С','Т','У','Ф','Х','Ц','Ч','Ш','Щ','Ъ','Ы','Ь','Э','Ю','Я'}
+  local lower={'а','б','в','г','д','е','ё','ж','з','и','й','к','л','м','н','о','п','р','с','т','у','ф','х','ц','ч','ш','щ','ъ','ы','ь','э','ю','я'}
+  local s=real_tostring(text or '')
+  for i=1,#upper do s=s:gsub(upper[i],lower[i]) end
+  return s:lower()
+end
+br.contains = function(text, needle, ignore_case)
+  if real_type(text) ~= 'string' or real_type(needle) ~= 'string' then return false end
+  if ignore_case then text,needle=br.lower(text),br.lower(needle) end
+  return text:find(needle,1,true) ~= nil
+end
+br.dialog_rows = function(text, style)
+  local rows = {}
+  local index = 0
+  local header = as_number(style) == 5
+  for raw in real_tostring(text or ''):gmatch('[^\r\n]+') do
+    if raw:match('%S') then
+      if header then header=false else
+        local clean=br.strip_colors(raw):gsub('^%s*%d+%s*[%.%)%-%:]%s*','')
+        rows[#rows+1]={index=index, text=clean, raw=raw}
+        index=index+1
+      end
+    end
+  end
+  return rows
+end
+br.find_dialog_row = function(text, needle, style, ignore_case)
+  for _, row in real_ipairs(br.dialog_rows(text, style)) do
+    if br.contains(row.text, needle, ignore_case) then return row.index, row.text end
+  end
+  return nil
+end
+local function finite(n)
+  return n ~= nil and n == n and n ~= math.huge and n ~= -math.huge
+end
+local function coords(point)
+  if real_type(point) ~= 'table' then return nil end
+  local x,y,z=as_number(point.x),as_number(point.y),as_number(point.z)
+  if not (finite(x) and finite(y) and finite(z)) then return nil end
+  return x,y,z
+end
+br.distance = function(a,b)
+  local ax,ay,az=coords(a); local bx,by,bz=coords(b)
+  if not (ax and bx) then return nil end
+  return math.sqrt((ax-bx)^2+(ay-by)^2+(az-bz)^2)
+end
+br.distance2d = function(a,b)
+  if real_type(a) ~= 'table' or real_type(b) ~= 'table' then return nil end
+  local ax,ay,bx,by=as_number(a.x),as_number(a.y),as_number(b.x),as_number(b.y)
+  if not (finite(ax) and finite(ay) and finite(bx) and finite(by)) then return nil end
+  return math.sqrt((ax-bx)^2+(ay-by)^2)
+end
+br.in_radius = function(a,b,radius)
+  local d,r=br.distance(a,b),as_number(radius)
+  return d ~= nil and finite(r) and r >= 0 and d <= r
+end
+br.hex_encode = function(value)
+  if real_type(value) ~= 'string' or #value > 2048 then return nil end
+  return (value:gsub('.', function(c) return string.format('%02x', string.byte(c)) end))
+end
+br.hex_decode = function(value)
+  if real_type(value) ~= 'string' or #value > 4096 or #value % 2 ~= 0 or value:find('[^0-9a-fA-F]') then return nil end
+  return (value:gsub('%x%x', function(pair) return string.char(real_tonumber(pair,16)) end))
+end
+br.json_encode = function(value)
+  local ok,result=real_pcall(json.encode,value)
+  if not ok or #result > 16384 then return nil, 'не удалось закодировать JSON или превышен лимит' end
+  return result
+end
+br.json_decode = function(value)
+  if real_type(value) ~= 'string' or #value > 16384 then return nil, 'нужен JSON до 16 КиБ' end
+  local result,stop=json.decode(value)
+  if result == nil then return nil,stop end
+  if skip_space(value,stop) <= #value then return nil,'лишние данные после JSON' end
+  return result
+end
+br.command = function(value)
+  if real_type(value) ~= 'string' or value:sub(1,1) ~= '/' or #value > 255 then return false end
+  return br.chat(value)
+end
+br.request = function(action, tag)
+  if real_type(action) ~= 'table' or real_type(action.kind) ~= 'string'
+     or real_type(tag) ~= 'string' or #tag < 1 or #tag > 64 then return false end
+  local copy={}
+  for key,value in real_pairs(action) do copy[key]=value end
+  copy.tag=tag
+  return emit_action(copy)
+end
 br.event = function(name, fn)
   if real_type(name) ~= 'string' or real_type(fn) ~= 'function' then return false end
   handlers[name] = fn

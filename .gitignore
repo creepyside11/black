@@ -74,3 +74,7 @@ _run_murmansk_loop.sh
 /accounts.local.json
 /accounts_arz.json
 /proxies_pool.json
+
+# Per-account Lua state, never commit user data
+/lua_data/
+
