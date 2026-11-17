@@ -4,6 +4,7 @@ import math
 import os
 import re
 import html
+import io
 import telebot
 from telebot import types
 from ai_controller import AICommander, load_ai_config, save_ai_config
@@ -241,6 +242,44 @@ class TelegramBotController:
 
     def _lua_admin(self, user_id, chat):
         return bool(self.admin_ids) and user_id in self.admin_ids and getattr(chat, "type", "") == "private" and getattr(chat, "id", None) == user_id
+
+    def _start_proxy_batch(self, chat_id, content):
+        from logic import proxy_batch_check as checker
+        try:
+            nodes = checker.parse_proxies(content)
+        except ValueError as exc:
+            self.bot.send_message(chat_id, html.escape(str(exc)))
+            return False
+        if not checker.CHECK_LOCK.acquire(blocking=False):
+            self.bot.send_message(chat_id, 'Уже выполняется другая массовая проверка. Подождите её завершения.')
+            return False
+        workers = min(checker.worker_count(), len(nodes))
+        def run():
+            try:
+                self.bot.send_message(chat_id, f'Проверяю {len(nodes)} прокси; одновременно до {workers}. Это может увеличить нагрузку VPS.')
+                rows = checker.check_many(nodes, workers=workers)
+                tcp = [n.proxy_url() for n, ok, udp in rows if ok]
+                udp = [n.proxy_url() for n, ok, confirmed in rows if ok and confirmed]
+                self.bot.send_message(chat_id, f'Проверено: {len(rows)}. TCP подтверждён: {len(tcp)}; UDP подтверждён: {len(udp)}. UDP без ответа не обязательно означает, что он не поддерживается.')
+                for filename, lines, label in [('proxy_tcp.txt', tcp, 'TCP'), ('proxy_udp.txt', udp, 'TCP и UDP')]:
+                    if not lines:
+                        continue
+                    document = io.BytesIO(('\n'.join(lines) + '\n').encode('utf-8'))
+                    document.name = filename
+                    try:
+                        self.bot.send_document(chat_id, document, caption=f'{label}: {len(lines)}. Доступность может измениться.')
+                    finally:
+                        document.close()
+            except Exception:
+                self.bot.send_message(chat_id, 'Не удалось завершить массовую проверку или отправить результаты.')
+            finally:
+                checker.CHECK_LOCK.release()
+        try:
+            threading.Thread(target=run, daemon=True, name='proxy-batch-check').start()
+        except Exception:
+            checker.CHECK_LOCK.release()
+            raise
+        return True
 
     def _lua_files_menu(self, chat_id, context, *, bid=None, page=1):
         from logic.lua_runtime import list_scripts
@@ -1305,6 +1344,7 @@ class TelegramBotController:
 
         markup.add(types.InlineKeyboardButton("🔗 Добавить VPN-подписку", callback_data="vpn_add_sub", style="success"))
         markup.add(types.InlineKeyboardButton("🔌 Добавить локальный прокси", callback_data="vpn_add_local", style="success"))
+        markup.add(types.InlineKeyboardButton("🔎 Массовая проверка SOCKS5", callback_data="proxy_batch", style="primary"))
         markup.add(types.InlineKeyboardButton("⬅️ Назад в меню", callback_data="page:1", style="primary"))
 
         if message_id is None:
@@ -2311,6 +2351,14 @@ class TelegramBotController:
                 threading.Thread(target=pool.refresh, daemon=True).start()
                 self._render_vpn_menu(chat_id, message_id, call.id, quiet=True)
 
+            elif data == 'proxy_batch':
+                if not self._lua_admin(call.from_user.id, call.message.chat):
+                    self.bot.answer_callback_query(call.id, 'Нужен личный чат и заданный ID администратора.', show_alert=True)
+                    return
+                self.user_states[chat_id] = {'action': 'proxy_batch_input'}
+                self.bot.answer_callback_query(call.id)
+                self.bot.send_message(chat_id, 'Пришлите TXT или список SOCKS5: один публичный IPv4:порт в строке, можно socks5://логин:пароль@IP:порт. До 20 000 адресов и 2 МиБ. Отмена: /cancel. Проверка использует сеть VPS, но не меняет прокси аккаунтов.')
+
             elif data == "vpn_add_sub":
                 self.user_states[chat_id] = {"action": "add_vpn_sub"}
                 self.bot.send_message(
@@ -2453,6 +2501,26 @@ class TelegramBotController:
         def handle_lua_document(message):
             if not self._lua_admin(message.from_user.id, message.chat): return
             state=self.user_states.get(message.chat.id) or {}
+            if state.get('action') == 'proxy_batch_input':
+                from logic.proxy_batch_check import MAX_INPUT_BYTES
+                doc = getattr(message, 'document', None)
+                if not doc or not (getattr(doc, 'file_name', '') or '').lower().endswith('.txt') or not getattr(doc, 'file_size', 0) or doc.file_size > MAX_INPUT_BYTES:
+                    self.bot.reply_to(message, 'Пришлите TXT размером до 2 МиБ.')
+                    return
+                try:
+                    info = self.bot.get_file(doc.file_id)
+                    if getattr(info, 'file_size', None) is not None and info.file_size > MAX_INPUT_BYTES: raise ValueError()
+                    raw = self.bot.download_file(info.file_path)
+                    if len(raw) > MAX_INPUT_BYTES: raise ValueError()
+                    content = raw.decode('utf-8-sig')
+                except (ValueError, UnicodeError):
+                    self.bot.reply_to(message, 'Не удалось прочитать TXT в UTF-8 или файл слишком большой.')
+                    return
+                except Exception:
+                    self.bot.reply_to(message, 'Не удалось загрузить TXT. Попробуйте снова.')
+                    return
+                if self._start_proxy_batch(message.chat.id, content): self.user_states.pop(message.chat.id, None)
+                return
             if state.get('action')!='lua_upload': return
             from logic.lua_telegram import MAX_SCRIPT_BYTES, NAME, store_script
             doc=message.document
@@ -2484,6 +2552,10 @@ class TelegramBotController:
                 return
 
             action = state.get("action")
+            if action == 'proxy_batch_input':
+                if not self._lua_admin(message.from_user.id, message.chat): return
+                if self._start_proxy_batch(message.chat.id, message.text or ''): self.user_states.pop(message.chat.id, None)
+                return
             if action == "batch_count":
                 # Шаг 2: количество. Старую однострочную форму убрали —
                 # с телефона помнить порядок полей и точное имя сервера
