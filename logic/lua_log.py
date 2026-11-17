@@ -32,3 +32,26 @@ def sink(bot):
             lua_logs.append(formatted if isinstance(formatted, str) else clean)
         logger.info(clean)
     return write
+
+
+def read_log(account, *, limit=4*1024*1024):
+    """Read a bounded tail, oldest rotation first, without following symlinks."""
+    import stat
+    account=int(account)
+    if account < 0: raise ValueError('invalid account')
+    chunks=[]
+    for suffix in ('.3','.2','.1',''):
+        path=os.path.join(LOG_DIR,f'account_{account}.log{suffix}')
+        flags=os.O_RDONLY | getattr(os,'O_NOFOLLOW',0)
+        try:
+            fd=os.open(path,flags)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):continue
+                with os.fdopen(fd,'rb',closefd=False) as source:
+                    source.seek(0,os.SEEK_END);size=source.tell()
+                    source.seek(max(0,size-limit));chunks.append(source.read(limit))
+            finally:os.close(fd)
+        except OSError:continue
+    result=b''.join(chunks)[-limit:]
+    if result and len(result)>=limit and b'\n' in result: result=result.split(b'\n',1)[1]
+    return result.decode('utf-8','replace')

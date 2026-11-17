@@ -41,3 +41,34 @@ def prepare_runtime(bot, name, mode='bot'):
         runtime.stop();bot.lua_runtime=None;bot.lua_spawn_control=False;bot.lua_ui_control=False
         raise
     return runtime
+
+
+def _deletion_snapshot_locked(name, manager):
+    """Refuse symlinks and scripts assigned to any live or future bot."""
+    from pathlib import Path
+    import stat
+    if not isinstance(name,str) or not NAME.fullmatch(name) or '..' in name:
+        raise ValueError('Недопустимое имя файла.')
+    root=Path(lua_runtime.SCRIPT_DIR)
+    if root.is_symlink(): raise ValueError('Каталог скриптов недоступен.')
+    path=root/name
+    try: info=path.lstat()
+    except OSError: raise ValueError('Файл больше не существует.')
+    if not stat.S_ISREG(info.st_mode):raise ValueError('Удалять можно только обычный файл.')
+    for bot in manager.bots.values():
+        runtime=getattr(bot,'lua_runtime',None)
+        if (getattr(bot,'default_task_name','') or '') == 'lua:'+name or (runtime and os.path.abspath(str(getattr(runtime,'path',''))) == os.path.abspath(str(path))):
+            raise ValueError('Файл назначен аккаунту или запущен. Сначала снимите задачу и остановите Lua.')
+    return (info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns)
+
+
+def deletion_snapshot(name, manager):
+    with manager._lock:
+        return _deletion_snapshot_locked(name, manager)
+
+
+def delete_script(name, expected, manager):
+    with manager._lock:
+        actual=_deletion_snapshot_locked(name, manager)
+        if tuple(expected) != actual: raise ValueError('Файл изменился. Выберите его заново.')
+        os.unlink(os.path.join(lua_runtime.SCRIPT_DIR,name))

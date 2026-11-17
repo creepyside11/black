@@ -516,6 +516,10 @@ class BotInstance:
         self._quest_helpers = None
         self.target_achieved = False
         self.last_stats_check = 0.0
+        self.stats_enabled = True
+        self.stats_interval_override = 0
+        self.auto_reconnect = True
+        self.reconnect_min_delay = 0
         # Когда в следующий раз спрашивать /mm. Ноль означает «ещё не
         # назначали» — тогда первый опрос ставится на вход в игру.
         self.stats_next_at = 0.0
@@ -1204,7 +1208,8 @@ class BotInstance:
         """Период опроса статистики с разбросом."""
         import random as _random
 
-        return _random.uniform(*self.STATS_INTERVAL)
+        override = getattr(self, 'stats_interval_override', 0)
+        return float(override) if override else _random.uniform(*self.STATS_INTERVAL)
 
     def arm_stats(self) -> None:
         """Назначить первый опрос /mm на потом, а не на сейчас.
@@ -1226,7 +1231,7 @@ class BotInstance:
         который первым делом лезет в настройки безопасности, — это и есть
         тот признак, за который античит кикает кодом 25.
         """
-        if self.stopping or self.is_banned:
+        if self.stopping or self.is_banned or not getattr(self, 'stats_enabled', True):
             return
         if not (self.session and self.session.connected):
             return
@@ -1275,6 +1280,11 @@ class BotInstance:
             if self.stopping or self.is_banned:
                 return
 
+            if not getattr(self, 'auto_reconnect', True):
+                self.status = 'Отключен (автовход выключен)'
+                self.add_log('Автоматический повтор входа отключён в настройках аккаунта.')
+                return
+
             # Реконнект уже запланирован обработчиком кика/дисконнекта —
             # второй таймер не нужен, иначе попытки считаются дважды.
             if self.reconnect_thread and self.reconnect_thread.is_alive():
@@ -1310,8 +1320,9 @@ class BotInstance:
                 self.schedule_reconnect(delay=10.0)
 
     def schedule_reconnect(self, delay: float = 10.0, force: bool = False):
-        if self.stopping or self.is_banned:
+        if self.stopping or self.is_banned or not getattr(self, 'auto_reconnect', True):
             return
+        delay = max(delay, getattr(self, 'reconnect_min_delay', 0))
 
         # Кик и дисконнект на один обрыв приходят парой, плюс _run может
         # успеть следом. Флаг ставим синхронно под локом — поток мог ещё
@@ -1364,7 +1375,7 @@ class BotInstance:
             nonlocal target_time
             try:
                 while time.time() < target_time:
-                    if self.reconnect_cancel_event.is_set() or self.stopping or self.is_banned:
+                    if self.reconnect_cancel_event.is_set() or self.stopping or self.is_banned or not getattr(self, 'auto_reconnect', True):
                         return
                     # Парковку могли продлить уже после старта таймера.
                     try:
@@ -1381,7 +1392,7 @@ class BotInstance:
                         self.status = f"Ожидание ({m:02d}:{s:02d})"
                     time.sleep(1.0)
 
-                if self.reconnect_cancel_event.is_set() or self.stopping or self.is_banned:
+                if self.reconnect_cancel_event.is_set() or self.stopping or self.is_banned or not getattr(self, 'auto_reconnect', True):
                     return
 
                 # Парковка кончилась — значит адрес могли уже разбанить или
@@ -2024,7 +2035,7 @@ class BotManager:
                     with self._lock:
                         for bid, b in self.bots.items():
                             # Автоматический перезапуск упавших активных ботов
-                            if not b.is_banned and not b.stopping:
+                            if not b.is_banned and not b.stopping and getattr(b, 'auto_reconnect', True):
                                 # Намеренная пауза (почасовой цикл payday) —
                                 # не поднимаем раньше срока, иначе бот вернётся
                                 # в игру вне своего окна и словит payday мимо.
@@ -2434,6 +2445,10 @@ class BotManager:
                 if b.stopping:
                     b.status = "Отключен"
                     return
+                if not getattr(b, 'auto_reconnect', True):
+                    b.status = 'Отключен (автовход выключен)'
+                    b.add_log('Автоматический повтор входа отключён в настройках аккаунта.')
+                    return
 
                 # Уже в очереди на переполненный сервер — таймер уже идёт
                 if b.queue_mode:
@@ -2796,6 +2811,12 @@ class BotManager:
                     b.level_str = saved_lvl
                     b.money = saved_money
                     b.target_lvl = saved_target_lvl
+                    b.stats_enabled = item.get('stats_enabled', True) is not False
+                    raw_interval = item.get('stats_interval_override', 0)
+                    b.stats_interval_override = raw_interval if type(raw_interval) is int and raw_interval in (0, 300, 900, 1800, 3600) else 0
+                    b.auto_reconnect = item.get('auto_reconnect', True) is not False
+                    raw_delay = item.get('reconnect_min_delay', 0)
+                    b.reconnect_min_delay = raw_delay if type(raw_delay) is int and raw_delay in (0, 30, 60, 120) else 0
                     self.bots[bot_id] = b
                     if self.active_bot_id is None:
                         self.active_bot_id = bot_id
@@ -2899,6 +2920,10 @@ class BotManager:
                     "lvl": b.level_str,
                     "money": b.money,
                     "target_lvl": b.target_lvl,
+                    "stats_enabled": getattr(b, 'stats_enabled', True),
+                    "stats_interval_override": getattr(b, 'stats_interval_override', 0),
+                    "auto_reconnect": getattr(b, 'auto_reconnect', True),
+                    "reconnect_min_delay": getattr(b, 'reconnect_min_delay', 0),
                     # Парковка при бане адреса: без неё после перезапуска бот
                     # снова долбится в закрытый IP и ловит лимит частых входов.
                     "parked_until": getattr(b, "parked_until", 0.0) or 0.0,
@@ -5062,3 +5087,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
