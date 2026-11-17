@@ -578,6 +578,20 @@ def apply_rpc_profile(project: Project | None = None, *, log=None) -> dict:
     project = project or active_project()
     path = project.rpc_profile_path
     report: dict = {"project": project.key, "path": path, "applied": {}}
+    # Пустой или отсутствующий профиль тоже означает переход к исходным
+    # значениям. Ранний return прежде оставлял профиль предыдущего проекта.
+    global _raknet_options
+    with _lock:
+        _raknet_options = {}
+    try:
+        from samp import constants as constants_mod
+    except Exception as exc:
+        report["error"] = f"{exc!r}"
+        return report
+    for cls_name in ("RPC", "InterfaceID", "PacketID"):
+        target = getattr(constants_mod, cls_name, None)
+        if target is not None:
+            _restore_defaults(cls_name, target)
     if not path or not os.path.exists(path):
         return report
     try:
@@ -624,7 +638,6 @@ def apply_rpc_profile(project: Project | None = None, *, log=None) -> dict:
     # magic у разных сборок разные, и если замер показал не 5/без magic —
     # это правится файлом, а не кодом. Нет секции — настройки сбрасываются:
     # иначе после Arizona они остались бы в силе на Black Russia.
-    global _raknet_options
     options = data.get("raknet")
     clean: dict = {}
     if isinstance(options, dict):

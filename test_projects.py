@@ -166,6 +166,31 @@ class ProfileTests(unittest.TestCase):
         projects_mod.apply_rpc_profile(projects_mod.get_project("br"))
         self.assertEqual(projects_mod.raknet_options(), {})
 
+    def test_missing_profile_resets_previous_project_values(self):
+        from dataclasses import replace
+        from samp import constants
+        original = constants.RPC.CHAT
+        projects_mod.apply_rpc_profile(projects_mod.get_project("arz"))
+        self.assertEqual(constants.RPC.CHAT, 25)
+        missing = replace(projects_mod.get_project("br"), rpc_profile="")
+        projects_mod.apply_rpc_profile(missing)
+        self.assertEqual(constants.RPC.CHAT, original)
+        self.assertEqual(projects_mod.raknet_options(), {})
+
+    def test_invalid_profile_resets_previous_project_values(self):
+        from dataclasses import replace
+        from samp import constants
+        original = constants.RPC.CHAT
+        projects_mod.apply_rpc_profile(projects_mod.get_project("arz"))
+        bad_path = os.path.join(self._dir, "broken.json")
+        with open(bad_path, "w", encoding="utf-8") as fh:
+            fh.write("{")
+        invalid = replace(projects_mod.get_project("br"), rpc_profile=bad_path)
+        report = projects_mod.apply_rpc_profile(invalid)
+        self.assertIn("error", report)
+        self.assertEqual(constants.RPC.CHAT, original)
+        self.assertEqual(projects_mod.raknet_options(), {})
+
     def test_unknown_names_are_ignored(self):
         path = self._arz
         with open(path, "w", encoding="utf-8") as fh:
