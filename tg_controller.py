@@ -1228,7 +1228,7 @@ class TelegramBotController:
                     lines.append("")
                     lines.append(f"<i>Страница {vpn_page} из {pages}</i>")
                 lines.append("")
-                lines.append("🟢 рабочий · 🟡 нужен клиент · 🔴 мёртвый · ⛔️ забанен")
+                lines.append("🟢 рабочий · 🟡 не готов (причина под узлом) · 🔴 недоступен · ⛔️ забанен")
                 # Без моста узлы vless/vmess/trojan/ss применить некуда:
                 # бот умеет только SOCKS5. Говорим прямо, что сделать.
                 bridge = getattr(pool, "bridge", None)

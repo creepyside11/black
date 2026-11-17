@@ -38,7 +38,7 @@ PORT_SPAN = 4000
 
 STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "_vpn_bridge")
 
-BINARY_CANDIDATES = ("sing-box", "/usr/local/bin/sing-box", "/usr/bin/sing-box",
+BINARY_CANDIDATES = ("sing-box", "/opt/rakcrmp-black-runtime/sing-box", "/usr/local/bin/sing-box", "/usr/bin/sing-box",
                      "/opt/sing-box/sing-box")
 
 # Резолверы для самого sing-box.
@@ -71,7 +71,7 @@ def find_binary() -> str | None:
             return path
     for cand in BINARY_CANDIDATES:
         path = shutil.which(cand) if "/" not in cand else (cand if os.path.exists(cand) else None)
-        if path:
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
             return path
     return None
 
@@ -638,7 +638,7 @@ class VpnBridge:
                 pass
 
     def available(self) -> bool:
-        if not self.binary:
+        if not self.binary or not os.path.isfile(self.binary) or not os.access(self.binary, os.X_OK):
             self.binary = find_binary()
         return bool(self.binary and os.path.isfile(self.binary) and os.access(self.binary, os.X_OK))
 

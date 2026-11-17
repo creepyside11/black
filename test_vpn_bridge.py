@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from logic import vpn_bridge as B
 
@@ -170,6 +171,19 @@ class NoBinaryTests(unittest.TestCase):
 
     def test_running_empty(self):
         self.assertEqual(B.VpnBridge(binary="/nonexistent/x").running(), [])
+
+    def test_finds_runtime_installed_after_start_without_restart(self):
+        with tempfile.TemporaryDirectory() as folder:
+            binary = os.path.join(folder, 'sing-box')
+            with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(B, 'BINARY_CANDIDATES', (binary,)):
+                bridge = B.VpnBridge(state_dir=folder)
+                self.assertFalse(bridge.available())
+                with open(binary, 'w') as f: f.write('#!/bin/sh\nexit 0\n')
+                os.chmod(binary, 0o755)
+                self.assertTrue(bridge.available())
+                self.assertEqual(bridge.binary, binary)
+                os.chmod(binary, 0o644)
+                self.assertFalse(bridge.available())
 
 
 if __name__ == "__main__":
