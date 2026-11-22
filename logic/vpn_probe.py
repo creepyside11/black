@@ -73,6 +73,17 @@ TCP_PROBE_PORT = 80
 # достаточно как признака «этот выход до игры дотягивается».
 GAME_TARGET_HOST = "80.66.82.20"
 GAME_TARGET_PORT = 80
+
+# Порт, на котором сервер игры слушает RakNet. TCP на GAME_TARGET_PORT (80)
+# отвечает через любой узел — это обычный nginx, — поэтому проверка по нему
+# пропускала узлы, которые не везут ни одного игрового байта. Заходить
+# через такой узел нельзя: бот пишет «сервер не ответил на подключение».
+GAME_UDP_PORT = 5125
+
+# Первый пакет входа Black Russia: id 0x04 и маркер BR. Живой сервер
+# отвечает на него пакетом 0x07. Голое b"BR" он игнорирует.
+GAME_UDP_PACKET = b"\x04BR"
+GAME_UDP_REPLY_ID = 0x07
 GAME_TIMEOUT = 6.0
 
 STATUS_OK = "ok"
@@ -316,6 +327,7 @@ def verify_socks5(
     check_udp: bool = True,
     game_host: str = "",
     game_port: int = GAME_TARGET_PORT,
+    game_udp_port: int = GAME_UDP_PORT,
     report: dict | None = None,
 ) -> tuple[bool, bool, str, float | None]:
     """Сквозная проверка SOCKS5: TCP до цели и UDP через STUN.
@@ -412,8 +424,92 @@ def verify_socks5(
         if not reachable:
             return True, False, why, latency
 
+        # HTTP по TCP прошёл — но игровой трафик идёт по UDP на свой порт,
+        # и узел может везти один, не везя второй. Без этой проверки в
+        # раздачу попадали узлы, через которые бот не входит вообще.
+        reachable, why = _game_udp_reachable(
+            host, port, login=login, password=password,
+            game_host=game_host, game_port=game_udp_port, timeout=timeout,
+        )
+        if not reachable:
+            return True, False, why, latency
+
     return True, True, f"выход {external}", latency
 
+
+def _socks_udp_payload(data: bytes) -> bytes:
+    """Тело UDP-ответа без SOCKS5-заголовка."""
+    if len(data) < 5:
+        return b""
+    atyp = data[3]
+    if atyp == 0x01:
+        offset = 10
+    elif atyp == 0x04:
+        offset = 22
+    elif atyp == 0x03:
+        offset = 7 + data[4]
+    else:
+        return b""
+    if offset > len(data):
+        return b""
+    return data[offset:]
+
+def _game_udp_reachable(host, port, *, login="", password="", game_host="",
+                        game_port=GAME_UDP_PORT, timeout=GAME_TIMEOUT,
+                        attempts: int = 3):
+    """Отвечает ли игра на RakNet-хендшейк через этот узел.
+
+    Отдельно от `_game_reachable`: там HTTP по TCP, и он проходит даже
+    через узлы, которые игровые датаграммы не везут. Игра же живёт на UDP,
+    поэтому спрашиваем её тем же пакетом, каким начинает бот, и ждём
+    ответ 0x07. Возвращает (дошло, причина).
+    """
+    if not game_host:
+        return True, ""
+
+    ctrl = None
+    udp = None
+    try:
+        try:
+            target_ip = socket.gethostbyname(game_host)
+        except OSError:
+            return False, "игра: имя сервера не разрешилось"
+
+        ctrl = socket.create_connection((host, int(port)), timeout=timeout)
+        ctrl.settimeout(timeout)
+        if not _socks5_handshake(ctrl, login, password):
+            return False, "игра: отказ авторизации"
+        relay = _socks5_udp_associate(ctrl)
+        if relay is None:
+            return False, "игра: UDP ASSOCIATE не поддерживается"
+
+        udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        udp.settimeout(timeout)
+        header = (
+            b"\x00\x00\x00\x01" + socket.inet_aton(target_ip)
+            + struct.pack(">H", int(game_port))
+        )
+        # UDP теряет пакеты, поэтому несколько попыток: одиночная давала
+        # ложный отказ на живом узле.
+        for _ in range(max(1, int(attempts))):
+            try:
+                udp.sendto(header + GAME_UDP_PACKET, relay)
+                data, _ = udp.recvfrom(2048)
+            except OSError:
+                continue
+            body = _socks_udp_payload(data)
+            if body and body[0] == GAME_UDP_REPLY_ID:
+                return True, ""
+        return False, "игра не отвечает по UDP через этот узел"
+    except OSError as exc:
+        return False, f"игра: {type(exc).__name__}"
+    finally:
+        for item in (udp, ctrl):
+            if item is not None:
+                try:
+                    item.close()
+                except OSError:
+                    pass
 
 def _game_reachable(host, port, *, login="", password="", game_host="",
                     game_port=GAME_TARGET_PORT, timeout=GAME_TIMEOUT):
@@ -603,6 +699,7 @@ def probe_node(
     check_udp: bool = True,
     game_host: str = "",
     game_port: int = GAME_TARGET_PORT,
+    game_udp_port: int = GAME_UDP_PORT,
 ) -> ProbeResult:
     """Проверить один узел."""
     result = ProbeResult(node=node, checked_at=time.time())
@@ -630,6 +727,7 @@ def probe_node(
             check_udp=check_udp,
             game_host=game_host,
             game_port=game_port,
+            game_udp_port=game_udp_port,
             report=report,
         )
         result.alive = alive
