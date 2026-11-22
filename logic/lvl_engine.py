@@ -8,13 +8,20 @@
    отдаёт координаты и чат сразу, а в player stream не пускает, пока не
    уйдёт финальный Spawn.
 2. Сказать в лог, на каком вокзале бот оказался.
-3. Выдержать минуту после спавна: сервер только что высадил персонажа.
-4. Включить бессмертие от голода, чтобы HP не проседало до PayDay.
-5. Взять точку для этого вокзала. На вокзал до трёх точек, выбор
+3. Выдержать паузу после спавна: сервер только что высадил персонажа.
+   Пауза каждый раз разная — одинаковые 60.0 с у всех аккаунтов выдают
+   их уже самим совпадением.
+4. Взять точку для этого вокзала. На вокзал до трёх точек, выбор
    случайный и без повтора — десяток аккаунтов не встаёт в одну клетку.
-6. Перейти на точку delta-методом на 8 м/с: шаг в пакете равен
-   speed * interval, античит видит бег, а не прыжок.
-7. Прописать /bg.
+5. Перейти на точку delta-методом: шаг в пакете равен speed * interval,
+   античит видит бег, а не прыжок. Скорость берётся из TRAVEL_SPEED_RANGE
+   и не превышает потолок, который сервер считает честным.
+6. Прописать /bg.
+
+Бессмертия здесь нет намеренно. Держать HP на сотне круглосуточно — это
+ровная константа, которой у живого игрока не бывает: голод, урон и
+восстановление дают колебания. Такой признак копится и приводит к бану
+не сразу, а через несколько часов — у каждого аккаунта в свой момент.
 
 Координаты лежат в logic/lvl_targets.json. Для вокзала без точек движок
 честно сообщает об этом и остаётся на вокзале: в ноль он не телепортируется.
@@ -33,6 +40,10 @@ TARGETS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lvl_tar
 
 # Сколько ждать после спавна перед переходом на точку.
 SPAWN_DELAY = 60.0
+# Разброс паузы. Пятнадцать ботов, выходящих на точку ровно через 60.0 с
+# после спавна, выдают себя уже самим совпадением — у живых игроков так не
+# бывает. Каждому заходу достаётся своё значение из диапазона.
+SPAWN_DELAY_RANGE = (52.0, 78.0)
 # Сколько ждать подтверждения мира по стриму игроков.
 WORLD_TIMEOUT = 40.0
 # Команда после прибытия.
@@ -43,10 +54,36 @@ ARRIVAL_COMMAND = "/bg"
 # Раньше здесь был pause_warp кусками по 45 м с паузой 0.4 с — это 112 м/с,
 # сервер такие прыжки откатывал, и бот оставался на вокзале.
 TRAVEL_SPEED = 8.0
+# Рабочий диапазон скорости. Ровные 8.0 м/с на всём пути — тоже признак:
+# живой игрок то ускоряется, то сбрасывает. Потолок не превышаем.
+TRAVEL_SPEED_RANGE = (6.6, 8.0)
 TRAVEL_INTERVAL = 0.02
+# Небольшое дрожание шага. Без него линия пути идеально прямая.
+TRAVEL_JITTER = 0.12
 
 # Прибытие считается состоявшимся в этих пределах.
 ARRIVE_RADIUS = 5.0
+
+def _pick(bounds: tuple[float, float], rng: random.Random | None = None) -> float:
+    """Случайное значение из диапазона.
+
+    `rng` принимается, чтобы тесты могли зафиксировать результат; в работе
+    передаётся None и берётся обычный random.
+    """
+    low, high = bounds
+    source = rng or random
+    return float(source.uniform(float(low), float(high)))
+
+
+def spawn_delay_value(rng: random.Random | None = None) -> float:
+    """Пауза после спавна для одного захода."""
+    return _pick(SPAWN_DELAY_RANGE, rng)
+
+
+def travel_speed_value(rng: random.Random | None = None) -> float:
+    """Скорость перехода для одного захода."""
+    return _pick(TRAVEL_SPEED_RANGE, rng)
+
 
 # Последняя выбранная точка на бота: две подряд одинаковые — заметно.
 _LAST_PICK: dict[int, int] = {}
@@ -161,12 +198,16 @@ def status(bot) -> dict:
 # --- переход ----------------------------------------------------------------
 
 
-def travel_to_point(bot, point, *, speed: float = TRAVEL_SPEED, log=None) -> dict:
+def travel_to_point(bot, point, *, speed: float | None = None, log=None) -> dict:
     """Дойти до точки обычным delta-переходом на честной скорости.
 
     Тот же механизм, что и travel_to_station: пачка коротких приращений по
     OnFootSync, где шаг равен speed * interval. Сервер видит монотонное
     движение, а не прыжок, и позицию не откатывает.
+
+    Скорость по умолчанию берётся случайной из TRAVEL_SPEED_RANGE: держать
+    на всём пути ровно 8.0 м/с — значит идти с постоянной скоростью, чего
+    живой игрок не делает.
     """
     from logic.delta_teleport import DeltaTeleport, step_for_speed
 
@@ -177,13 +218,17 @@ def travel_to_point(bot, point, *, speed: float = TRAVEL_SPEED, log=None) -> dic
     if not getattr(session, "connected", False):
         return {"status": "no_session", "left": None}
 
+    if speed is None:
+        speed = travel_speed_value()
+    speed = float(speed)
+
     engine = DeltaTeleport(
         session.players.bot,
         api._delta_sync_sender,
         step=step_for_speed(speed, TRAVEL_INTERVAL),
         interval=TRAVEL_INTERVAL,
         velocity_mode="consistent",
-        jitter=0.0,
+        jitter=TRAVEL_JITTER,
         settle_packets=1,
         abort_check=lambda: not session.connected,
     )
@@ -213,21 +258,25 @@ def run_cycle(
     bot,
     *,
     log=None,
-    spawn_delay: float = SPAWN_DELAY,
+    spawn_delay: float | None = None,
     world_timeout: float = WORLD_TIMEOUT,
     command: str = ARRIVAL_COMMAND,
     spawns: dict | None = None,
     rng: random.Random | None = None,
     stop_event: threading.Event | None = None,
 ) -> dict:
-    """Полный заход: мир → вокзал → минута → бессмертие → точка → /bg.
+    """Полный заход: мир → вокзал → пауза → точка → /bg.
 
     Возвращает отчёт. Пока идёт заход, на боте поднят флаг
     `_lvl_engine_active`: фоновая проверка мира не должна вести ту же
     сессию своим переходом, иначе два потока дёргают позицию в разные
     стороны и стрим остаётся пустым.
+
+    Пауза после спавна не задана — берётся случайная из SPAWN_DELAY_RANGE.
     """
     say = log or (lambda _m: None)
+    if spawn_delay is None:
+        spawn_delay = spawn_delay_value(rng)
     stop = stop_event or threading.Event()
     started = time.monotonic()
 
@@ -276,14 +325,7 @@ def run_cycle(
         if stopped():
             return {"status": "stopped", "station": station}
 
-        # 4. Бессмертие от голода.
-        try:
-            from logic import immortal
-            immortal.enable(bot, log=say)
-        except Exception as exc:
-            say(f"[LVL] бессмертие не включилось: {exc!r}")
-
-        # 5. Точка своего вокзала.
+        # 4. Точка своего вокзала.
         bot.lvl_phase = "target"
         index, point = pick_target(bot, station, spawns=spawns, rng=rng)
         if point is None:
@@ -297,7 +339,7 @@ def run_cycle(
         bot.lvl_target_index = index
         say(f"[LVL] точка {index + 1}: ({point[0]:.1f}, {point[1]:.1f}, {point[2]:.1f})")
 
-        # 6. Переход на 8 м/с.
+        # 5. Переход на честной скорости.
         bot.lvl_phase = "moving"
         try:
             moved = travel_to_point(bot, point, log=say)
@@ -328,7 +370,7 @@ def run_cycle(
         if stopped():
             return {"status": "stopped", "station": station, "target": list(point)}
 
-        # 7. Команда.
+        # 6. Команда.
         bot.lvl_phase = "command"
         sent = False
         try:
@@ -357,12 +399,17 @@ def run_cycle(
 class LevelRun:
     """Тот же заход, но в своём потоке — для задачи на боте."""
 
-    def __init__(self, bot, *, log=None, spawn_delay: float = SPAWN_DELAY,
+    def __init__(self, bot, *, log=None, spawn_delay: float | None = None,
                  world_timeout: float = WORLD_TIMEOUT, spawns: dict | None = None,
                  command: str = ARRIVAL_COMMAND, rng: random.Random | None = None):
         self.bot = bot
         self.log = log or (lambda _m: None)
-        self.spawn_delay = float(spawn_delay)
+        # Не задана — берём случайную из SPAWN_DELAY_RANGE. Явное число
+        # остаётся для тестов и ручных прогонов.
+        self.spawn_delay = (
+            float(spawn_delay) if spawn_delay is not None
+            else spawn_delay_value(rng)
+        )
         self.world_timeout = float(world_timeout)
         self.spawns = spawns
         self.command = command

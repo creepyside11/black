@@ -135,6 +135,21 @@ class LevelRunTests(unittest.TestCase):
                         run.run_once()
         return run, imm
 
+    def test_no_immortality(self):
+        """Бессмертие в качке не включается.
+
+        Держать HP на сотне круглосуточно — ровная константа, которой у
+        живого игрока не бывает. Сервер считает такое поведение и банит
+        не сразу, а через часы, у каждого аккаунта в свой момент.
+        """
+        bot = FakeBot()
+        run, imm = self._run(bot, {"Нижегородск 2": [(500.0, 600.0, 10.0)]})
+        self.assertEqual(run.report["status"], "done")
+        self.assertFalse(imm.called, "бессмертие не должно включаться")
+        # Никакого флага подмены HP в пакете тоже не выставляется.
+        player = getattr(getattr(bot.session, "players", None), "bot", None)
+        self.assertFalse(getattr(player, "godmode_zero_xp", False))
+
     def test_happy_path_reaches_point_and_sends_command(self):
         bot = FakeBot()
         spawns = {"Нижегородск 2": [(500.0, 600.0, 10.0)]}
@@ -142,7 +157,7 @@ class LevelRunTests(unittest.TestCase):
         self.assertEqual(run.report["status"], "done")
         self.assertEqual(run.report["station"], "Нижегородск 2")
         self.assertEqual(bot.api.chat, ["/bg"])
-        self.assertTrue(imm.called, "бессмертие должно включаться")
+        self.assertFalse(imm.called, "бессмертие больше не включается")
         self.assertEqual(bot.lvl_target, [500.0, 600.0, 10.0])
 
     def test_reports_spawn_name_in_log(self):
@@ -252,8 +267,12 @@ class TravelSpeedTests(unittest.TestCase):
             out = lvl_engine.travel_to_point(bot, (10.0, 20.0, 5.0))
         self.assertEqual(out["status"], "ok")
         speed = captured["step"] / captured["interval"]
-        self.assertAlmostEqual(speed, lvl_engine.TRAVEL_SPEED, places=2)
+        low, high = lvl_engine.TRAVEL_SPEED_RANGE
+        self.assertGreaterEqual(speed, low - 0.05)
+        self.assertLessEqual(speed, high + 0.05)
         self.assertEqual(captured["velocity_mode"], "consistent")
+        # Дрожание шага: без него путь — идеальная прямая.
+        self.assertGreater(captured["jitter"], 0.0)
 
 
 class TaskTests(unittest.TestCase):
@@ -269,6 +288,45 @@ class TaskTests(unittest.TestCase):
         task.DRIFT_LIMIT = 30.0
         task.HOLD_POLL = 0.01
         return task, bot
+
+    def test_timings_differ_between_bots(self):
+        """У каждого бота свой ритм.
+
+        Пятнадцать аккаунтов с одинаковым периодом опроса и одинаковой
+        паузой после спавна тикают синхронно — это видно по логам сервера
+        как кластер, даже если больше ничего не совпадает.
+        """
+        from logic.bot_tasks import LevelRunnerTask
+
+        polls = {LevelRunnerTask(FakeBot(bot_id=i)).HOLD_POLL for i in range(15)}
+        retries = {LevelRunnerTask(FakeBot(bot_id=i)).RETRY_DELAY for i in range(15)}
+        self.assertGreater(len(polls), 1, "период опроса у всех одинаков")
+        self.assertGreater(len(retries), 1, "пауза повтора у всех одинакова")
+
+    def test_timings_stay_within_ranges(self):
+        from logic.bot_tasks import LevelRunnerTask
+
+        low, high = LevelRunnerTask.HOLD_POLL_RANGE
+        for i in range(30):
+            poll = LevelRunnerTask(FakeBot(bot_id=i)).HOLD_POLL
+            self.assertGreaterEqual(poll, low)
+            self.assertLessEqual(poll, high)
+
+    def test_spawn_delay_is_randomized_and_bounded(self):
+        low, high = lvl_engine.SPAWN_DELAY_RANGE
+        values = {lvl_engine.spawn_delay_value() for _ in range(40)}
+        self.assertGreater(len(values), 1, "пауза после спавна не меняется")
+        for value in values:
+            self.assertGreaterEqual(value, low)
+            self.assertLessEqual(value, high)
+
+    def test_travel_speed_never_exceeds_ceiling(self):
+        low, high = lvl_engine.TRAVEL_SPEED_RANGE
+        self.assertLessEqual(high, lvl_engine.TRAVEL_SPEED)
+        for _ in range(40):
+            speed = lvl_engine.travel_speed_value()
+            self.assertGreaterEqual(speed, low)
+            self.assertLessEqual(speed, high)
 
     def test_task_is_wired_to_engine(self):
         from logic import bot_tasks
