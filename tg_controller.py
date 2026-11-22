@@ -623,6 +623,7 @@ class TelegramBotController:
             "factory": "🏭 Завод",
             "bus": "🚌 Автобус",
             "farm": "🍎 Ферма",
+            "loader": "📦 Грузчик",
             "stop": "⏸ Без задачи",
         }
         buttons = []
@@ -1246,6 +1247,30 @@ class TelegramBotController:
 
         self._live_thread = threading.Thread(target=_loop, daemon=True)
         self._live_thread.start()
+
+    def _refresh_proxies_async(self, pool, render) -> None:
+        """Проверить узлы в фоне и перерисовать меню ПОСЛЕ проверки.
+
+        Раньше проверка уходила в отдельный поток, а меню рисовалось сразу
+        же — то есть до её окончания. Человек нажимал «Проверить сейчас»,
+        видел тот же текст с прежними данными и решал, что кнопка не
+        работает. На деле проверка шла и завершалась секунды спустя, но
+        показать результат было уже некому.
+
+        `render` вызывается всегда, даже если проверка упала: иначе при
+        ошибке меню так и осталось бы со старыми данными без объяснения.
+        """
+        def _worker():
+            try:
+                pool.refresh()
+            except Exception as exc:
+                print(f"[ПРОКСИ] проверка по кнопке упала: {exc!r}", flush=True)
+            try:
+                render()
+            except Exception as exc:
+                print(f"[ПРОКСИ] не удалось перерисовать меню: {exc!r}", flush=True)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _render_vpn_menu(self, chat_id, message_id=None, callback_id=None,
                          quiet=False, page: int = 1):
@@ -1982,6 +2007,7 @@ class TelegramBotController:
                     "lvl": "📈 Прокачка", "quest": "📜 Квесты",
                     "mine": "⛏ Шахта", "factory": "🏭 Завод",
                     "bus": "🚌 Автобус", "farm": "🍎 Ферма",
+                    "loader": "📦 Грузчик",
                     "stop": "⏸ Без задачи",
                 }
                 buttons = [
@@ -2211,6 +2237,9 @@ class TelegramBotController:
                 )
                 markup.row(
                     types.InlineKeyboardButton("Автобусник", callback_data=f"set_task:{bid}:{page}:bus", style="success"),
+                    types.InlineKeyboardButton("📦 Грузчик", callback_data=f"set_task:{bid}:{page}:loader", style="success")
+                )
+                markup.row(
                     types.InlineKeyboardButton("⏹ Снять задачу", callback_data=f"set_task:{bid}:{page}:stop", style="danger")
                 )
                 markup.row(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"bot_view:{bid}:{page}", style="primary"))
@@ -2371,9 +2400,12 @@ class TelegramBotController:
                     self.bot.answer_callback_query(call.id, "Пул прокси не запущен", show_alert=True)
                     return
                 self.bot.answer_callback_query(call.id, "Проверяю узлы...", show_alert=False)
-                threading.Thread(target=pool.refresh, daemon=True).start()
                 call.data = f"bot_proxy_menu:{bid}:{page}"
                 handle_callbacks(call)
+                # Перерисовка — тем же диспетчером, что и первая отрисовка:
+                # отдельного метода на это меню нет, оно строится прямо в
+                # обработчике bot_proxy_menu. call.data уже переставлен выше.
+                self._refresh_proxies_async(pool, lambda: handle_callbacks(call))
 
             elif data.startswith("bot_proxy_reset:"):
                 _, bid_s, page_s = data.split(":")
@@ -2500,8 +2532,11 @@ class TelegramBotController:
                     self.bot.answer_callback_query(call.id, "Пул прокси не запущен", show_alert=True)
                     return
                 self.bot.answer_callback_query(call.id, "Проверяю узлы...")
-                threading.Thread(target=pool.refresh, daemon=True).start()
-                self._render_vpn_menu(chat_id, message_id, call.id, quiet=True)
+                self._render_vpn_menu(chat_id, message_id, None, quiet=True)
+                self._refresh_proxies_async(
+                    pool,
+                    lambda: self._render_vpn_menu(chat_id, message_id, None, quiet=True),
+                )
 
             elif data == 'proxy_batch':
                 if not self._lua_admin(call.from_user.id, call.message.chat):
@@ -3021,9 +3056,10 @@ class TelegramBotController:
                     chat_id=message.chat.id,
                     message_id=status.message_id,
                 )
-                threading.Thread(target=pool.refresh, kwargs={"fetch": False}, daemon=True).start()
-                time.sleep(1.0)
-                self._render_vpn_menu(message.chat.id, None, None, quiet=True)
+                self._refresh_proxies_async(
+                    pool,
+                    lambda: self._render_vpn_menu(message.chat.id, None, None, quiet=True),
+                )
 
             elif action == "add_vpn_local":
                 del self.user_states[message.chat.id]
