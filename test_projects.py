@@ -55,6 +55,23 @@ class RegistryTests(unittest.TestCase):
         self.assertNotEqual(br.accounts_path, arz.accounts_path)
         self.assertNotEqual(br.servers_cache_path, arz.servers_cache_path)
 
+    def test_online_rp_is_available_with_existing_project_config(self):
+        with open(self._file, "w", encoding="utf-8") as fh:
+            json.dump({"active": "arz", "projects": {"arz": {"title": "Arizona"}}}, fh)
+
+        self.assertEqual(projects_mod.active_key(), "arz")
+        online_rp = projects_mod.get_project("Online RP")
+        self.assertEqual(online_rp.key, "onlinerp")
+        self.assertEqual(online_rp.accounts_file, "accounts_onlinerp.json")
+        self.assertEqual(online_rp.servers_cache_file, ".servers_cache_onlinerp.json")
+        self.assertEqual(projects_mod.set_active("онлайн рп").key, online_rp.key)
+        self.assertEqual(projects_mod.active_key(), online_rp.key)
+        menu_entry = next(item for item in projects_mod.describe()
+                          if item["key"] == online_rp.key)
+        self.assertTrue(menu_entry["has_servers"])
+        self.assertTrue(menu_entry["active"])
+        self.assertEqual(projects_mod.get_project("arz").title, "Arizona")
+
     def test_handshake_differs(self):
         """У BR свой первый пакет, у Arizona — стандартный RakNet."""
         self.assertEqual(projects_mod.get_project("br").handshake, "br")
@@ -280,6 +297,24 @@ class IsolationTests(unittest.TestCase):
         text = str(br_servers._not_configured_error(project))
         self.assertIn("projects.json", text)
         self.assertIn("Arizona", text)
+
+    def test_online_rp_list_and_lookup_work_without_an_api(self):
+        with mock.patch.object(br_servers, "_load_disk_cache", return_value=None):
+            with mock.patch.object(br_servers, "_fetch_one") as fetch:
+                servers = br_servers.get_servers("onlinerp")
+                self.assertEqual(
+                    [(s["id"], s["name"], s["ip"], s["port"]) for s in servers],
+                    [
+                        (1, "Texas", "s1.gta-mobile.ru", 7777),
+                        (2, "Florida", "s2.gta-mobile.ru", 7777),
+                        (3, "Nevada", "s3.gta-mobile.ru", 7777),
+                        (4, "Hawaii", "s4.gta-mobile.ru", 7777),
+                        (5, "Indiana", "s5.gta-mobile.ru", 7777),
+                    ],
+                )
+                self.assertEqual(br_servers.find_server("4", "onlinerp")["name"], "Hawaii")
+                self.assertEqual(br_servers.find_server("indiana", "onlinerp")["id"], 5)
+                fetch.assert_not_called()
 
     def test_find_server_by_number_and_name(self):
         def fake_servers(project=None):

@@ -4071,7 +4071,7 @@ def print_help():
   /luatest list                      - тестовые Lua-скрипты
   /luatest run <файл.lua> [события.json] - офлайн-полигон
   /switch <ID>      - Выбрать активного бота для консольных команд
-  /project [br|arz] - Показать или переключить игровой проект
+  /project [проект] - Показать или переключить игровой проект
   /logs [ID]        - Посмотреть последние логи бота
   /unban <ID>       - Снять статус бана с аккаунта
   /del <ID>         - Удалить бота из списка и accounts.json
@@ -4583,7 +4583,7 @@ def main():
         manager.add_bot(target_server, nickname, password=password)
     elif len(filtered_args) in (1, 2):
         print("[-] Ошибка: Для запуска через аргументы пароль обязателен!")
-        print("Использование: python3 bot.py <сервер> <никнейм> <пароль> [--project br|arz] [--tg ТОКЕН] [--admin ID]")
+        print("Использование: python3 bot.py <сервер> <никнейм> <пароль> [--project проект] [--tg ТОКЕН] [--admin ID]")
     else:
         if manager.bots:
             print(
@@ -4736,7 +4736,7 @@ def main():
                 for item in projects_mod.describe():
                     mark = "*" if item["active"] else " "
                     print(f" {mark} {item['key']:<6} {item['title']}")
-                print("Использование: /project <br|arz>")
+                print("Использование: /project <проект>")
 
         elif line.startswith("/switch"):
             parts = line.split()

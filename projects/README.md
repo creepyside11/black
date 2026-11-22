@@ -7,8 +7,8 @@
 | Реестр проектов (что вообще бывает) | `projects.py` в корне |
 | Правки без кода: адреса API, файлы, лимиты, хендшейк | `projects.json` в корне (создаётся при первом переключении) |
 | Профили id RPC/интерфейсов | эта папка, `<ключ>.profile.json` |
-| Аккаунты проекта | `accounts.json` (BR), `accounts_arz.json` (Arizona RP) |
-| Кэш списка серверов проекта | `.servers_cache.json`, `.servers_cache_arz.json` |
+| Аккаунты проекта | `accounts.json` (BR), `accounts_arz.json` (Arizona RP), `accounts_onlinerp.json` (Online RP) |
+| Кэш списка серверов проекта | `.servers_cache.json`, `.servers_cache_arz.json`, `.servers_cache_onlinerp.json` |
 | Инструменты входа | `tools/project_handshake.py`, `tools/project_calibrate.py` |
 
 ## Переключение
@@ -35,7 +35,24 @@
 Ничего не удаляется: аккаунты каждого проекта лежат в своём файле и
 возвращаются, когда проект включают обратно.
 
-## Добавить третий проект
+## Online RP
+
+В Telegram выберите «Проект» → «Online RP» или введите `/project onlinerp`.
+Из терминала проект можно выбрать командой `python3 bot.py --project onlinerp`.
+В программу встроен список из [официального форума Online RP](https://forum.onlinerp.com/).
+Для показа списка интернет-соединение не требуется.
+
+| № | Сервер | Адрес |
+|---|---|---|
+| 1 | Texas | `s1.gta-mobile.ru:7777` |
+| 2 | Florida | `s2.gta-mobile.ru:7777` |
+| 3 | Nevada | `s3.gta-mobile.ru:7777` |
+| 4 | Hawaii | `s4.gta-mobile.ru:7777` |
+| 5 | Indiana | `s5.gta-mobile.ru:7777` |
+
+Вход и спавн на Online RP через RakCRMP пока не проверены.
+
+## Добавление своего проекта
 
 Дописать блок в `projects.json`:
 

@@ -1115,8 +1115,8 @@ class TelegramBotController:
             )
             if item.get("note"):
                 lines.append(f"   <i>{item['note']}</i>")
-            if not item.get("has_servers_api"):
-                lines.append("   <i>⚠️ адрес списка серверов не задан</i>")
+            if not item.get("has_servers"):
+                lines.append("   <i>⚠️ список серверов не настроен</i>")
             if item.get("active"):
                 continue
             markup.add(types.InlineKeyboardButton(

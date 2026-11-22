@@ -1,4 +1,4 @@
-"""Реестр игровых проектов: Black Russia, Arizona RP и всё, что добавят дальше.
+"""Реестр игровых проектов: Black Russia, Arizona RP и Online RP.
 
 Зачем отдельный модуль. Раньше «Black Russia» была не настройкой, а
 константой, размазанной по коду: список серверов брался с
@@ -110,6 +110,10 @@ class Project:
         """Только адреса — для логов, панели и совместимости со старым кодом."""
         return tuple(source.url for source in self.servers_api)
 
+    @property
+    def has_servers(self) -> bool:
+        return bool(self.servers_api or self.servers_static)
+
     def clean_server_name(self, raw: str) -> str:
         """Имя сервера без префикса проекта — как его показывает бот."""
         name = str(raw or "").strip()
@@ -128,6 +132,7 @@ class Project:
             "host_suffix": self.http_host_suffix,
             "nickname_max": self.nickname_max,
             "handshake": self.handshake,
+            "has_servers": self.has_servers,
             "has_servers_api": bool(self.servers_api),
             "servers_api": [source.as_dict() for source in self.servers_api],
             "accounts_file": self.accounts_file,
@@ -239,6 +244,21 @@ DEFAULT_PROJECTS: dict[str, dict] = {
         "handshake": "raknet",
         "note": "32 сервера/порт 7777; вход не подтверждён — формат первого пакета не разобран",
     },
+    "onlinerp": {
+        "title": "Online RP",
+        "short": "ORP",
+        # Номера и домены из раздела «Игровые сервера» форума forum.onlinerp.com.
+        "servers_static": [
+            {"id": 1, "name": "Texas", "ip": "s1.gta-mobile.ru", "port": 7777},
+            {"id": 2, "name": "Florida", "ip": "s2.gta-mobile.ru", "port": 7777},
+            {"id": 3, "name": "Nevada", "ip": "s3.gta-mobile.ru", "port": 7777},
+            {"id": 4, "name": "Hawaii", "ip": "s4.gta-mobile.ru", "port": 7777},
+            {"id": 5, "name": "Indiana", "ip": "s5.gta-mobile.ru", "port": 7777},
+        ],
+        "name_prefixes": ["ONLINE RP | ", "ONLINE-RP | "],
+        "handshake": "raknet",
+        "note": "5 игровых серверов. Вход через RakCRMP пока не подтверждён.",
+    },
 }
 
 # Как человек может назвать проект в команде. Ключи — то, что он напишет.
@@ -262,6 +282,10 @@ ALIASES: dict[str, str] = {
     "аризона": "arz",
     "аризонарп": "arz",
     "аризона рп": "arz",
+    "online rp": "onlinerp",
+    "online-rp": "onlinerp",
+    "orp": "onlinerp",
+    "онлайн рп": "onlinerp",
 }
 
 _lock = threading.RLock()

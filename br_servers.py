@@ -89,8 +89,7 @@ def api_urls(project=None) -> list:
 
 def is_configured(project=None) -> bool:
     """Есть ли у проекта вообще откуда взять список серверов."""
-    resolved = _project(project)
-    return bool(resolved.servers_api or resolved.servers_static)
+    return _project(project).has_servers
 
 
 def reset_cache(project=None) -> None:

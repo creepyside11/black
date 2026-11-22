@@ -73,6 +73,7 @@ _run_murmansk_loop.sh
 # Личные аккаунты и настройки не включаются в репозиторий
 /accounts.local.json
 /accounts_arz.json
+/accounts_onlinerp.json
 /proxies_pool.json
 
 # Per-account Lua state, never commit user data
