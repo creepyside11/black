@@ -28,7 +28,11 @@ case "$ARCH" in
     *) echo "[-] Неизвестная архитектура: $ARCH"; exit 1 ;;
 esac
 
-VERSION="${SING_BOX_VERSION:-1.11.15}"
+# Версия должна совпадать с той, под которую написан build_config в
+# logic/vpn_bridge.py: новый формат dns-серверов и default_domain_resolver
+# появились в 1.12. На 1.11.15 конфиг не декодируется, процесс падает на
+# старте, и ни один узел не поднимается — весь прокси-слой лежит.
+VERSION="${SING_BOX_VERSION:-1.14.4}"
 TARBALL="sing-box-${VERSION}-linux-${SB_ARCH}.tar.gz"
 URL="https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/${TARBALL}"
 
