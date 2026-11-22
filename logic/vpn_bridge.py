@@ -41,6 +41,13 @@ STATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "_vpn
 BINARY_CANDIDATES = ("sing-box", "/opt/rakcrmp-black-runtime/sing-box", "/usr/local/bin/sing-box", "/usr/bin/sing-box",
                      "/opt/sing-box/sing-box")
 
+# Второй движок. sing-box не проходит REALITY у части узлов: на всех
+# подряд «reality verification failed», при этом тот же конфиг через xray
+# отдаёт живой трафик. Расхождение в реализациях REALITY, и пока его не
+# разобрали, узел лучше пускать тем клиентом, который с ним совместим.
+XRAY_CANDIDATES = ("xray", "/usr/local/bin/xray", "/usr/bin/xray",
+                   "/opt/xray/xray", "/root/xray/xray")
+
 # Резолверы для самого sing-box.
 #
 # Ему не виден системный DNS Android: Go читает /etc/resolv.conf, которого в
@@ -76,8 +83,22 @@ def find_binary() -> str | None:
     return None
 
 
+def find_xray_binary() -> str | None:
+    """Путь к xray или None."""
+    env = os.environ.get("XRAY_BIN")
+    if env:
+        path = shutil.which(env) if not os.path.isabs(env) else env
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    for cand in XRAY_CANDIDATES:
+        path = shutil.which(cand) if "/" not in cand else (cand if os.path.exists(cand) else None)
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return None
+
 def bridge_available() -> bool:
-    return find_binary() is not None
+    """Мост возможен, если есть хотя бы один движок."""
+    return find_binary() is not None or find_xray_binary() is not None
 
 
 def port_for(key: str) -> int:
@@ -563,6 +584,43 @@ def build_config(node_key: str, outbound: dict, port: int) -> dict:
     }
 
 
+def xray_outbound_from_raw(link: str) -> dict | None:
+    """Готовый outbound Xray из конфига подписки, без пересборки.
+
+    Подписка часто отдаёт конфиг Xray целиком (protocol/settings/
+    streamSettings). Для sing-box он пересобирается в его формат, а для
+    xray годится как есть — поэтому отдаём исходный объект и не теряем
+    ни одного поля, которое могло бы влиять на REALITY.
+    """
+    text = (link or "").strip()
+    if not text.startswith("{"):
+        return None
+    try:
+        cfg = json.loads(text)
+    except ValueError:
+        return None
+    if not isinstance(cfg, dict):
+        return None
+    for item in cfg.get("outbounds") or []:
+        if not isinstance(item, dict):
+            continue
+        if (item.get("protocol") or "").lower() in _XRAY_PROTOCOLS:
+            return item
+    return None
+
+def build_xray_config(outbound: dict, port: int) -> dict:
+    """Конфиг xray: SOCKS5 на 127.0.0.1:port -> один outbound."""
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "port": int(port),
+            "listen": "127.0.0.1",
+            "protocol": "socks",
+            "settings": {"udp": True},
+        }],
+        "outbounds": [dict(outbound)],
+    }
+
 def socks_alive(port: int, timeout: float = 1.0) -> bool:
     """Принимает ли мост SOCKS5-подключения."""
     try:
@@ -576,9 +634,13 @@ class VpnBridge:
     """Поднимает и держит sing-box по одному на узел."""
 
     def __init__(self, *, state_dir: str | None = None, binary: str | None = None,
-                 log=None):
+                 xray_binary: str | None = None, log=None):
         self.state_dir = state_dir or STATE_DIR
         self.binary = binary or find_binary()
+        # Второй движок: узлы с REALITY, которые sing-box не проходит.
+        # Ищется один раз; None означает, что его нет и работает только
+        # sing-box, как раньше.
+        self.xray_binary = xray_binary if xray_binary is not None else find_xray_binary()
         self.log = log
         self._procs: dict[str, subprocess.Popen] = {}
         self._ports: dict[str, int] = {}
@@ -619,28 +681,54 @@ class VpnBridge:
         if not self.available() or not os.path.isdir(self.state_dir):
             return
         marker = os.path.basename(self.state_dir) + os.sep
-        try:
-            listing = subprocess.run(
-                ["pgrep", "-af", "sing-box run -c"],
-                capture_output=True, text=True, timeout=5,
-            )
-        except (OSError, subprocess.SubprocessError):
-            return
-        for line in (listing.stdout or "").splitlines():
-            if marker not in line:
-                continue
-            pid_text = line.split(None, 1)[0]
-            if not pid_text.isdigit():
-                continue
+        # Один и тот же pid может попасть в оба списка, если шаблон
+        # совпал с обеими командными строками; гасим каждого один раз.
+        seen: set[int] = set()
+        for pattern in ("sing-box run -c", "xray run -c"):
             try:
-                os.kill(int(pid_text), 15)
-            except OSError:
-                pass
+                listing = subprocess.run(
+                    ["pgrep", "-af", pattern],
+                    capture_output=True, text=True, timeout=5,
+                )
+            except (OSError, subprocess.SubprocessError):
+                continue
+            for line in (listing.stdout or "").splitlines():
+                if marker not in line:
+                    continue
+                pid_text = line.split(None, 1)[0]
+                if not pid_text.isdigit():
+                    continue
+                pid = int(pid_text)
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                try:
+                    os.kill(pid, 15)
+                except OSError:
+                    pass
 
-    def available(self) -> bool:
+    def _xray(self) -> str | None:
+        """Путь к xray, если он есть и исполняем."""
+        path = self.xray_binary
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+        self.xray_binary = find_xray_binary()
+        path = self.xray_binary
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+        return None
+
+    def _singbox(self) -> str | None:
+        """Путь к sing-box, если он есть и исполняем."""
         if not self.binary or not os.path.isfile(self.binary) or not os.access(self.binary, os.X_OK):
             self.binary = find_binary()
-        return bool(self.binary and os.path.isfile(self.binary) and os.access(self.binary, os.X_OK))
+        path = self.binary
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+        return None
+
+    def available(self) -> bool:
+        return bool(self._xray() or self._singbox())
 
     def _config_path(self, key: str) -> str:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
@@ -683,14 +771,36 @@ class VpnBridge:
     def _start_one(self, key: str, link: str) -> str | None:
         """Поднять мост под узел. Возвращает socks-адрес или None."""
         if not self.available():
-            self._note("[МОСТ] sing-box не найден. В Termux установите: pkg install sing-box")
+            self._note("[МОСТ] нет ни sing-box, ни xray. Termux: pkg install sing-box")
             return None
-        outbound = parse_link(link)
-        if not outbound:
-            self._note("[МОСТ] не удалось разобрать ссылку узла")
-            return None
-        # Имя узла -> IP: у sing-box здесь нет рабочего резолвера.
-        outbound = resolve_server(outbound)
+
+        # Какой движок поднимать под этот узел.
+        #
+        # Узел, пришедший готовым конфигом Xray, пускаем через xray: с
+        # REALITY он совместим, а sing-box на тех же узлах отвечает
+        # «reality verification failed» и не отдаёт ни байта. Ссылки
+        # (vless:// и подобные) остаются за sing-box — их разбор написан
+        # под него, и там он работает.
+        engine = "singbox"
+        binary = self._singbox()
+        outbound = None
+        xray_out = None
+        if self._xray():
+            xray_out = xray_outbound_from_raw(link)
+            if xray_out is not None:
+                engine = "xray"
+                binary = self._xray()
+
+        if engine == "singbox":
+            if not binary:
+                self._note("[МОСТ] sing-box не найден. В Termux установите: pkg install sing-box")
+                return None
+            outbound = parse_link(link)
+            if not outbound:
+                self._note("[МОСТ] не удалось разобрать ссылку узла")
+                return None
+            # Имя узла -> IP: у sing-box здесь нет рабочего резолвера.
+            outbound = resolve_server(outbound)
 
         with self._lock:
             proc = self._procs.get(key)
@@ -710,7 +820,10 @@ class VpnBridge:
 
             os.makedirs(self.state_dir, exist_ok=True)
             cfg_path = self._config_path(key)
-            cfg = build_config(key, outbound, port)
+            if engine == "xray":
+                cfg = build_xray_config(xray_out, port)
+            else:
+                cfg = build_config(key, outbound, port)
             try:
                 with open(cfg_path, "w", encoding="utf-8") as f:
                     json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -721,13 +834,13 @@ class VpnBridge:
 
             try:
                 proc = subprocess.Popen(
-                    [self.binary, "run", "-c", cfg_path],
+                    [binary, "run", "-c", cfg_path],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.PIPE,
                 )
             except OSError as exc:
                 self._ports.pop(key, None)
-                self._note(f"[МОСТ] sing-box не запустился: {exc}")
+                self._note(f"[МОСТ] {engine} не запустился: {exc}")
                 return None
 
             self._procs[key] = proc
@@ -754,11 +867,12 @@ class VpnBridge:
                 stderr_thread.join(timeout=.2)
                 detail = b"".join(stderr_tail).decode("utf-8", errors="replace").lower()
                 if "address already in use" in detail: hint = "порт уже занят"
-                elif "deprecated" in detail or "removed" in detail: hint = "конфигурация несовместима с версией sing-box"
+                elif "deprecated" in detail or "removed" in detail: hint = f"конфигурация несовместима с версией {engine}"
                 elif "permission denied" in detail: hint = "нет разрешения на запуск или запись"
+                elif "reality" in detail: hint = "сервер отверг ключ REALITY"
                 elif "dns" in detail or "resolve" in detail: hint = "ошибка DNS или адреса узла"
-                else: hint = "проверьте конфигурацию и версию sing-box"
-                self._note(f"[МОСТ] sing-box завершился (код {proc.returncode}): {hint}")
+                else: hint = f"проверьте конфигурацию и версию {engine}"
+                self._note(f"[МОСТ] {engine} завершился (код {proc.returncode}): {hint}")
                 with self._lock:
                     if self._procs.get(key) is proc: self._kill(key)
                 return None
