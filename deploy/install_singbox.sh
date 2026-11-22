@@ -64,6 +64,31 @@ fi
 install -m 0755 "$BIN" /usr/local/bin/sing-box
 echo "[+] Установлен: $(/usr/local/bin/sing-box version | head -1)"
 
+# --- xray ------------------------------------------------------------------
+#
+# Второй движок, и он обязателен. Узлы с REALITY sing-box не проходит:
+# на всех подряд «reality verification failed», хотя тот же конфиг через
+# xray отдаёт живой трафик. Мост выбирает движок по виду узла: готовый
+# конфиг Xray — через xray, ссылку vless:// — через sing-box.
+if command -v xray >/dev/null 2>&1; then
+    echo "[+] xray уже стоит: $(xray version | head -1)"
+else
+    XRAY_TAG="$(curl -fsSL --max-time 20 \
+        https://api.github.com/repos/XTLS/Xray-core/releases/latest \
+        | grep -o '"tag_name": *"[^"]*"' | head -1 | cut -d'"' -f4)"
+    XRAY_TAG="${XRAY_TAG:-v26.11.9}"
+    echo "[*] Качаю xray ${XRAY_TAG}"
+    if curl -fsSL --retry 3 -o "$TMP/xray.zip" \
+        "https://github.com/XTLS/Xray-core/releases/download/${XRAY_TAG}/Xray-linux-${SB_ARCH}.zip"; then
+        python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" \
+            "$TMP/xray.zip" "$TMP/xray"
+        install -m 0755 "$TMP/xray/xray" /usr/local/bin/xray
+        echo "[+] Установлен: $(/usr/local/bin/xray version | head -1)"
+    else
+        echo "[!] xray не скачался — узлы с REALITY останутся красными"
+    fi
+fi
+
 # Мост запускает процессы сам, отдельный сервис не нужен.
 echo
 echo "Готово. Дальше:"
