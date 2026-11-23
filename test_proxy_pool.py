@@ -195,6 +195,19 @@ class PoolTests(unittest.TestCase):
         self.assertEqual(len(nodes), 2)
         self.assertEqual(len(pool.subscriptions), 1)
 
+    def test_added_subscription_is_visible_immediately(self):
+        """Узлы подписки видны в списке сразу, ещё до проверки.
+
+        Раньше кеш узлов заполнялся только в fetch_all(), поэтому между
+        «подписка добавлена, узлов 182» и первой проверкой (на 182 узла это
+        минуты) список прокси был пуст — со стороны выглядело, будто
+        подписка не добавилась вовсе.
+        """
+        pool = self._pool()
+        pool.add_subscription("https://sub.example.org/abc")
+        names = [n.name for n in pool.nodes()]
+        self.assertEqual(len(names), 2, f"узлы не попали в список: {names}")
+
     def test_bad_subscription_rejected(self):
         def loader(url, **kwargs):
             raise VS.SubscriptionError("нет узлов")

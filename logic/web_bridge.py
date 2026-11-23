@@ -95,6 +95,22 @@ def submit(cmd: str, args: dict | None = None, timeout: float = 20.0) -> dict:
             "error": "бот не ответил за отведённое время"}
 
 
+
+def _start_vpn_refresh(pool) -> None:
+    """Проверить узлы в фоне, не задерживая ответ панели."""
+    import threading
+
+    def _worker():
+        try:
+            pool.refresh()
+        except Exception as exc:
+            print(f"[ПРОКСИ] фоновая проверка после добавления упала: {exc!r}", flush=True)
+
+    try:
+        threading.Thread(target=_worker, daemon=True).start()
+    except Exception:
+        pass
+
 class WebBridge:
     """Сторона бота: читает очередь, исполняет, пишет снимок состояния."""
 
@@ -640,6 +656,11 @@ class WebBridge:
         name = str(args.get("name") or "подписка")
         url = str(args["url"])
         nodes = pool.add_subscription(url, name)
+        # Проверку запускаем сразу и в фоне, как это делает Telegram.
+        # Без неё из панели подписка добавлялась «в пустоту»: узлы лежали в
+        # пуле непроверенными до ближайшего обновления по таймеру, а до тех
+        # пор список выглядел пустым.
+        _start_vpn_refresh(pool)
         return {"added": name, "nodes": len(nodes)}
 
     def _cmd_settings(self, args):

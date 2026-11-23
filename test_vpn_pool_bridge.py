@@ -593,3 +593,71 @@ class BusyBridgeTests(unittest.TestCase):
         self.assertEqual(pool.acquire_proxy(""), "")
         # Локальный порт держим даже без ключа узла — по номеру порта.
         self.assertTrue(pool.acquire_proxy("socks5://127.0.0.1:9").endswith("|9"))
+
+
+class BridgeCapTests(unittest.TestCase):
+    """Поднятых мостов не больше лимита.
+
+    Каждый мост — отдельный процесс xray/sing-box около 33 МБ. На подписке в
+    182 узла без лимита набиралось 19 живых процессов, 655 МБ из 956, и
+    свободной памяти оставалось 26 МБ. Дальше либо OOM, либо пробы не
+    укладываются в таймаут, и живые узлы получают ложное «не везёт трафик».
+    """
+
+    def test_extra_idle_bridges_are_stopped(self):
+        import tempfile
+        tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
+        tmp.close()
+        self.addCleanup(lambda: os.path.exists(tmp.name) and os.unlink(tmp.name))
+
+        count = P.MAX_IDLE_BRIDGES + 3
+        nodes = [
+            VpnNode(name=f"n{i}", protocol="vless", address="ex.com", port=443,
+                    login=f"u{i}", raw='{"outbounds":[{"server":"x"}]}')
+            for i in range(count)
+        ]
+        live = set()
+        stopped = []
+
+        class Bridge:
+            def available(self):
+                return True
+
+            def start(self, key, link):
+                live.add(key)
+                return "socks5://127.0.0.1:20001"
+
+            def port_of(self, key):
+                return 20001
+
+            def running(self):
+                return list(live)
+
+            def is_busy(self, key):
+                return False
+
+            def stop(self, key, force=False):
+                live.discard(key)
+                stopped.append(key)
+
+        pool = P.ProxyPool(tmp.name, loader=lambda u, **k: [], log=lambda _m: None)
+        pool.bridge = Bridge()
+        pool._cached_nodes = list(nodes)
+
+        def prober(batch, **kwargs):
+            # Ключи (vless) сперва «нужен клиент»: пул поднимает под них
+            # мост и проверяет уже его SOCKS5-вход. Эти пробы успешны.
+            return [
+                ProbeResult(node=n, alive=True,
+                            usable=(n.protocol == "socks5"),
+                            status=STATUS_OK if n.protocol == "socks5"
+                            else STATUS_NEEDS_CLIENT)
+                for n in batch
+            ]
+
+        pool._prober = prober
+        pool.refresh(fetch=False)
+
+        self.assertTrue(stopped, "лишние мосты не погасили")
+        self.assertLessEqual(len(live), P.MAX_IDLE_BRIDGES,
+                             f"живых мостов больше лимита: {len(live)}")
